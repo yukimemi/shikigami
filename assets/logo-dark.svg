@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 160" width="560" height="160" role="img" aria-label="shikigami">
+  <title>shikigami</title>
+  <!-- dark mode 用。logo.svg と同じ構図で、線と文字を明るい側に振る。 -->
+  <g fill="none" stroke="#e6edf3" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M32 20 h72 v120 h-72 z" fill="#161b22" />
+    <path d="M44 44 h48 M44 60 h48 M44 76 h30" stroke="#f0836b" />
+    <circle cx="56" cy="102" r="6" fill="#e6edf3" />
+    <path d="M56 108 v14" />
+    <circle cx="56" cy="128" r="6" fill="#161b22" />
+    <path d="M62 102 l18 -12" />
+    <circle cx="86" cy="86" r="6" fill="#161b22" />
+  </g>
+  <text x="140" y="92" font-family="'Iosevka','JetBrains Mono','Consolas',monospace" font-size="54" font-weight="700" fill="#e6edf3">shikigami</text>
+  <text x="142" y="122" font-family="'Iosevka','JetBrains Mono','Consolas',monospace" font-size="19" fill="#9aa7b2">a terminal UI for Jujutsu (jj)</text>
+</svg>

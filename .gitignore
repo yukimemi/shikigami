@@ -1,0 +1,19 @@
+# Cargo build output. Cargo.lock IS committed (binary crate; `cargo make
+# lock-check` enforces it stays in sync).
+/target/
+
+# kata:gitignore:base:begin
+# Editor / OS noise — kata-managed (yukimemi/pj-base).
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# APM dependencies — install output of apm.yml's deps.
+# Skill files under .agents/, .claude/, .gemini/ etc. are
+# committed (kata seeds them; renri post_create refreshes via
+# `apm install --update`); the apm_modules/ source cache is not.
+apm_modules/
+# kata:gitignore:base:end

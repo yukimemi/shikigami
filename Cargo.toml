@@ -1,0 +1,33 @@
+[package]
+name = "shikigami"
+version = "0.0.1"
+edition = "2024"
+description = "Terminal UI for Jujutsu (jj): browse the change graph, read diffs, and drive new/edit/describe/squash/rebase/abandon without leaving the log"
+license = "MIT"
+repository = "https://github.com/yukimemi/shikigami"
+homepage = "https://github.com/yukimemi/shikigami"
+readme = "README.md"
+keywords = ["jujutsu", "jj", "tui", "vcs", "ratatui"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+# CLI
+clap = { version = "4.6.6", features = ["derive"] }
+clap_complete = "4.6.9"
+anyhow = "1.0.104"
+
+# TUI
+ratatui = "0.30.2"
+crossterm = { version = "0.29", features = ["events"] }
+# `jj diff --color always` の ANSI をそのまま ratatui の Text に変換するため。
+# diff の色付けを自前で実装すると jj 側の設定 (ui.diff-formatter, color
+# theme, word-level diff) を全部無視することになる。jj に色を付けさせて
+# 変換するだけなら、user の `~/.config/jj/config.toml` がそのまま効く。
+ansi-to-tui = "8.0.1"
+
+# jj の呼び出しは同期 std::process::Command で足りる (renri の JjBackend と
+# 同じ方針)。TUI は 1 イベントループ 1 スレッドで、重い処理は selection 変更
+# 時の `jj diff` 1 本だけ。tokio を持ち込むと runtime 分の起動コストと依存が
+# 増えるだけで、並行させる相手がいない。
+[dev-dependencies]
+tempfile = "3.27"

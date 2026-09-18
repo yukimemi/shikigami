@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 160" width="560" height="160" role="img" aria-label="shikigami">
+  <title>shikigami</title>
+  <!-- 式神 = 呪符に宿らせて使役する代理。左の札が jj の change graph を
+       握っているモチーフ。light mode 用 (濃い線 / 明るい背景想定)。 -->
+  <g fill="none" stroke="#1f2933" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <!-- 呪符 (paper talisman) -->
+    <path d="M32 20 h72 v120 h-72 z" fill="#fdfaf3" />
+    <path d="M44 44 h48 M44 60 h48 M44 76 h30" stroke="#b9472f" />
+    <!-- 札の下部に刻む jj の change graph -->
+    <circle cx="56" cy="102" r="6" fill="#1f2933" />
+    <path d="M56 108 v14" />
+    <circle cx="56" cy="128" r="6" fill="#fdfaf3" />
+    <path d="M62 102 l18 -12" />
+    <circle cx="86" cy="86" r="6" fill="#fdfaf3" />
+  </g>
+  <text x="140" y="92" font-family="'Iosevka','JetBrains Mono','Consolas',monospace" font-size="54" font-weight="700" fill="#1f2933">shikigami</text>
+  <text x="142" y="122" font-family="'Iosevka','JetBrains Mono','Consolas',monospace" font-size="19" fill="#5b6b7b">a terminal UI for Jujutsu (jj)</text>
+</svg>
