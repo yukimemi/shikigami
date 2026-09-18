@@ -63,8 +63,13 @@ jobs:
           set -euo pipefail
           url="https://github.com/jj-vcs/jj/releases/download/${JJ_VERSION}/jj-${JJ_VERSION}-x86_64-unknown-linux-musl.tar.gz"
           curl -fsSL "$url" -o jj.tar.gz
-          tar xzf jj.tar.gz jj
-          install -m 0755 jj "$HOME/.local/bin/jj" 2>/dev/null || { mkdir -p "$HOME/.local/bin"; install -m 0755 jj "$HOME/.local/bin/jj"; }
+          # Members are stored with a `./` prefix (`./jj`, `./README.md`),
+          # so naming `jj` as an extract target fails with "Not found in
+          # archive". Unpack the lot into a scratch dir instead.
+          mkdir -p jj-dist "$HOME/.local/bin"
+          tar xzf jj.tar.gz -C jj-dist
+          install -m 0755 jj-dist/jj "$HOME/.local/bin/jj"
+          rm -rf jj-dist jj.tar.gz
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install jj (Windows)
