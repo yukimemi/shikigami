@@ -10,6 +10,51 @@ use std::process::Command;
 use crate::app::App;
 use crate::jj::Jj;
 
+/// `jj` が PATH に居るか。
+///
+/// kata 由来の `ci.yml` (`cargo test --all-targets` を 3 OS で回す) は
+/// jj を入れない。テストを無条件に落とすと、その generic matrix が
+/// 永続的に赤くなって signal を失う。なので jj が無ければ skip し、
+/// 代わりに repo 所有の `.github/workflows/jj.yml` が jj を入れて
+/// `SHIKIGAMI_REQUIRE_JJ=1` で走らせる。そこでは skip が panic になる
+/// ので、「どこでも skip されて誰も気付かない」にはならない。
+pub fn jj_available() -> bool {
+    Command::new("jj")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// skip を記録する。`SHIKIGAMI_REQUIRE_JJ=1` なら失敗させる。
+pub fn report_skip() {
+    assert!(
+        std::env::var_os("SHIKIGAMI_REQUIRE_JJ").is_none(),
+        "SHIKIGAMI_REQUIRE_JJ is set but `jj` is not on PATH — this job exists \
+         precisely to run the jj-backed tests"
+    );
+    eprintln!("skipping: `jj` is not on PATH");
+}
+
+/// jj が無い環境では `None`。
+pub fn try_repo() -> Option<(tempfile::TempDir, App)> {
+    jj_available().then(repo)
+}
+
+/// `repo()` の結果を受けるか、jj が無ければテストを抜ける。
+macro_rules! repo_or_skip {
+    () => {
+        match $crate::testutil::try_repo() {
+            Some(pair) => pair,
+            None => {
+                $crate::testutil::report_skip();
+                return;
+            }
+        }
+    };
+}
+pub(crate) use repo_or_skip;
+
 /// `jj` を repo 内の設定だけで動かす。実行環境の
 /// `~/.config/jj/config.toml` (revsets.log や template の上書き、
 /// ui.editor) に結果を左右されないようにする。

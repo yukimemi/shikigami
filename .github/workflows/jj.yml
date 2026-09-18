@@ -1,0 +1,91 @@
+# jj-backed tests.
+#
+# Consumer-owned (NOT kata-managed): the shared `ci.yml` from
+# `yukimemi/pj-rust` runs `cargo test --all-targets` on three runners
+# with no `jj` installed, and shikigami's interesting tests drive a real
+# `jj` binary against real repos in temp dirs. Those tests skip
+# themselves when `jj` is absent (see `src/testutil.rs`) so the generic
+# matrix stays meaningful instead of being permanently red.
+#
+# This job is where the skip is not allowed: it installs jj and sets
+# `SHIKIGAMI_REQUIRE_JJ=1`, which turns "jj missing" into a test
+# failure. If this workflow is ever deleted, the jj-backed tests stop
+# being enforced anywhere — keep it.
+#
+# Two runners on purpose: Linux and Windows differ in the parts most
+# likely to break (path handling, CRLF in `jj log` output, ConPTY key
+# events). macOS adds nothing those two do not already cover.
+
+name: jj
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  SHIKIGAMI_REQUIRE_JJ: "1"
+  # renovate: datasource=github-releases depName=jj-vcs/jj
+  JJ_VERSION: v0.45.1
+
+jobs:
+  test:
+    name: jj tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+        # Same transient GH Actions cache flake the shared ci.yml
+        # guards against on windows-latest: fall through to a cold
+        # build rather than failing the job.
+        continue-on-error: true
+
+      # Release binaries instead of `cargo install jj-cli`: the crate
+      # takes minutes to build on every run and would dominate this
+      # job. musl on Linux so the binary is glibc-agnostic.
+      - name: Install jj (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          url="https://github.com/jj-vcs/jj/releases/download/${JJ_VERSION}/jj-${JJ_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL "$url" -o jj.tar.gz
+          tar xzf jj.tar.gz jj
+          install -m 0755 jj "$HOME/.local/bin/jj" 2>/dev/null || { mkdir -p "$HOME/.local/bin"; install -m 0755 jj "$HOME/.local/bin/jj"; }
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install jj (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/jj-vcs/jj/releases/download/$env:JJ_VERSION/jj-$env:JJ_VERSION-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -Uri $url -OutFile jj.zip
+          Expand-Archive -Path jj.zip -DestinationPath "$env:RUNNER_TEMP\jj"
+          "$env:RUNNER_TEMP\jj" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # The tests create repos whose commits need an author; jj has no
+      # repo yet at this point, so configure the user globally.
+      - name: Configure jj user
+        shell: bash
+        run: |
+          jj --version
+          jj config set --user user.name "ci"
+          jj config set --user user.email "ci@example.com"
+
+      - run: cargo test --locked --all-targets
+      # The release pipeline runs this on every published target; make
+      # sure it works here too, where jj actually exists.
+      - run: cargo run --locked --example smoke

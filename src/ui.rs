@@ -278,7 +278,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use crate::testutil::repo;
+    use crate::testutil::repo_or_skip;
 
     /// frame を 1 枚描いて、cell の中身を行ごとの文字列にする。
     /// PTY をキャプチャすると ratatui の差分描画 (cursor 移動) で
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn log_pane_keeps_the_graph_prefix_and_separates_the_columns() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         let lines = render(&mut app, 120, 20);
         let joined = lines.join("\n");
 
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn status_bar_reports_mark_and_rebase_mode() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         assert!(render(&mut app, 120, 20).last().unwrap().contains("mark:-"));
 
         app.handle_key(key(KeyCode::Char('m')));
@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn marked_row_is_flagged_in_the_log() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         app.handle_key(key(KeyCode::Char('m')));
         let marked = app.marked.as_ref().unwrap().short_id.clone();
         let lines = render(&mut app, 120, 20);
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn confirm_overlay_shows_the_change_it_will_destroy() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         app.handle_key(key(KeyCode::Char('a')));
         let joined = render(&mut app, 120, 20).join("\n");
         assert!(joined.contains("confirm"), "{joined}");
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn help_overlay_lists_every_documented_key() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         app.handle_key(key(KeyCode::Char('?')));
         // 画面を十分大きくして全行出す。KEYS が増えたとき help の箱が
         // 足りなくなるのをここで検知する。
@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn diff_pane_titles_the_selected_change() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         let selected = app.selected_change().unwrap().clone();
         let joined = render(&mut app, 140, 24).join("\n");
         assert!(

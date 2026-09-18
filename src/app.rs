@@ -660,7 +660,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::repo;
+    use crate::testutil::repo_or_skip;
     use std::path::Path;
     use std::process::Command;
 
@@ -684,7 +684,7 @@ mod tests {
 
     #[test]
     fn log_is_loaded_with_working_copy_marked() {
-        let (_tmp, app) = repo();
+        let (_tmp, app) = repo_or_skip!();
         let descs = descriptions(&app);
         assert!(
             descs.iter().any(|d| d == "third change"),
@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn navigation_skips_connector_rows_and_clamps() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         // connector を挟んでも Change 行だけを辿る。
         let mut seen = Vec::new();
         for _ in 0..10 {
@@ -723,7 +723,7 @@ mod tests {
 
     #[test]
     fn describe_rewrites_the_selected_change() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         // 2 番目 (second change) に合わせる。
         while app.selected_change().unwrap().description != "second change" {
             app.handle_key(key(KeyCode::Char('j')));
@@ -754,7 +754,7 @@ mod tests {
 
     #[test]
     fn escape_cancels_input_without_touching_the_repo() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         let before = descriptions(&app);
         app.handle_key(key(KeyCode::Char('e')));
         for c in "junk".chars() {
@@ -768,7 +768,7 @@ mod tests {
 
     #[test]
     fn squash_requires_a_mark_and_then_merges_into_it() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         // mark 無しで s を押しても repo は変わらず、理由が status に出る。
         app.handle_key(key(KeyCode::Char('s')));
         assert_eq!(app.status.kind, StatusKind::Error);
@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn confirm_dialog_rejects_anything_but_yes() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         let before = descriptions(&app);
         app.handle_key(key(KeyCode::Char('a')));
         assert!(matches!(app.mode, Mode::Confirm(_)));
@@ -812,7 +812,7 @@ mod tests {
 
     #[test]
     fn abandon_then_undo_restores_the_change() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         while app.selected_change().unwrap().description != "second change" {
             app.handle_key(key(KeyCode::Char('j')));
         }
@@ -833,7 +833,7 @@ mod tests {
 
     #[test]
     fn immutable_root_commit_failure_is_surfaced_not_panicked() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         // root commit は log の末尾。abandon は jj 側で必ず拒否される。
         app.handle_key(key(KeyCode::Char('G')));
         app.handle_key(key(KeyCode::Char('a')));
@@ -850,7 +850,7 @@ mod tests {
 
     #[test]
     fn rebase_without_mark_prompts_for_a_revset_and_rebases() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         let target = {
             // `first change` の change id を控えておく。
             while app.selected_change().unwrap().description != "first change" {
@@ -912,7 +912,7 @@ mod tests {
 
     #[test]
     fn mark_is_dropped_when_the_marked_change_disappears() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         while app.selected_change().unwrap().description != "third change" {
             app.handle_key(key(KeyCode::Char('j')));
         }
@@ -930,7 +930,7 @@ mod tests {
 
     #[test]
     fn diff_pane_is_loaded_for_the_selection_and_scrolls_within_bounds() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         while app.selected_change().unwrap().description != "second change" {
             app.handle_key(key(KeyCode::Char('j')));
         }
@@ -976,7 +976,7 @@ mod tests {
     fn key_release_events_are_ignored() {
         // ConPTY は Press/Release を両方投げる。Release で二重に動くと
         // Windows だけカーソルが 2 行飛ぶ。
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         let start = app.selected_change().unwrap().id.clone();
         let mut release = key(KeyCode::Char('j'));
         release.kind = KeyEventKind::Release;
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn revset_toggle_switches_between_all_and_default() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         app.revset = None;
         app.reload().unwrap();
         app.handle_key(key(KeyCode::Char('A')));
@@ -998,7 +998,7 @@ mod tests {
 
     #[test]
     fn new_child_with_empty_message_is_allowed() {
-        let (_tmp, mut app) = repo();
+        let (_tmp, mut app) = repo_or_skip!();
         let before = app.rows.len();
         app.handle_key(key(KeyCode::Char('n')));
         app.handle_key(key(KeyCode::Enter));
