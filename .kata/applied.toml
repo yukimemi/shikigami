@@ -23,6 +23,7 @@ once_applied = true
 once_applied = true
 
 [files.".editorconfig"]
+content_hash = "02e4337db1bb05d6b19fdfb51328eb000ceb17c635273c63a66767698242b0a4"
 once_applied = true
 
 [files.".gemini/settings.json"]
