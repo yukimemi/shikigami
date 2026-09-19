@@ -1,6 +1,6 @@
 [package]
 name = "shikigami"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Terminal UI for Jujutsu (jj): browse the change graph, read diffs, and drive new/edit/describe/squash/rebase/abandon without leaving the log"
 license = "MIT"
