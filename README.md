@@ -109,6 +109,14 @@ Any CLI that can read a diff on stdin works (`aichat`, `sgpt`, `mods`, your own 
 output is folded to a single line; the prompt only ever holds one. Without `SHIKIGAMI_AI_CMD` set,
 `Ctrl-g` reports the missing configuration in the status bar instead of doing nothing silently.
 
+**If your `SHIKIGAMI_AI_CMD` is an agentic coding CLI (Claude Code, opencode, Codex, …)
+rather than a plain completion tool, disable its tool/file-edit access.** The diff is untrusted
+content (it can contain anything a contributor typed) piped straight into that command; an
+agent with tool access may try to *act* on a diff instead of just describing it — up to and
+including editing files in whatever directory it's launched from. E.g. for Claude Code, add
+`--allowedTools ""` to deny every tool; running with tools denied is also markedly more reliable
+for this one-line-summary use case than leaving them enabled.
+
 ## Design notes
 
 - **jj CLI, not `jj-lib`.** `jj-lib` has no semver guarantee; the CLI's template language and flags
