@@ -548,6 +548,15 @@ impl App {
                 },
             };
             let mut text = self.header.clone();
+            // フィルタが失敗した回、直前の操作結果を一度も見せずに status
+            // を上書きするのを避けたときに立てる (`status_fresh` 参照)。
+            // 立った場合は shown_diff/shown_diff_width を更新しない —
+            // 次フレームでまだ状況が同じなら再試行し、そのときは
+            // (status_fresh はもう立っていないので) 実際にエラーを
+            // status bar へ報告する。更新してしまうと、この
+            // (commit, path, width) キーに落ち着いている限り再試行され
+            // ず、フィルタが壊れていることが一度も表に出ないままになる。
+            let mut suppressed_error = false;
             if diff_raw.trim().is_empty() {
                 text.extend(Text::from("(no changes)"));
             } else {
@@ -557,10 +566,10 @@ impl App {
                         Err(err) => {
                             // フィルタが壊れていても diff pane を空にはしない —
                             // jj の生出力にフォールバックしつつ、原因は
-                            // status bar に出す。ただし直前の操作結果を
-                            // 一度も見せずに消してしまうことは避ける
-                            // (`status_fresh` 参照)。
-                            if !status_just_reported {
+                            // status bar に出す。
+                            if status_just_reported {
+                                suppressed_error = true;
+                            } else {
                                 self.status = Status::error(format!(
                                     "{}: {err}",
                                     crate::diff_filter::DIFF_FILTER_ENV
@@ -574,8 +583,10 @@ impl App {
                 text.extend(parse_ansi(&rendered));
             }
             self.diff = text;
-            self.shown_diff = Some(key);
-            self.shown_diff_width = Some(diff_width);
+            if !suppressed_error {
+                self.shown_diff = Some(key);
+                self.shown_diff_width = Some(diff_width);
+            }
             if selection_changed {
                 self.diff_scroll = 0;
             }
@@ -1460,6 +1471,46 @@ mod tests {
             app.status
         );
         assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+    }
+
+    #[cfg(unix)]
+    fn fail_on_new_content_cmd() -> &'static str {
+        "if grep -q new-content; then exit 1; else cat; fi"
+    }
+    #[cfg(windows)]
+    fn fail_on_new_content_cmd() -> &'static str {
+        "findstr new-content >nul && exit /b 1 || more"
+    }
+
+    #[test]
+    fn diff_filter_failure_suppressed_after_reload_is_still_reported_next_frame() {
+        let (_tmp, mut app) = repo_or_skip!();
+        app.diff_filter_cmd = Some(fail_on_new_content_cmd().to_string());
+        app.sync_diff(80);
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+
+        // 別プロセスによる working copy への変更を模す。フィルタは
+        // "new-content" を含む diff だけ失敗する。
+        std::fs::write(app.jj.root().join("b.txt"), "new-content\n").unwrap();
+        app.handle_key(ctrl('r'));
+        assert_eq!(app.status.text, "reloaded");
+
+        // reload 直後の 1 回はまだ "reloaded" を見せる (直前の操作結果を
+        // 一度も見せずに消さないための抑制)。
+        app.sync_diff(80);
+        assert_eq!(app.status.text, "reloaded", "{:?}", app.status);
+
+        // だが、選択が変わらなければ次のフレームで必ず再試行され、壊れた
+        // フィルタは実際に status bar へ出る — 抑制した分を
+        // shown_diff/shown_diff_width に記録して二度と再試行しない、と
+        // いうことがあってはならない。
+        app.sync_diff(80);
+        assert_eq!(
+            app.status.kind,
+            StatusKind::Error,
+            "filter failure after reload was silently swallowed forever: {:?}",
+            app.status
+        );
     }
 
     #[test]
