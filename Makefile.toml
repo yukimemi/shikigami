@@ -203,3 +203,34 @@ description = "Wired to renri's [[hooks.post_create]] — runs in a freshly crea
 # moved — see yukimemi/pj-base#8 for the companion change in
 # `renri.toml.base`.
 dependencies = ["apm-install", "vcs-fetch"]
+
+# ─── vhs / demo GIF regeneration ───────────────────────────────────────
+# Native vhs hangs on `Set Theme` on Windows, so the GIF is produced in a
+# Docker image (vhs + jj + shikigami) driven from cargo-make. The image
+# also builds the demo's jj repo itself, so the GIF never depends on the
+# author's working copy.
+#
+# Windows prerequisite: Docker Engine inside WSL2 (Docker Desktop not
+# required) — these tasks shell out via `wsl -- docker ...`.
+# Linux / macOS: a real `docker` on PATH is enough.
+
+[tasks.vhs-build]
+description = "Build the shikigami-vhs Docker image (~4 min first time, cached after)"
+cwd = "vhs"
+command = "docker"
+args = ["build", "-t", "shikigami-vhs", "."]
+
+[tasks.vhs-build.windows]
+command = "wsl"
+args = ["--", "docker", "build", "-t", "shikigami-vhs", "."]
+
+[tasks.vhs-regen]
+description = "Regenerate vhs/demo.gif (or another tape via `cargo make vhs-regen <tape>`)"
+dependencies = ["vhs-build"]
+cwd = "vhs"
+command = "bash"
+args = ["regen.sh", "${@}"]
+
+[tasks.vhs-regen.windows]
+command = "wsl"
+args = ["--", "bash", "regen.sh", "${@}"]

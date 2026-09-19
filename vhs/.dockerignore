@@ -1,0 +1,4 @@
+# The build context only needs the Dockerfile: tapes are bind-mounted at
+# run time, and the generated GIFs would just bloat the context.
+*
+!Dockerfile

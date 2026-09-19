@@ -1,12 +1,19 @@
+<!-- Absolute raw URLs, not repo-relative paths: crates.io serves this
+     README off its own domain, so `assets/logo.svg` 404s there (and the
+     `#gh-light-mode-only` fragment trick is GitHub-only, which is why the
+     dark variant goes through <picture> instead). -->
 <p align="center">
-  <img src="assets/logo.svg#gh-light-mode-only" width="560" alt="shikigami">
-  <img src="assets/logo-dark.svg#gh-dark-mode-only" width="560" alt="shikigami">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/yukimemi/shikigami/main/assets/logo-dark.svg">
+    <img src="https://raw.githubusercontent.com/yukimemi/shikigami/main/assets/logo.svg" width="560" alt="shikigami">
+  </picture>
 </p>
 
 <p align="center">
   <a href="https://github.com/yukimemi/shikigami/actions/workflows/ci.yml"><img src="https://github.com/yukimemi/shikigami/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/yukimemi/shikigami/actions/workflows/jj.yml"><img src="https://github.com/yukimemi/shikigami/actions/workflows/jj.yml/badge.svg" alt="jj tests"></a>
   <a href="https://crates.io/crates/shikigami"><img src="https://img.shields.io/crates/v/shikigami.svg" alt="crates.io"></a>
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
+  <a href="https://github.com/yukimemi/shikigami/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
 </p>
 
 <p align="center">
@@ -14,6 +21,14 @@
   with its diffs, and run <code>new</code> / <code>edit</code> / <code>describe</code> /
   <code>squash</code> / <code>rebase</code> / <code>abandon</code> / <code>undo</code> without
   leaving the log.
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/yukimemi/shikigami/main/vhs/demo.gif" width="900" alt="shikigami demo: browsing the jj change graph, describing a change, squashing into a marked target, then undoing it">
+</p>
+
+<p align="center">
+  <sub>Regenerate with <code>cargo make vhs-regen</code> — the tape builds its own throwaway jj repo, so the GIF never depends on a working copy.</sub>
 </p>
 
 ## Why
