@@ -1,0 +1,127 @@
+# magi on shikigami: pre-merge review, competition when a task is worth one.
+#
+# **Only what is peculiar to this checkout lives here.** The roster, the seat
+# assignment, the shape of a run and the update policy live in the machine
+# layer (`<config_dir>/magi/config.toml`), because none of them are facts
+# about this repository: they are facts about which agent CLIs are installed
+# and what the operator is willing to spend. Stating them once there is the
+# point of having layers, and it keeps this file to the things a different
+# machine would still need to be told.
+#
+# What that leaves, and why each one has to be here:
+#
+# - `[verify]` runs `cargo`. A repository that is not Rust cannot inherit it,
+#   and `gate` in particular has to match `.github/workflows/ci.yml` exactly:
+#   a gate looser than CI is the one failure this whole setup cannot absorb —
+#   a clean `magi run` that still turns into a red PR.
+# - `[merge] base` names this repository's default branch, and is required at
+#   all because of how this checkout is set up (see below).
+# - `[prompts]` are this project's conventions.
+#
+# Note that an array may be declared in exactly one layer
+# (`Config::refuse_split_arrays`). The roster (`[[agents]]`) and `[roles]`'s
+# lists already live in the machine layer, so they must not be restated here
+# — same reason `[graph]` and `[update]` stay there too: none of them are
+# facts about this checkout.
+#
+# Rendered by teravars itself. Tera braces are live everywhere in this file,
+# but comments are stripped before Tera sees them (teravars >= 0.2.2), so a
+# comment may quote `{{ ... }}` freely.
+
+[vars]
+# Shared build cache for the verification commands. Override per machine with
+# MAGI_CACHE. Lives beside its only consumer: `[vars]` is rendered per file,
+# so a value used by this file's templates is stated in this file.
+cache = "{{ env.MAGI_CACHE | default(value='/tmp') }}"
+
+[verify]
+# The real-machine leg, run in the winner's worktree once per review round;
+# its output goes to the fixer.
+#
+# CARGO_TARGET_DIR is shared on purpose: each candidate worktree would
+# otherwise compile this crate from scratch, which is by far the slowest
+# thing in a review round on a Rust repo. Only the winner's worktree runs
+# these commands, and only one at a time, so nothing contends on cargo's lock.
+#
+# `e2e` does not force `jj` to be present. shikigami's interesting tests drive
+# a real `jj` binary against throwaway repos in a temp dir (see
+# `src/testutil.rs`) and skip themselves when `jj` is missing from PATH, so
+# this leg is a fast per-round signal for the fixer, not the final word — see
+# `gate` below for why the final word does require `jj`.
+e2e = ["CARGO_TARGET_DIR={{ vars.cache }}/shikigami-target cargo test --locked --all-targets"]
+# The final gate before merge. Must match the set `.github/workflows/ci.yml`
+# runs. `Makefile.toml`'s `[tasks.check]` already advertises itself as "same
+# as CI" and lists its dependencies as editorconfig-check + fmt-check +
+# clippy + test (+ test-doc, since `src/lib.rs` exists) + lock-check, which
+# line up with ci.yml's editorconfig / fmt / clippy / test / lockfile jobs
+# (lock-check's `cargo check --locked --all-targets` also covers the plain
+# `check` job, since anything that compiles --locked also compiles unlocked).
+# editorconfig-check is present on both sides, which is the state that
+# matters — it would be just as correct for neither side to have it, but one
+# side without the other is exactly the drift this gate exists to prevent. So
+# the gate is `cargo make check`.
+#
+# `[tasks.editorconfig-check]` itself degrades to a no-op when the
+# `editorconfig-checker` binary isn't on the gate machine's PATH ("skipped
+# locally ... still enforced in CI", per its own description), while ci.yml's
+# `editorconfig` job always installs it via a dedicated Action step. Calling
+# the bare binary directly from this gate to force that check was tried and
+# reverted on other repos in this layer: unlike CI, nothing here provisions
+# the tool, so on a gate machine that never had it installed the command
+# itself is missing (exit 127) — a hard failure unrelated to any actual
+# `.editorconfig` violation, and worse than the soft-skip it was meant to
+# replace. Closing that gap for real means the gate machine has
+# `editorconfig-checker` installed (see the task's own install link), not
+# something this file can paper over on its own.
+#
+# ci.yml's `coverage` job (cargo llvm-cov + Codecov upload) is deliberately
+# left out: it uploads to an external service and is explicitly configured
+# not to fail the build (`fail_ci_if_error: false`), so it can never turn a
+# clean magi run into a red PR — the one thing this gate has to prevent.
+#
+# `ci.yml` is not the only required workflow, though: `.github/workflows/jj.yml`
+# sets `SHIKIGAMI_REQUIRE_JJ=1` and turns "jj is missing" from a skip into a
+# test failure, because shikigami's actual job is driving `jj`, and a change
+# that breaks that is exactly what the jj-backed tests exist to catch. Without
+# the same env var here, this gate could go green on a change that breaks jj
+# integration and only fail once the PR's jj CI runs — the "clean run, red PR"
+# failure this file exists to rule out. Unlike editorconfig-checker, requiring
+# the tool here isn't asking a gate machine to be provisioned with something
+# unrelated to the repo's purpose: shikigami is a `jj` TUI, so a machine used
+# to review it is expected to already have `jj` on PATH.
+gate = ["CARGO_TARGET_DIR={{ vars.cache }}/shikigami-target SHIKIGAMI_REQUIRE_JJ=1 cargo make check"]
+
+[merge]
+# Not overridden to "none": the machine-layer default of "pr" is what lets
+# `magi task add` work queued by `magi serve` / `magi web` land as a reviewable
+# PR once review + gate pass, instead of stopping short with nothing for the
+# operator to look at. `yukimemi/magi`'s own repository hit exactly that
+# problem — a repo-layer `mode = "none"` left queue-completed runs stuck at the
+# gate with no PR — and fixed it the same way. `magi review` invoked by hand
+# is unaffected: per this repository's AGENTS.md, it is always called with an
+# explicit `--merge none`, which overrides whatever this file says for that
+# one invocation.
+#
+# `base` is required here, and in every jj-colocated repo: jj keeps git's HEAD
+# detached at the working-copy commit, so magi cannot infer the base branch
+# from `git symbolic-ref HEAD`.
+base = "main"
+
+# Project conventions appended to the node prompts, never merged into them.
+# Repository-wide context lives in AGENTS.md, which every agent already reads
+# from the checkout; these are the things a magi *node* needs to know.
+[prompts]
+all = """
+This repository uses jj (Jujutsu) with a colocated git repo. `git commit` works \
+in a candidate worktree and is what magi expects, but never run `jj` commands \
+and never touch the main working copy.
+`verify.gate` sets `SHIKIGAMI_REQUIRE_JJ=1`, so a clean gate does mean the \
+jj-backed tests ran and passed. `verify.e2e` does not set it and only gives a \
+fast per-round signal; the jj-backed tests silently skip there when `jj` \
+isn't on PATH (see `src/testutil.rs`), so do not read a clean `verify.e2e` \
+alone as "jj-tested".
+shikigami's TUI runs on an alternate screen (see `src/tui.rs`): never add \
+print-style debugging that writes to stdout/stderr while it's active, and \
+never re-interpret or strip `jj`'s ANSI output by hand — it is meant to reach \
+the screen through `ansi_to_tui` as-is.
+"""
