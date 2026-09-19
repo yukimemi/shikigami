@@ -172,6 +172,11 @@ pub struct App {
     /// 直近に `diff` を反映した (commit_id, path)。
     /// これが変わったときだけ diff pane の scroll を先頭に戻す。
     shown_diff: Option<(String, Option<String>)>,
+    /// `shown_diff` を最後に反映したときの `diff_width`。
+    /// `diff_filter_cmd` が設定されているときだけ意味を持つ — フィルタは
+    /// `COLUMNS` として幅を受け取るので、選択が変わらなくてもリサイズで
+    /// 幅が変われば再実行が必要 (`sync_diff` 参照)。
+    shown_diff_width: Option<u16>,
     /// 起動時にバックグラウンドで走らせた `jj log`/`jj status` の
     /// 結果を受け取るチャネル。終わるまでは `None` のまま Some で残る。
     startup_rx: Option<mpsc::Receiver<ReloadResult>>,
@@ -191,6 +196,13 @@ pub struct App {
     /// `None` なら diff pane は jj の生出力をそのまま使う
     /// (`crate::diff_filter` 参照)。
     pub diff_filter_cmd: Option<String>,
+    /// 直前の `handle_key` が `status` を実際に書き換えたか。
+    /// `sync_diff` はこのフラグが立っている次の 1 回だけ、diff-filter
+    /// 失敗による status 上書きを控える — 描画順が `handle_key` の次に
+    /// `sync_diff` → `draw` なので、ここで無条件に上書きすると操作結果
+    /// (例: describe/rebase の成功メッセージ) が画面に一度も出ないまま
+    /// filter のエラーに消される (`sync_diff` 参照)。
+    status_fresh: bool,
     pub should_quit: bool,
 }
 
@@ -217,6 +229,7 @@ impl App {
             diff_cache,
             shown_commit: None,
             shown_diff: None,
+            shown_diff_width: None,
             startup_rx: None,
             startup_error: None,
             diff_scroll: 0,
@@ -227,6 +240,7 @@ impl App {
             diff_filter_cmd: std::env::var(crate::diff_filter::DIFF_FILTER_ENV)
                 .ok()
                 .filter(|cmd| !cmd.trim().is_empty()),
+            status_fresh: false,
             should_quit: false,
         };
         app.begin_reload();
@@ -451,10 +465,14 @@ impl App {
     ///
     /// `diff_width` は `SHIKIGAMI_DIFF_FILTER` (`crate::diff_filter`) が
     /// 設定されているときだけ使う — フィルタの子プロセスへ `COLUMNS` と
-    /// して渡す diff pane の実幅。選択が変わらない限り取り直さないので、
-    /// 端末リサイズ中は次に選択を動かすまで古い幅のまま — diff pane 自体
-    /// が折り返しをしない設計 (`ui::draw_diff` 参照) と同じ割り切り。
+    /// して渡す diff pane の実幅。選択が同じでも、前回フィルタを実行した
+    /// ときの幅 (`shown_diff_width`) と異なればフィルタを再実行する
+    /// (`diff_raw` 自体は commit/path キーのキャッシュを使い回すので、
+    /// jj を呼び直すわけではない)。
     pub fn sync_diff(&mut self, diff_width: u16) {
+        // 直前の `handle_key` が status を書き換えていたら、その 1 回だけ
+        // diff-filter 失敗による上書きを控える (`status_fresh` 参照)。
+        let status_just_reported = std::mem::take(&mut self.status_fresh);
         let Some(change) = self.selected_change() else {
             self.files = Vec::new();
             self.file_selected = 0;
@@ -462,6 +480,7 @@ impl App {
             self.diff = Text::default();
             self.shown_commit = None;
             self.shown_diff = None;
+            self.shown_diff_width = None;
             return;
         };
         let rev = change.id.clone();
@@ -502,7 +521,13 @@ impl App {
 
         let path = self.selected_file().map(|f| f.path.clone());
         let key = (commit_id.clone(), path.clone());
-        if self.shown_diff.as_ref() != Some(&key) {
+        let selection_changed = self.shown_diff.as_ref() != Some(&key);
+        // フィルタ設定時は選択が同じでも、リサイズで幅が変わったら
+        // 再実行する — フィルタの子プロセスへ渡す `COLUMNS` が古いままだと
+        // side-by-side 出力が実幅に合わなくなる。
+        let width_changed =
+            self.diff_filter_cmd.is_some() && self.shown_diff_width != Some(diff_width);
+        if selection_changed || width_changed {
             let cached = self
                 .diff_cache
                 .get(&commit_id)
@@ -532,11 +557,15 @@ impl App {
                         Err(err) => {
                             // フィルタが壊れていても diff pane を空にはしない —
                             // jj の生出力にフォールバックしつつ、原因は
-                            // status bar に出す。
-                            self.status = Status::error(format!(
-                                "{}: {err}",
-                                crate::diff_filter::DIFF_FILTER_ENV
-                            ));
+                            // status bar に出す。ただし直前の操作結果を
+                            // 一度も見せずに消してしまうことは避ける
+                            // (`status_fresh` 参照)。
+                            if !status_just_reported {
+                                self.status = Status::error(format!(
+                                    "{}: {err}",
+                                    crate::diff_filter::DIFF_FILTER_ENV
+                                ));
+                            }
                             diff_raw.clone()
                         }
                     },
@@ -546,7 +575,10 @@ impl App {
             }
             self.diff = text;
             self.shown_diff = Some(key);
-            self.diff_scroll = 0;
+            self.shown_diff_width = Some(diff_width);
+            if selection_changed {
+                self.diff_scroll = 0;
+            }
         }
     }
 
@@ -664,6 +696,7 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        let status_before = self.status.clone();
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Normal => self.handle_normal(key),
             Mode::Help => {
@@ -674,6 +707,9 @@ impl App {
             }
             Mode::Input(input) => self.handle_input(key, input),
             Mode::Confirm(confirm) => self.handle_confirm(key, confirm),
+        }
+        if self.status != status_before {
+            self.status_fresh = true;
         }
     }
 
@@ -1338,6 +1374,33 @@ mod tests {
     }
 
     #[test]
+    fn diff_filter_cmd_reruns_on_resize_without_changing_the_selection() {
+        let (_tmp, mut app) = repo_or_skip!();
+        while app.selected_change().unwrap().description != "second change" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.diff_filter_cmd = Some(wrap_cmd().to_string());
+        app.sync_diff(42);
+        app.sync_diff(80);
+        let text = app
+            .diff
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("WIDTH:80"),
+            "resize with the same selection did not re-run the filter with the new width: {text}"
+        );
+    }
+
+    #[test]
     fn broken_diff_filter_cmd_falls_back_to_the_raw_diff() {
         let (_tmp, mut app) = repo_or_skip!();
         while app.selected_change().unwrap().description != "second change" {
@@ -1370,6 +1433,36 @@ mod tests {
     }
 
     #[test]
+    fn broken_diff_filter_cmd_does_not_clobber_a_fresh_action_status() {
+        let (_tmp, mut app) = repo_or_skip!();
+        while app.selected_change().unwrap().description != "second change" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.diff_filter_cmd = Some("exit 1".to_string());
+        // describe 前の commit_id 分のキャッシュを埋めておく。
+        app.sync_diff(80);
+
+        app.handle_key(key(KeyCode::Char('e')));
+        for c in "-renamed".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+        let status_after_describe = app.status.text.clone();
+
+        // describe で commit_id が変わったので、次の sync_diff は新しい
+        // diff を取り直し、フィルタが壊れているので失敗する。それでも
+        // 直前の describe 成功メッセージを一度も見せずに消してはいけない。
+        app.sync_diff(80);
+        assert_eq!(
+            app.status.text, status_after_describe,
+            "diff-filter failure overwrote the just-reported action status: {:?}",
+            app.status
+        );
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+    }
+
+    #[test]
     fn files_pane_lists_every_changed_file_and_diff_follows_the_selection() {
         let (_tmp, mut app) = repo_or_skip!();
         // working copy (third change) に 2 ファイル追加して、files pane に
@@ -1399,11 +1492,14 @@ mod tests {
         };
 
         // 先頭ファイルだけが diff pane に出て、もう一方は出ない。
+        // `jj diff` はもう `--git` を強制しない (ui.diff-formatter に従う)
+        // ので、ヘッダの厳密な文字列ではなくパス名の有無だけを見る —
+        // どの formatter でもファイルパスはヘッダに出る。
         let first_path = app.files[0].path.clone();
         let second_path = app.files[1].path.clone();
         let first_text = text_of(&app);
-        assert!(first_text.contains(&format!("diff --git a/{first_path}")));
-        assert!(!first_text.contains(&format!("diff --git a/{second_path}")));
+        assert!(first_text.contains(&first_path));
+        assert!(!first_text.contains(&second_path));
 
         // files pane に移って次のファイルへ動かすと、diff pane が切り替わる。
         app.handle_key(key(KeyCode::Tab));
@@ -1412,8 +1508,8 @@ mod tests {
         assert_eq!(app.file_selected, 1);
         app.sync_diff(80);
         let second_text = text_of(&app);
-        assert!(second_text.contains(&format!("diff --git a/{second_path}")));
-        assert!(!second_text.contains(&format!("diff --git a/{first_path}")));
+        assert!(second_text.contains(&second_path));
+        assert!(!second_text.contains(&first_path));
     }
 
     #[test]
