@@ -22,7 +22,11 @@ crossterm = { version = "0.29", features = ["events"] }
 # `jj diff --color always` の ANSI をそのまま ratatui の Text に変換するため。
 # diff の色付けを自前で実装すると jj 側の設定 (ui.diff-formatter, color
 # theme, word-level diff) を全部無視することになる。jj に色を付けさせて
-# 変換するだけなら、user の `~/.config/jj/config.toml` がそのまま効く。
+# 変換するだけなら、user の `~/.config/jj/config.toml` がそのまま効く
+# (`Jj::diff` は `--git` を強制しないので `ui.diff-formatter` に外部ツール
+# を設定していればそれも通る)。任意で `SHIKIGAMI_DIFF_FILTER`
+# (`src/diff_filter.rs`) がこの ANSI を delta のような外部ページャに
+# もう一段通せるが、shikigami 自身は依然として diff を一切再解釈しない。
 ansi-to-tui = "8.0.1"
 
 # jj の呼び出しは同期 std::process::Command で足りる (renri の JjBackend と

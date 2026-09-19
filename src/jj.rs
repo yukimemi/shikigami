@@ -241,10 +241,14 @@ impl Jj {
     }
 
     /// 選択中 change の diff。`--color always` なので ANSI 付き。
+    /// フォーマットは固定しない — jj の `ui.diff-formatter` (`:git` /
+    /// `:color-words` / difftastic のような外部ツール) にそのまま従う。
+    /// これにより shikigami は「シェルで見えるのと同じ見た目」という
+    /// README の設計方針を、diff-formatter を自前で選んだ場合にも保つ。
     /// `path` を渡すと、その 1 ファイル分だけに絞った diff になる
     /// (jj のファイルセット引数をそのまま流す)。
     pub fn diff(&self, rev: &str, path: Option<&str>) -> Result<String> {
-        let mut args = vec!["diff", "-r", rev, "--git"];
+        let mut args = vec!["diff", "-r", rev];
         if let Some(path) = path {
             args.push(path);
         }
