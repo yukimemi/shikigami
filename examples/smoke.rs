@@ -2,15 +2,24 @@
 //!
 //! `release.yml` runs `cargo run --release --target <T> --example smoke`
 //! for every matrix entry. shikigami の場合、lib テストが通っていても
-//! release バイナリが死ぬ経路は「jj を起動して template 出力を読む」
-//! ところに集中している (template 文法の非互換、graph マーカーの扱い、
-//! Windows の改行/コードページ)。そこを実際に 1 回通す。
+//! release バイナリが死ぬ経路は 2 つある:
 //!
-//! `jj` が無い runner では skip して exit 0 する。ここで落として
-//! release を止める価値はない (jj の有無は shikigami のバグではない)。
+//! 1. 「jj を起動して template 出力を読む」経路 (template 文法の非互換、
+//!    graph マーカーの扱い、Windows の改行/コードページ)。
+//! 2. `self-update` の HTTPS 経路 (kaishin -> reqwest -> rustls)。ここは
+//!    `cargo test` が通らない — rustls の `CryptoProvider` 未初期化パニック
+//!    は shoka v0.10.0 が release バイナリでだけ踏んだ (CI は 13 個とも
+//!    green だった) のと同じ罠なので、release 対象のバイナリで実際に
+//!    1 回ハンドシェイクさせる。認証は要らない (`GITHUB_TOKEN` があれば
+//!    kaishin が拾ってレート制限を避けるだけ)。
+//!
+//! `jj` が無い runner では 1. を skip して exit 0 する (jj の有無は
+//! shikigami のバグではない)。2. はネットワークがあれば常に実行する。
 
 use std::path::Path;
 use std::process::Command;
+
+use anyhow::Context;
 
 fn jj(dir: &Path, args: &[&str]) -> bool {
     Command::new("jj")
@@ -22,8 +31,14 @@ fn jj(dir: &Path, args: &[&str]) -> bool {
 }
 
 fn main() -> anyhow::Result<()> {
+    // `self-update --check` は install を伴わない: latest release を
+    // 取得して比較するだけの GET 1 本。rustls ハンドシェイクさえ通れば
+    // 「もう最新」でも「更新あり」でも成功なので、ここでは戻り値だけ見る。
+    shikigami::update::run(false, true).context("self-update HTTPS smoke check failed")?;
+    eprintln!("smoke: self-update HTTPS handshake ok");
+
     if Command::new("jj").arg("--version").output().is_err() {
-        eprintln!("smoke: `jj` not on PATH; skipping (exit 0)");
+        eprintln!("smoke: `jj` not on PATH; skipping jj checks (exit 0)");
         return Ok(());
     }
     let tmp = std::env::temp_dir().join(format!("shikigami-smoke-{}", std::process::id()));

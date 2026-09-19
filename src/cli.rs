@@ -51,6 +51,17 @@ pub enum Commands {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+
+    /// Update the shikigami binary itself to the latest GitHub release
+    SelfUpdate {
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Print availability and exit without installing
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -60,6 +71,7 @@ pub fn run() -> Result<()> {
             completion(shell);
             Ok(())
         }
+        Some(Commands::SelfUpdate { yes, check }) => crate::update::run(yes, check),
         None => launch(cli.repository, cli.revisions),
     }
 }

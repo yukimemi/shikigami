@@ -93,4 +93,16 @@ jobs:
       - run: cargo test --locked --all-targets
       # The release pipeline runs this on every published target; make
       # sure it works here too, where jj actually exists.
-      - run: cargo run --locked --example smoke
+      #
+      # smoke.rs now also does a `self-update --check` (kaishin) round-trip
+      # against the real GitHub releases API to catch a rustls handshake
+      # regression before release (see examples/smoke.rs). Unauthenticated
+      # that call shares GitHub's 60/hr-per-IP quota with every other
+      # Actions job on the same runner pool, which this job (unlike
+      # release.yml, which only runs on a tag push) hits on every PR/push —
+      # easily exhausted. `GITHUB_TOKEN` raises it to 5000/hr, same as
+      # release.yml's smoke step.
+      - name: smoke
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo run --locked --example smoke

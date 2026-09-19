@@ -28,6 +28,18 @@ ansi-to-tui = "8.0.1"
 # jj の呼び出しは同期 std::process::Command で足りる (renri の JjBackend と
 # 同じ方針)。TUI は 1 イベントループ 1 スレッドで、重い処理は selection 変更
 # 時の `jj diff` 1 本だけ。tokio を持ち込むと runtime 分の起動コストと依存が
-# 増えるだけで、並行させる相手がいない。
+# 増えるだけで、並行させる相手がいない — この方針は TUI 本体では変わらない。
+
+# Self-update (`shikigami self-update`) は kaishin 経由。TUI 実行時には
+# tokio ランタイムを一切立てない: src/update.rs がサブコマンド専用に
+# current_thread ランタイムをその場で組み立てて畳むだけで、renri の
+# Checker のようなバックグラウンド自動更新/banner は持ち込まない
+# (alternate screen 上の TUI に印字する隙間がない)。kaishin 自体が
+# tokio を "full" feature で要求するので、ここでの feature 指定は
+# 実質ドキュメント目的 (Builder::new_current_thread / block_on にしか
+# 使わない)。
+kaishin = "0.7.5"
+tokio = { version = "1.53", features = ["rt"] }
+
 [dev-dependencies]
 tempfile = "3.27"
