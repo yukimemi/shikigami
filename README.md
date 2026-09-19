@@ -1,7 +1,12 @@
-<!-- Absolute raw URLs, not repo-relative paths: crates.io serves this
-     README off its own domain, so `assets/logo.svg` 404s there (and the
-     `#gh-light-mode-only` fragment trick is GitHub-only, which is why the
-     dark variant goes through <picture> instead). -->
+<!-- The `#gh-light-mode-only` / `#gh-dark-mode-only` fragment trick is
+     GitHub-only, and on crates.io it also breaks the image outright:
+     crates.io rewrites a plain relative `assets/logo.svg` to
+     `github.com/<repo>/raw/HEAD/assets/logo.svg?sanitize=true` (verified
+     on rvpm 3.50.0, whose logo renders fine), but with a fragment
+     appended it stops at `/blob/HEAD/...#gh-light-mode-only` — an HTML
+     page, not an image. Absolute raw.githubusercontent URLs inside
+     <picture> sidestep both: GitHub honours prefers-color-scheme, and
+     crates.io falls back to the <img>. -->
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/yukimemi/shikigami/main/assets/logo-dark.svg">
