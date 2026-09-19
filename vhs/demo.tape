@@ -12,7 +12,7 @@
 #
 # Flow:
 #   1. log + diff panes, cursor movement
-#   2. Tab into the diff pane and scroll
+#   2. Tab through the files pane into the diff pane and scroll
 #   3. ? help overlay
 #   4. e  → describe the selected change
 #   5. n  → new child change
@@ -73,7 +73,9 @@ Sleep 1200ms
 Type "k"
 Sleep 1000ms
 
-# ── 2. diff pane ──
+# ── 2. files pane, then diff pane ──
+Tab
+Sleep 500ms
 Tab
 Sleep 800ms
 Type "j"

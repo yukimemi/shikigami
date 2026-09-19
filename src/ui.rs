@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{App, Focus, Mode, StatusKind};
-use crate::jj::Row;
+use crate::jj::{DiffFile, Row};
 
 /// help overlay に出すキー一覧。`doc` と二重管理にならないよう、
 /// README / vimdoc はここを参照する形にしてある。
@@ -15,7 +15,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("j / k, ↓ / ↑", "move (log) or scroll (diff)"),
     ("g / G", "first / last"),
     ("Ctrl-d / Ctrl-u", "half-page move"),
-    ("Tab", "switch focus between log and diff"),
+    ("Tab", "cycle focus: log -> files -> diff"),
     ("Enter", "jj edit — make the change the working copy"),
     ("n", "jj new — child of the selected change"),
     ("e", "jj describe — edit the description"),
@@ -40,10 +40,17 @@ pub const KEYS: &[(&str, &str)] = &[
 pub fn draw(frame: &mut Frame, app: &App) {
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
-    let [log_area, diff_area] =
+    let [log_area, right_area] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
+    // files pane はファイル数 + 枠 2 行で伸縮させ、余白を無駄にしない。
+    // ただし diff pane を 3 行未満に潰さない上限は付ける。
+    let files_max = right_area.height.saturating_sub(3).max(3);
+    let files_height = (app.files.len() as u16 + 2).clamp(3, files_max);
+    let [files_area, diff_area] =
+        Layout::vertical([Constraint::Length(files_height), Constraint::Min(1)]).areas(right_area);
 
     draw_log(frame, log_area, app);
+    draw_files(frame, files_area, app);
     draw_diff(frame, diff_area, app);
     draw_status(frame, status, app);
 
@@ -155,10 +162,51 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+fn diff_file_color(status: char) -> Color {
+    match status {
+        'A' => Color::Green,
+        'D' => Color::Red,
+        'M' => Color::Yellow,
+        'R' | 'C' => Color::Blue,
+        _ => Color::White,
+    }
+}
+
+fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
+    let items: Vec<ListItem> = app
+        .files
+        .iter()
+        .map(|f: &DiffFile| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{} ", f.status),
+                    Style::default()
+                        .fg(diff_file_color(f.status))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(f.path.clone()),
+            ]))
+        })
+        .collect();
+
+    let title = format!(" files ({}) ", app.files.len());
+    let list = List::new(items)
+        .block(pane_block(title, app.focus == Focus::Files))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default();
+    if !app.files.is_empty() {
+        state.select(Some(app.file_selected));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
 fn draw_diff(frame: &mut Frame, area: Rect, app: &App) {
-    let title = match app.selected_change() {
-        Some(change) => format!(" {} {} ", change.short_id, change.commit_id),
-        None => " diff ".to_string(),
+    let title = match (app.selected_change(), app.selected_file()) {
+        (Some(change), Some(file)) => {
+            format!(" {} {} — {} ", change.short_id, change.commit_id, file.path)
+        }
+        (Some(change), None) => format!(" {} {} ", change.short_id, change.commit_id),
+        (None, _) => " diff ".to_string(),
     };
     // wrap しない: diff は桁が意味を持つ (`+`/`-` の列、インデント)。
     // 折り返すと行番号と scroll 位置の対応も崩れる。

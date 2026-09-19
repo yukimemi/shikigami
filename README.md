@@ -70,10 +70,10 @@ Without `-r`, shikigami uses jj's own `revsets.log`, i.e. the same set of change
 
 | Key               | Action                                                        |
 | ----------------- | ------------------------------------------------------------- |
-| `j` / `k`         | move (log pane) or scroll (diff pane)                         |
-| `g` / `G`         | first / last                                                  |
+| `j` / `k`         | move (log pane), select a file (files pane), or scroll (diff pane) |
+| `g` / `G`         | first / last (in whichever pane has focus)                    |
 | `Ctrl-d`/`Ctrl-u` | half-page move                                                |
-| `Tab`             | switch focus between the log and the diff                     |
+| `Tab`             | cycle focus: log → files → diff                                |
 | `Enter`           | `jj edit` — make the selected change the working copy         |
 | `n`               | `jj new` — child of the selected change (description prompt)  |
 | `e`               | `jj describe` — edit the description                          |
@@ -120,6 +120,9 @@ output is folded to a single line; the prompt only ever holds one. Without `SHIK
   fails visibly in the status bar instead of hijacking the alternate screen.
 - **Diff colors are jj's.** `jj diff --color always` output is converted to styled terminal text, so
   the diff looks exactly as it does in your shell.
+- **Files pane, one file at a time.** The right column is split into a file list
+  (`jj diff --summary`) above the diff. The diff pane only ever shows the file currently selected
+  there — like lazygit — instead of the whole change's diff scrolling past all at once.
 
 ## Development
 
