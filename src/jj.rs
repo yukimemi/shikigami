@@ -53,7 +53,7 @@ pub enum Row {
 
 /// `jj diff --summary` の 1 行。files pane (lazygit のファイル一覧相当) の
 /// 1 項目に対応する。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiffFile {
     /// jj のステータス文字 (`M`/`A`/`D`/`R`/`C`)。
     pub status: char,

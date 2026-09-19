@@ -4,14 +4,32 @@
 //! 状態遷移 → jj 呼び出しまでをここで完結させる。おかげで、端末を開かずに
 //! 「このキーで本当にこの jj コマンドが飛ぶか」をテストできる。
 
+use std::sync::mpsc;
+use std::thread;
+
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::Text;
 
+use crate::cache::{CommitCache, DiffStore};
 use crate::jj::{Change, DiffFile, Jj, RebaseMode, Row};
 
 /// 一度に動かす行数 (Ctrl-d / Ctrl-u)。
 const PAGE: usize = 10;
+
+/// [`App::begin_reload`] が背景スレッドから返す `jj log`/`jj status` の
+/// 結果。
+type ReloadResult = Result<(Vec<Row>, String)>;
+
+/// `jj` の ANSI 出力を ratatui の `Text` にパースする。パース自体が
+/// 失敗したら (通常は起きない) エラー文をそのまま表示用テキストにする。
+fn parse_ansi(raw: &str) -> Text<'static> {
+    use ansi_to_tui::IntoText;
+    raw.as_bytes()
+        .to_vec()
+        .into_text()
+        .unwrap_or_else(|err| Text::from(format!("{err}")))
+}
 
 /// どちらの pane にキーが効くか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,16 +158,30 @@ pub struct App {
     pub files: Vec<DiffFile>,
     /// `files` の index。ここで選んだ 1 ファイルだけが `diff` に出る。
     pub file_selected: usize,
-    /// `files` がどの commit のものか。selection が動いたかの判定に使う。
-    files_of: Option<String>,
     /// `jj show -r rev --no-patch` の結果 (ANSI 解決済み)。ファイル切り替え
     /// だけなら変わらないので、change ごとに 1 回だけ取って使い回す。
     header: Text<'static>,
-    /// `header` がどの commit のものか。
-    header_of: Option<String>,
-    /// `diff` が (どの commit, どのファイル) のものか。
-    /// `file` 側が `None` なら change 全体の diff。
-    diff_rendered: Option<(String, Option<String>)>,
+    /// commit ごとの `jj diff --summary` / `jj show` / `jj diff` の
+    /// ディスク永続キャッシュ。`commit_id` が content-addressed な
+    /// おかげで、一度取れば同じ commit を再訪しても (プロセスを
+    /// またいでも) jj を呼び直さない (詳細は [`crate::cache`])。
+    diff_cache: DiffStore,
+    /// 直近に `files`/`header`/`file_selected` を反映した commit_id。
+    /// これが変わったときだけ files pane の選択を先頭に戻す。
+    shown_commit: Option<String>,
+    /// 直近に `diff` を反映した (commit_id, path)。
+    /// これが変わったときだけ diff pane の scroll を先頭に戻す。
+    shown_diff: Option<(String, Option<String>)>,
+    /// 起動時にバックグラウンドで走らせた `jj log`/`jj status` の
+    /// 結果を受け取るチャネル。終わるまでは `None` のまま Some で残る。
+    startup_rx: Option<mpsc::Receiver<ReloadResult>>,
+    /// 起動時の `jj log`/`jj status` が失敗したときのエラー。以前は
+    /// `App::new` が同期に呼んでいたので、alternate screen を開く前に
+    /// プロセスごと落ちて分かりやすいエラーで終了できた。非同期化した
+    /// 今も同じ着地にするため、失敗を検知したら `should_quit` を立てて
+    /// ここに退避し、`tui::run` が終了コードに変換する
+    /// ([`Self::take_startup_error`])。
+    startup_error: Option<anyhow::Error>,
     pub diff_scroll: u16,
     pub working_copy: String,
     /// `SHIKIGAMI_AI_CMD` の値。起動時に一度だけ読む (`App::new`)。
@@ -160,6 +192,10 @@ pub struct App {
 
 impl App {
     pub fn new(jj: Jj, revset: Option<String>) -> Result<Self> {
+        // ディスクの永続キャッシュはローカルファイル読み込みだけなので
+        // 同期でも軽い (プロセス起動は無い)。起動を遅くするのは常に
+        // `jj log`/`jj status` の方 — それだけ後段で非同期にする。
+        let diff_cache = DiffStore::load(&jj);
         let mut app = Self {
             jj,
             rows: Vec::new(),
@@ -167,16 +203,18 @@ impl App {
             revset,
             focus: Focus::Log,
             mode: Mode::Normal,
-            status: Status::info("? for help"),
+            status: Status::info("loading…"),
             marked: None,
             rebase_mode: RebaseMode::Revision,
             diff: Text::default(),
             files: Vec::new(),
             file_selected: 0,
-            files_of: None,
             header: Text::default(),
-            header_of: None,
-            diff_rendered: None,
+            diff_cache,
+            shown_commit: None,
+            shown_diff: None,
+            startup_rx: None,
+            startup_error: None,
             diff_scroll: 0,
             working_copy: String::new(),
             ai_cmd: std::env::var(crate::ai::AI_CMD_ENV)
@@ -184,20 +222,124 @@ impl App {
                 .filter(|cmd| !cmd.trim().is_empty()),
             should_quit: false,
         };
-        app.reload()?;
+        app.begin_reload();
         Ok(app)
+    }
+
+    /// 起動時の `jj log`/`jj status` を別スレッドで走らせる。
+    ///
+    /// Windows は `CreateProcess` が重く、これをメインスレッドで
+    /// ブロッキングして待つと alternate screen に入るまで画面が固まって
+    /// 見える。結果は [`Self::poll_startup`] が描画ループから
+    /// ノンブロッキングで拾う。selection 変更時の `jj diff` (`sync_diff`)
+    /// は対象と異なりキー入力のたびに起きるものではないので、そちらは
+    /// 同期のまま — 非同期化するのはこの起動時 1 回きりの呼び出しだけ。
+    fn begin_reload(&mut self) {
+        let jj = self.jj.clone();
+        let revset = self.revset.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = jj.log(revset.as_deref()).map(|rows| {
+                let working_copy = jj.status_line().unwrap_or_default();
+                (rows, working_copy)
+            });
+            let _ = tx.send(result);
+        });
+        self.startup_rx = Some(rx);
+    }
+
+    /// [`Self::begin_reload`] の結果をノンブロッキングで拾う。描画ループ
+    /// から毎フレーム呼ぶ想定 (まだ終わっていなければ即座に戻る)。
+    pub fn poll_startup(&mut self) {
+        let Some(rx) = &self.startup_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok((rows, working_copy))) => {
+                self.apply_rows(rows, working_copy);
+                self.startup_rx = None;
+                if self.status.text == "loading…" {
+                    self.status = Status::info("? for help");
+                }
+            }
+            Ok(Err(err)) => {
+                self.status = Status::error(format!("log failed: {err}"));
+                // TUI の中に留まって status bar のエラーを見せるのではなく、
+                // 以前の同期呼び出し (`app.reload()?` in `App::new`) と同じ
+                // 「alternate screen 越しにでも、はっきりしたエラーで
+                // すぐ終了する」形に寄せる。実際の終了は `tui::run` が
+                // `take_startup_error` で拾って行う。
+                self.startup_error = Some(err);
+                self.should_quit = true;
+                self.startup_rx = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.startup_rx = None,
+        }
+    }
+
+    /// 起動時 `jj log`/`jj status` の失敗を取り出す。`tui::run` が
+    /// イベントループを抜けた後、これがあればプロセスの終了エラーに
+    /// 変換する。
+    pub fn take_startup_error(&mut self) -> Option<anyhow::Error> {
+        self.startup_error.take()
+    }
+
+    /// 起動時のバックグラウンド `jj log` がまだ終わっていないか。
+    /// 描画ループのポーリング間隔を詰めるのに使う。
+    pub fn is_loading(&self) -> bool {
+        self.startup_rx.is_some()
+    }
+
+    /// 起動直後のテスト用: バックグラウンドの初回 `jj log` が終わるまで
+    /// 待つ。TUI 本体はブロッキングしない (`poll_startup` 参照) が、
+    /// テストは rows が同期的に揃っている前提の方が書きやすい。
+    #[cfg(test)]
+    pub fn wait_for_startup(&mut self) {
+        while self.is_loading() {
+            self.poll_startup();
+            if self.is_loading() {
+                thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// commit ごとの `jj` 出力キャッシュを、次回起動のためにディスクへ
+    /// 書き出す。ベストエフォート ([`DiffStore::save`] 参照)。
+    pub fn save_disk_cache(&self) {
+        self.diff_cache.save(&self.jj);
     }
 
     /// log を読み直す。選択は change id で追いかけるので、squash や
     /// rebase で行数が変わってもカーソルが飛ばない。
+    ///
+    /// `Ctrl-r` と、jj を書き換えるコマンド成功後 (`report`) から呼ぶ
+    /// 同期版。起動時だけは [`Self::begin_reload`] の非同期版を使う —
+    /// こちらは「今すぐ結果が要る」呼び出し元しかいないので、非同期化
+    /// する理由がない。
     pub fn reload(&mut self) -> Result<()> {
+        // 起動時のバックグラウンド `jj log` がまだ走っている間に (revset
+        // 変更や Ctrl-r で) ここが呼ばれることがある。この同期呼び出しは
+        // 常に「今の revset での最新結果」を作るので、後から届く古い
+        // startup 結果に上書きされないよう、その受信を捨てておく
+        // (`poll_startup` は `startup_rx` が `None` なら何もしない)。
+        self.startup_rx = None;
+        let rows = self.jj.log(self.revset.as_deref())?;
+        let working_copy = self.jj.status_line().unwrap_or_default();
+        self.apply_rows(rows, working_copy);
+        Ok(())
+    }
+
+    /// `jj log`/`jj status` の結果を反映する。同期 (`reload`) / 非同期
+    /// (`begin_reload` → `poll_startup`) の両方から呼ばれる共通処理。
+    fn apply_rows(&mut self, rows: Vec<Row>, working_copy: String) {
         let keep = self.selected_change().map(|c| c.id.clone());
-        self.rows = self.jj.log(self.revset.as_deref())?;
+        self.rows = rows;
         self.selected = keep
             .and_then(|id| self.index_of(&id))
             .or_else(|| self.first_change_index())
             .unwrap_or(0);
-        self.working_copy = self.jj.status_line().unwrap_or_default();
+        self.working_copy = working_copy;
         // 消えた change を mark したままにすると、以降の squash/rebase が
         // 毎回 jj 側のエラーになる。log から消えたら外す。
         if let Some(marked) = &self.marked
@@ -205,9 +347,6 @@ impl App {
         {
             self.marked = None;
         }
-        self.files_of = None;
-        self.header_of = None;
-        Ok(())
     }
 
     fn index_of(&self, id: &str) -> Option<usize> {
@@ -294,79 +433,92 @@ impl App {
     /// `jj diff` を起動すると、キー入力より diff の方が遅くなる。
     /// 描画直前に「今の選択の分だけ」1 回取る。
     ///
-    /// change が変わった場合はまずファイル一覧 (`jj diff --summary`) と
-    /// header (`jj show --no-patch`) を取り直し、files pane の選択を
-    /// 先頭に戻す。files pane 内で選択ファイルだけが変わった場合は
-    /// header を使い回し、`jj diff` だけ叩く — 起動する `jj` プロセスを
-    /// 1 個に抑える (Windows は `CreateProcess` が重く、j/k のたびに
-    /// `jj show` + `jj diff` の 2 プロセスを立てると files pane の
-    /// 連打がもたつく)。
+    /// `commit_id` ごとに [`DiffStore`] へ生出力を溜め、同じ commit /
+    /// 同じ (commit, ファイル) の組を再訪したときは jj を一切呼ばない
+    /// (`Ctrl-r` で reload しても、内容が変わっていない commit の
+    /// キャッシュはそのまま使い回される — content-addressed な jj の
+    /// 性質上、それで安全なことは [`crate::cache`] 参照)。ANSI 解決
+    /// (`parse_ansi`) はキャッシュ命中時も毎回やり直す — プロセス起動と
+    /// 違って純 CPU 処理なので、これを避けるために生文字列と
+    /// `Text` を二重にキャッシュする価値はない。
     pub fn sync_diff(&mut self) {
         let Some(change) = self.selected_change() else {
             self.files = Vec::new();
             self.file_selected = 0;
-            self.files_of = None;
             self.header = Text::default();
-            self.header_of = None;
             self.diff = Text::default();
-            self.diff_rendered = None;
+            self.shown_commit = None;
+            self.shown_diff = None;
             return;
         };
         let rev = change.id.clone();
         let commit_id = change.commit_id.clone();
-        if self.files_of.as_deref() != Some(commit_id.as_str()) {
-            self.files = self.jj.diff_summary(&rev).unwrap_or_default();
+
+        if self.shown_commit.as_deref() != Some(commit_id.as_str()) {
+            if self.diff_cache.contains(&commit_id) {
+                self.diff_cache.touch(&commit_id);
+                let entry = self
+                    .diff_cache
+                    .get(&commit_id)
+                    .expect("checked contains above");
+                self.files = entry.files.clone();
+                self.header = parse_ansi(&entry.header_raw);
+            } else {
+                // jj の呼び出し失敗はこの commit の内容ではない (一時的な
+                // 失敗かもしれない) ので、content-addressed キャッシュには
+                // 書かない — 成功した組だけを `insert` する。失敗を
+                // キャッシュしてしまうと、次回同じ commit を開いたときも
+                // jj を呼び直さずに同じ失敗をずっと見せ続けることになる。
+                match (self.jj.diff_summary(&rev), self.jj.show(&rev)) {
+                    (Ok(files), Ok(header_raw)) => {
+                        self.files = files.clone();
+                        self.header = parse_ansi(&header_raw);
+                        self.diff_cache
+                            .insert(commit_id.clone(), CommitCache::new(files, header_raw));
+                    }
+                    (files_result, header_result) => {
+                        self.files = files_result.unwrap_or_default();
+                        self.header =
+                            parse_ansi(&header_result.unwrap_or_else(|err| err.to_string()));
+                    }
+                }
+            }
             self.file_selected = 0;
-            self.files_of = Some(commit_id.clone());
+            self.shown_commit = Some(commit_id.clone());
         }
-        if self.header_of.as_deref() != Some(commit_id.as_str()) {
-            self.header = match self.render_header(&rev) {
-                Ok(header) => header,
-                Err(err) => Text::from(format!("{err}")),
-            };
-            self.header_of = Some(commit_id.clone());
-        }
+
         let path = self.selected_file().map(|f| f.path.clone());
-        let key = (commit_id, path.clone());
-        if self.diff_rendered.as_ref() == Some(&key) {
-            return;
+        let key = (commit_id.clone(), path.clone());
+        if self.shown_diff.as_ref() != Some(&key) {
+            let cached = self
+                .diff_cache
+                .get(&commit_id)
+                .and_then(|entry| entry.diffs_raw.get(&path))
+                .cloned();
+            let diff_raw = match cached {
+                Some(raw) => raw,
+                // 失敗はここでも同様にキャッシュしない (上の files/header
+                // と同じ理由)。
+                None => match self.jj.diff(&rev, path.as_deref()) {
+                    Ok(raw) => {
+                        if let Some(entry) = self.diff_cache.get_mut(&commit_id) {
+                            entry.diffs_raw.insert(path.clone(), raw.clone());
+                        }
+                        raw
+                    }
+                    Err(err) => err.to_string(),
+                },
+            };
+            let mut text = self.header.clone();
+            if diff_raw.trim().is_empty() {
+                text.extend(Text::from("(no changes)"));
+            } else {
+                text.extend(parse_ansi(&diff_raw));
+            }
+            self.diff = text;
+            self.shown_diff = Some(key);
+            self.diff_scroll = 0;
         }
-        let text = match self.render_diff(self.header.clone(), &rev, path.as_deref()) {
-            Ok(text) => text,
-            Err(err) => Text::from(format!("{err}")),
-        };
-        self.diff = text;
-        self.diff_rendered = Some(key);
-        self.diff_scroll = 0;
-    }
-
-    /// diff pane のヘッダ部分 (`jj show --no-patch` 相当)。change が
-    /// 変わったときだけ呼ぶ。
-    fn render_header(&self, rev: &str) -> Result<Text<'static>> {
-        use ansi_to_tui::IntoText;
-        self.jj
-            .show(rev)?
-            .into_bytes()
-            .into_text()
-            .map_err(anyhow::Error::from)
-    }
-
-    /// `header` に選択中ファイル (`path`; `None` なら change 全体) の
-    /// diff を続ける。
-    fn render_diff(
-        &self,
-        mut header: Text<'static>,
-        rev: &str,
-        path: Option<&str>,
-    ) -> Result<Text<'static>> {
-        use ansi_to_tui::IntoText;
-        let diff = self.jj.diff(rev, path)?;
-        if diff.trim().is_empty() {
-            header.extend(Text::from("(no changes)"));
-        } else {
-            header.extend(diff.into_bytes().into_text().map_err(anyhow::Error::from)?);
-        }
-        Ok(header)
     }
 
     pub fn scroll_diff(&mut self, delta: isize) {
@@ -1160,6 +1312,106 @@ mod tests {
         let second_text = text_of(&app);
         assert!(second_text.contains(&format!("diff --git a/{second_path}")));
         assert!(!second_text.contains(&format!("diff --git a/{first_path}")));
+    }
+
+    #[test]
+    fn revisiting_a_commit_reuses_the_cached_diff_without_calling_jj_again() {
+        let (_tmp, mut app) = repo_or_skip!();
+        let text_of = |app: &App| -> String {
+            app.diff
+                .lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // 先頭 (working copy = third change) の diff/files を一度取ってキャッシュさせる。
+        app.sync_diff();
+        let first_id = app.selected_change().unwrap().commit_id.clone();
+        let first_text = text_of(&app);
+        let first_files: Vec<String> = app.files.iter().map(|f| f.path.clone()).collect();
+
+        // 別 commit (second change) へ移動して files/diff を取り直させる。
+        app.handle_key(key(KeyCode::Char('j')));
+        app.sync_diff();
+        assert_ne!(app.selected_change().unwrap().commit_id, first_id);
+
+        // ここで repo 自体を消す: これ以降に本当に `jj` を叩けば必ず失敗する。
+        std::fs::remove_dir_all(app.jj.root()).unwrap();
+
+        // 元の commit に戻る。commit_id は content-addressed で不変なので、
+        // キャッシュヒットするなら jj を一切呼ばずに同じ内容が復元されるはず。
+        app.handle_key(key(KeyCode::Char('k')));
+        app.sync_diff();
+        assert_eq!(app.selected_change().unwrap().commit_id, first_id);
+        assert_eq!(text_of(&app), first_text);
+        let files_again: Vec<String> = app.files.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(files_again, first_files);
+    }
+
+    #[test]
+    fn jj_failures_are_not_cached_and_are_retried_on_the_next_view() {
+        let (_tmp, mut app) = repo_or_skip!();
+        // 先頭 (working copy) はここでキャッシュさせておき、壊す対象から外す。
+        app.sync_diff();
+        // 壊す対象 (second change) へ移動するが、まだ sync_diff は呼ばない —
+        // ここでキャッシュしてしまうと失敗を注入する前に成功が残ってしまう。
+        app.handle_key(key(KeyCode::Char('j')));
+        let commit_id = app.selected_change().unwrap().commit_id.clone();
+
+        // repo を一時的に隠して `jj diff --summary`/`jj show` を失敗させる。
+        let jj_dir = app.jj.root().join(".jj");
+        let hidden = app.jj.root().join(".jj-hidden");
+        std::fs::rename(&jj_dir, &hidden).unwrap();
+        app.sync_diff();
+        std::fs::rename(&hidden, &jj_dir).unwrap();
+
+        assert!(
+            !app.diff_cache.contains(&commit_id),
+            "jj の失敗が成功データとしてキャッシュに残っている"
+        );
+        // jj 自体のエラー文言のバージョン依存は避け、「何らかのエラー
+        // 文が出ている (空の diff pane のままではない)」ことだけ見る。
+        assert!(
+            !app.header.lines.is_empty(),
+            "失敗理由が header に出ていない (空のまま)"
+        );
+
+        // repo を戻して別 commit を経由 → 同じ commit に戻ると、
+        // キャッシュされていないので jj を叩き直し、今度は成功する。
+        app.handle_key(key(KeyCode::Char('j')));
+        app.sync_diff();
+        app.handle_key(key(KeyCode::Char('k')));
+        app.sync_diff();
+        assert!(
+            app.diff_cache.contains(&commit_id),
+            "リトライ後は成功データがキャッシュされているはず"
+        );
+    }
+
+    #[test]
+    fn reload_discards_a_pending_startup_receiver() {
+        let (_tmp, mut app) = repo_or_skip!();
+        // 起動時のバックグラウンド `jj log` がまだ終わっていない状態を
+        // 再現する (テストの `repo()` は `wait_for_startup` 済みなので、
+        // ここで改めて private な `begin_reload` を呼んで re-arm する)。
+        app.begin_reload();
+        assert!(app.is_loading(), "re-arm できていない");
+
+        // reload (Ctrl-r 相当) を呼んだ時点で、後から届く可能性のある
+        // 古い起動結果を待つ理由はなくなる — 捨てられているはず。
+        app.reload().unwrap();
+        assert!(
+            !app.is_loading(),
+            "reload が pending の startup receiver を破棄していない: \
+             後から届く古い結果で reload の結果が上書きされ得る"
+        );
     }
 
     #[test]

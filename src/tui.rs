@@ -26,6 +26,11 @@ use crate::ui;
 /// 復帰する。長めにして idle 時の CPU は使わない。
 const POLL: Duration = Duration::from_millis(500);
 
+/// 起動時のバックグラウンド `jj log` が終わっていない間だけ使う短い
+/// poll 間隔。`POLL` のままだと結果が届いてから最大 500ms 表示が
+/// 遅れる — 起動直後だけ詰めて、そこが終わればすぐ `POLL` に戻す。
+const STARTUP_POLL: Duration = Duration::from_millis(30);
+
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
@@ -48,17 +53,37 @@ pub fn run(app: &mut App) -> Result<()> {
     terminal.hide_cursor()?;
 
     let result = event_loop(&mut terminal, app);
+    // 次回起動を速くするための保存。ベストエフォート: これが失敗しても
+    // 表示していたセッション自体は正常に終わっているので、終了処理は
+    // 続ける。
+    app.save_disk_cache();
     let _ = terminal.show_cursor();
-    result
+    // 起動時 `jj log`/`jj status` の失敗はここで拾う。alternate screen を
+    // 抜けたあとにエラーで終了するので、以前の同期呼び出しと同じく
+    // 「はっきりしたエラーメッセージを残してプロセスが終了する」形になる。
+    result.and_then(|()| match app.take_startup_error() {
+        Some(err) => Err(err),
+        None => Ok(()),
+    })
 }
 
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     while !app.should_quit {
+        // 起動時の `jj log`/`jj status` はバックグラウンドスレッドで
+        // 走らせてある (`App::begin_reload`)。終わっていればここで
+        // ノンブロッキングに反映する — メインスレッドは一度も
+        // ブロックしない。
+        app.poll_startup();
         // 描画の直前に 1 回だけ diff を取る。j/k の連打中に 1 行ごと
         // `jj diff` を起動しない (app::App::sync_diff 参照)。
         app.sync_diff();
         terminal.draw(|frame| ui::draw(frame, app))?;
-        if event::poll(POLL)? {
+        // `should_quit` (poll_startup が起動失敗で立てることがある) が
+        // 既に立っていたら、次ループの先頭で即座に抜ける。ここで
+        // `event::poll` を待つと最大 `POLL`/`STARTUP_POLL` 分、来ない
+        // キー入力を無駄に待ってから終了することになる。
+        let poll_timeout = if app.is_loading() { STARTUP_POLL } else { POLL };
+        if !app.should_quit && event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) => app.handle_key(key),
                 // Resize は draw が次のループで拾うので、ここでは

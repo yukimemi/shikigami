@@ -139,6 +139,20 @@ for this one-line-summary use case than leaving them enabled.
   (`jj diff --summary`) above the diff. The diff pane only ever shows the file currently selected
   there — like lazygit — instead of the whole change's diff scrolling past all at once.
 
+## Caching
+
+jj's object store is content-addressed: a `commit_id` is derived from the commit's own content, and
+rewrites (`describe`/`squash`/`rebase`/`abandon`/…) always mint a new id rather than mutating an
+existing one. shikigami relies on that to cache `jj diff`/`jj diff --summary`/`jj show` output per
+`commit_id`, both in memory for the running session and on disk across restarts — revisiting a
+commit you've already looked at (even in a previous run) never re-invokes `jj`. The disk cache lives
+under the OS cache directory (`shikigami/<repo-hash>.json`) and keeps at most the 300
+most-recently-used commits per repo; override the location with `SHIKIGAMI_CACHE_DIR`.
+
+Startup itself never blocks on `jj`: the alternate screen opens immediately, and the initial
+`jj log`/`jj status` run on a background thread while the log pane shows "loading…" — this matters
+most on Windows, where spawning a process is noticeably slower than on Unix.
+
 ## Development
 
 ```sh

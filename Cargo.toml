@@ -26,9 +26,12 @@ crossterm = { version = "0.29", features = ["events"] }
 ansi-to-tui = "8.0.1"
 
 # jj の呼び出しは同期 std::process::Command で足りる (renri の JjBackend と
-# 同じ方針)。TUI は 1 イベントループ 1 スレッドで、重い処理は selection 変更
-# 時の `jj diff` 1 本だけ。tokio を持ち込むと runtime 分の起動コストと依存が
-# 増えるだけで、並行させる相手がいない — この方針は TUI 本体では変わらない。
+# 同じ方針)。TUI 本体は 1 イベントループ 1 スレッドで、選択変更のたびの
+# `jj diff` は同期のまま。唯一の例外が起動時の `jj log`/`jj status`
+# (`App::begin_reload`): これだけは std::thread + mpsc で back
+# ground に逃がす — Windows は `CreateProcess` が重く、それをブロッキング
+# で待つと alternate screen に入るまで固まって見えるため。tokio は
+# 持ち込まない (1 回きりの fire-and-forget に runtime は要らない)。
 
 # Self-update (`shikigami self-update`) は kaishin 経由。TUI 実行時には
 # tokio ランタイムを一切立てない: src/update.rs がサブコマンド専用に
@@ -40,6 +43,16 @@ ansi-to-tui = "8.0.1"
 # 使わない)。
 kaishin = "0.7.5"
 tokio = { version = "1.53.1", features = ["rt"] }
+
+# commit ごとの `jj diff`/`jj show` 結果をディスクへ永続化するキャッシュ
+# (`src/cache.rs`) 用。jj の commit_id は content-addressed なので、一度
+# 取れた出力はプロセスをまたいでも安全に使い回せる — 次回起動時、選択中の
+# commit がキャッシュに載っていれば `jj diff`/`jj show` を叩かずに初回描画
+# できる。serde/serde_json は保存形式、dirs は OS ごとのキャッシュ
+# ディレクトリ解決に使う。
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+dirs = "7.0.0"
 
 [dev-dependencies]
 tempfile = "3.27"
