@@ -92,10 +92,19 @@ e2e = ["CARGO_TARGET_DIR={{ vars.cache }}/shikigami-target cargo test --locked -
 gate = ["CARGO_TARGET_DIR={{ vars.cache }}/shikigami-target SHIKIGAMI_REQUIRE_JJ=1 cargo make check"]
 
 [merge]
-mode = "none"
-# Required here, and in every jj-colocated repo: jj keeps git's HEAD detached
-# at the working-copy commit, so magi cannot infer the base branch from
-# `git symbolic-ref HEAD`.
+# Not overridden to "none": the machine-layer default of "pr" is what lets
+# `magi task add` work queued by `magi serve` / `magi web` land as a reviewable
+# PR once review + gate pass, instead of stopping short with nothing for the
+# operator to look at. `yukimemi/magi`'s own repository hit exactly that
+# problem — a repo-layer `mode = "none"` left queue-completed runs stuck at the
+# gate with no PR — and fixed it the same way. `magi review` invoked by hand
+# is unaffected: per this repository's AGENTS.md, it is always called with an
+# explicit `--merge none`, which overrides whatever this file says for that
+# one invocation.
+#
+# `base` is required here, and in every jj-colocated repo: jj keeps git's HEAD
+# detached at the working-copy commit, so magi cannot infer the base branch
+# from `git symbolic-ref HEAD`.
 base = "main"
 
 # Project conventions appended to the node prompts, never merged into them.
