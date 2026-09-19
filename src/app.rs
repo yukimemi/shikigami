@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::Text;
 
-use crate::jj::{Change, Jj, RebaseMode, Row};
+use crate::jj::{Change, DiffFile, Jj, RebaseMode, Row};
 
 /// 一度に動かす行数 (Ctrl-d / Ctrl-u)。
 const PAGE: usize = 10;
@@ -17,6 +17,8 @@ const PAGE: usize = 10;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Log,
+    /// 選択中 change のファイル一覧 (lazygit の files pane 相当)。
+    Files,
     Diff,
 }
 
@@ -134,8 +136,20 @@ pub struct App {
     pub rebase_mode: RebaseMode,
     /// diff pane の中身 (ANSI を解決済みの ratatui Text)。
     pub diff: Text<'static>,
-    /// `diff` がどの commit のものか。selection が動いたかの判定に使う。
-    diff_of: Option<String>,
+    /// 選択中 change で変更されたファイル一覧 (lazygit の files pane 相当)。
+    pub files: Vec<DiffFile>,
+    /// `files` の index。ここで選んだ 1 ファイルだけが `diff` に出る。
+    pub file_selected: usize,
+    /// `files` がどの commit のものか。selection が動いたかの判定に使う。
+    files_of: Option<String>,
+    /// `jj show -r rev --no-patch` の結果 (ANSI 解決済み)。ファイル切り替え
+    /// だけなら変わらないので、change ごとに 1 回だけ取って使い回す。
+    header: Text<'static>,
+    /// `header` がどの commit のものか。
+    header_of: Option<String>,
+    /// `diff` が (どの commit, どのファイル) のものか。
+    /// `file` 側が `None` なら change 全体の diff。
+    diff_rendered: Option<(String, Option<String>)>,
     pub diff_scroll: u16,
     pub working_copy: String,
     /// `SHIKIGAMI_AI_CMD` の値。起動時に一度だけ読む (`App::new`)。
@@ -157,7 +171,12 @@ impl App {
             marked: None,
             rebase_mode: RebaseMode::Revision,
             diff: Text::default(),
-            diff_of: None,
+            files: Vec::new(),
+            file_selected: 0,
+            files_of: None,
+            header: Text::default(),
+            header_of: None,
+            diff_rendered: None,
             diff_scroll: 0,
             working_copy: String::new(),
             ai_cmd: std::env::var(crate::ai::AI_CMD_ENV)
@@ -186,7 +205,8 @@ impl App {
         {
             self.marked = None;
         }
-        self.diff_of = None;
+        self.files_of = None;
+        self.header_of = None;
         Ok(())
     }
 
@@ -246,46 +266,107 @@ impl App {
         }
     }
 
+    /// 選択中 change のファイル一覧の 1 件 (files pane で選ばれているもの)。
+    pub fn selected_file(&self) -> Option<&DiffFile> {
+        self.files.get(self.file_selected)
+    }
+
+    /// files pane の選択を `delta` 行動かす。
+    fn move_file_selection(&mut self, delta: isize) {
+        if self.files.is_empty() {
+            return;
+        }
+        let next = (self.file_selected as isize + delta).clamp(0, self.files.len() as isize - 1);
+        self.file_selected = next as usize;
+    }
+
+    fn select_first_file(&mut self) {
+        self.file_selected = 0;
+    }
+
+    fn select_last_file(&mut self) {
+        self.file_selected = self.files.len().saturating_sub(1);
+    }
+
     /// 選択が変わっていたら diff を取り直す。描画前に呼ぶ。
     ///
     /// 遅延させる理由: j/k で連続移動しているあいだに 1 行ごとに
     /// `jj diff` を起動すると、キー入力より diff の方が遅くなる。
     /// 描画直前に「今の選択の分だけ」1 回取る。
+    ///
+    /// change が変わった場合はまずファイル一覧 (`jj diff --summary`) と
+    /// header (`jj show --no-patch`) を取り直し、files pane の選択を
+    /// 先頭に戻す。files pane 内で選択ファイルだけが変わった場合は
+    /// header を使い回し、`jj diff` だけ叩く — 起動する `jj` プロセスを
+    /// 1 個に抑える (Windows は `CreateProcess` が重く、j/k のたびに
+    /// `jj show` + `jj diff` の 2 プロセスを立てると files pane の
+    /// 連打がもたつく)。
     pub fn sync_diff(&mut self) {
         let Some(change) = self.selected_change() else {
+            self.files = Vec::new();
+            self.file_selected = 0;
+            self.files_of = None;
+            self.header = Text::default();
+            self.header_of = None;
             self.diff = Text::default();
-            self.diff_of = None;
+            self.diff_rendered = None;
             return;
         };
-        if self.diff_of.as_deref() == Some(change.commit_id.as_str()) {
-            return;
-        }
         let rev = change.id.clone();
         let commit_id = change.commit_id.clone();
-        let text = match self.render_change(&rev) {
+        if self.files_of.as_deref() != Some(commit_id.as_str()) {
+            self.files = self.jj.diff_summary(&rev).unwrap_or_default();
+            self.file_selected = 0;
+            self.files_of = Some(commit_id.clone());
+        }
+        if self.header_of.as_deref() != Some(commit_id.as_str()) {
+            self.header = match self.render_header(&rev) {
+                Ok(header) => header,
+                Err(err) => Text::from(format!("{err}")),
+            };
+            self.header_of = Some(commit_id.clone());
+        }
+        let path = self.selected_file().map(|f| f.path.clone());
+        let key = (commit_id, path.clone());
+        if self.diff_rendered.as_ref() == Some(&key) {
+            return;
+        }
+        let text = match self.render_diff(self.header.clone(), &rev, path.as_deref()) {
             Ok(text) => text,
             Err(err) => Text::from(format!("{err}")),
         };
         self.diff = text;
-        self.diff_of = Some(commit_id);
+        self.diff_rendered = Some(key);
         self.diff_scroll = 0;
     }
 
-    fn render_change(&self, rev: &str) -> Result<Text<'static>> {
+    /// diff pane のヘッダ部分 (`jj show --no-patch` 相当)。change が
+    /// 変わったときだけ呼ぶ。
+    fn render_header(&self, rev: &str) -> Result<Text<'static>> {
         use ansi_to_tui::IntoText;
-
-        let header = self.jj.show(rev)?;
-        let diff = self.jj.diff(rev)?;
-        let mut text = header
+        self.jj
+            .show(rev)?
             .into_bytes()
             .into_text()
-            .map_err(anyhow::Error::from)?;
+            .map_err(anyhow::Error::from)
+    }
+
+    /// `header` に選択中ファイル (`path`; `None` なら change 全体) の
+    /// diff を続ける。
+    fn render_diff(
+        &self,
+        mut header: Text<'static>,
+        rev: &str,
+        path: Option<&str>,
+    ) -> Result<Text<'static>> {
+        use ansi_to_tui::IntoText;
+        let diff = self.jj.diff(rev, path)?;
         if diff.trim().is_empty() {
-            text.extend(Text::from("(no changes)"));
+            header.extend(Text::from("(no changes)"));
         } else {
-            text.extend(diff.into_bytes().into_text().map_err(anyhow::Error::from)?);
+            header.extend(diff.into_bytes().into_text().map_err(anyhow::Error::from)?);
         }
-        Ok(text)
+        Ok(header)
     }
 
     pub fn scroll_diff(&mut self, delta: isize) {
@@ -487,7 +568,8 @@ impl App {
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Tab => {
                 self.focus = match self.focus {
-                    Focus::Log => Focus::Diff,
+                    Focus::Log => Focus::Files,
+                    Focus::Files => Focus::Diff,
                     Focus::Diff => Focus::Log,
                 }
             }
@@ -497,10 +579,12 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.step(-1),
             KeyCode::Char('g') | KeyCode::Home => match self.focus {
                 Focus::Log => self.select_first(),
+                Focus::Files => self.select_first_file(),
                 Focus::Diff => self.diff_scroll = 0,
             },
             KeyCode::Char('G') | KeyCode::End => match self.focus {
                 Focus::Log => self.select_last(),
+                Focus::Files => self.select_last_file(),
                 Focus::Diff => self.scroll_diff(isize::MAX / 2),
             },
             KeyCode::Char('r') if ctrl => match self.reload() {
@@ -559,10 +643,11 @@ impl App {
         }
     }
 
-    /// focus に応じて log の選択か diff の scroll を動かす。
+    /// focus に応じて log の選択 / files の選択 / diff の scroll を動かす。
     fn step(&mut self, delta: isize) {
         match self.focus {
             Focus::Log => self.move_selection(delta),
+            Focus::Files => self.move_file_selection(delta),
             Focus::Diff => self.scroll_diff(delta),
         }
     }
@@ -1005,7 +1090,12 @@ mod tests {
             "diff header missing: {text}"
         );
         assert!(text.contains("b.txt"), "diff body missing: {text}");
+        assert_eq!(app.files.len(), 1, "{:?}", app.files);
+        assert_eq!(app.files[0].path, "b.txt");
 
+        // Tab は log -> files -> diff の順で回る。
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Files);
         // diff pane に focus を移すと j/k は scroll になる。
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Diff);
@@ -1023,6 +1113,53 @@ mod tests {
         let selected = app.selected_change().unwrap().id.clone();
         app.handle_key(ctrl('d'));
         assert_eq!(app.selected_change().unwrap().id, selected);
+    }
+
+    #[test]
+    fn files_pane_lists_every_changed_file_and_diff_follows_the_selection() {
+        let (_tmp, mut app) = repo_or_skip!();
+        // working copy (third change) に 2 ファイル追加して、files pane に
+        // 複数行出ることと、選択したファイルだけが diff pane に出ることを
+        // 確認する。
+        std::fs::write(app.jj.root().join("x.txt"), "x\n").unwrap();
+        std::fs::write(app.jj.root().join("y.txt"), "y\n").unwrap();
+        app.reload().unwrap();
+        app.sync_diff();
+
+        let mut paths: Vec<&str> = app.files.iter().map(|f| f.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["x.txt", "y.txt"], "{:?}", app.files);
+
+        let text_of = |app: &App| -> String {
+            app.diff
+                .lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // 先頭ファイルだけが diff pane に出て、もう一方は出ない。
+        let first_path = app.files[0].path.clone();
+        let second_path = app.files[1].path.clone();
+        let first_text = text_of(&app);
+        assert!(first_text.contains(&format!("diff --git a/{first_path}")));
+        assert!(!first_text.contains(&format!("diff --git a/{second_path}")));
+
+        // files pane に移って次のファイルへ動かすと、diff pane が切り替わる。
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Files);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.file_selected, 1);
+        app.sync_diff();
+        let second_text = text_of(&app);
+        assert!(second_text.contains(&format!("diff --git a/{second_path}")));
+        assert!(!second_text.contains(&format!("diff --git a/{first_path}")));
     }
 
     #[test]

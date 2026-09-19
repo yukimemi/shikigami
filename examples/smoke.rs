@@ -65,7 +65,7 @@ fn main() -> anyhow::Result<()> {
             _ => None,
         })
         .expect("no working-copy change in the log");
-    let diff = repo.diff(&head)?;
+    let diff = repo.diff(&head, None)?;
     assert!(
         diff.contains("a.txt"),
         "diff missing the changed file: {diff}"

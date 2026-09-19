@@ -51,6 +51,16 @@ pub enum Row {
     Connector(String),
 }
 
+/// `jj diff --summary` の 1 行。files pane (lazygit のファイル一覧相当) の
+/// 1 項目に対応する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffFile {
+    /// jj のステータス文字 (`M`/`A`/`D`/`R`/`C`)。
+    pub status: char,
+    /// リネームは `old => new` の形のままここに入る。
+    pub path: String,
+}
+
 /// log に出てくる 1 change。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
@@ -231,17 +241,27 @@ impl Jj {
     }
 
     /// 選択中 change の diff。`--color always` なので ANSI 付き。
-    pub fn diff(&self, rev: &str) -> Result<String> {
-        self.exec(
-            &["--no-pager", "--color", "always"],
-            &["diff", "-r", rev, "--git"],
-        )
+    /// `path` を渡すと、その 1 ファイル分だけに絞った diff になる
+    /// (jj のファイルセット引数をそのまま流す)。
+    pub fn diff(&self, rev: &str, path: Option<&str>) -> Result<String> {
+        let mut args = vec!["diff", "-r", rev, "--git"];
+        if let Some(path) = path {
+            args.push(path);
+        }
+        self.exec(&["--no-pager", "--color", "always"], &args)
     }
 
     /// [`Jj::diff`] の色なし版。AI コマンドなど、ANSI を混ぜたくない
-    /// 消費者へ渡す用途に使う。
+    /// 消費者へ渡す用途に使う。常に change 全体 (path 絞り込みなし)。
     pub fn diff_plain(&self, rev: &str) -> Result<String> {
         self.read(&["diff", "-r", rev, "--git"])
+    }
+
+    /// 選択中 change で変更されたファイルの一覧 (`jj diff --summary`)。
+    /// lazygit のようにファイル単位で diff を選べるようにするための入口。
+    pub fn diff_summary(&self, rev: &str) -> Result<Vec<DiffFile>> {
+        let out = self.read(&["diff", "-r", rev, "--summary"])?;
+        Ok(parse_diff_summary(&out))
     }
 
     /// diff pane のヘッダに出す `jj show --no-patch` 相当。
@@ -380,6 +400,28 @@ pub fn parse_log(out: &str) -> Vec<Row> {
     rows
 }
 
+/// `jj diff --summary` の出力を [`DiffFile`] へ分解する。
+///
+/// 各行は `<status><space><path>` (例: `M src/app.rs`, `R old => new`)。
+/// `parse_log` と同じ理由で、jj を起動せずにパーサだけテストできるよう
+/// 独立関数にしてある。
+pub fn parse_diff_summary(out: &str) -> Vec<DiffFile> {
+    out.lines()
+        .filter_map(|line| {
+            let mut chars = line.chars();
+            let status = chars.next()?;
+            let path = chars.as_str().trim();
+            if path.is_empty() {
+                return None;
+            }
+            Some(DiffFile {
+                status,
+                path: path.to_string(),
+            })
+        })
+        .collect()
+}
+
 fn parse_change(data: &str) -> Option<Change> {
     let mut f = data.split(FIELD);
     let id = f.next()?.to_string();
@@ -496,6 +538,32 @@ mod tests {
     #[test]
     fn trailing_blank_lines_are_dropped() {
         assert!(parse_log("\n\n").is_empty());
+    }
+
+    #[test]
+    fn diff_summary_parses_status_and_path_including_renames() {
+        let files = parse_diff_summary("M src/app.rs\nA new.rs\nD old.rs\nR from.rs => to.rs\n");
+        assert_eq!(
+            files,
+            vec![
+                DiffFile {
+                    status: 'M',
+                    path: "src/app.rs".to_string()
+                },
+                DiffFile {
+                    status: 'A',
+                    path: "new.rs".to_string()
+                },
+                DiffFile {
+                    status: 'D',
+                    path: "old.rs".to_string()
+                },
+                DiffFile {
+                    status: 'R',
+                    path: "from.rs => to.rs".to_string()
+                },
+            ]
+        );
     }
 
     #[test]
