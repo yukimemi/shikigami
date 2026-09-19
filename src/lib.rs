@@ -19,6 +19,7 @@ pub mod cli;
 pub mod jj;
 pub mod tui;
 pub mod ui;
+pub mod update;
 
 pub use crate::cli::run;
 

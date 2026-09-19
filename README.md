@@ -62,9 +62,16 @@ shikigami                      # TUI for the repo containing the cwd
 shikigami -R /path/to/repo     # ... for another repo
 shikigami -r 'all()'           # ... with an explicit revset
 shikigami completion zsh       # shell completion
+shikigami self-update          # update the shikigami binary itself
 ```
 
 Without `-r`, shikigami uses jj's own `revsets.log`, i.e. the same set of changes `jj log` shows.
+
+`self-update` fetches the latest GitHub release via [kaishin](https://github.com/yukimemi/kaishin)
+and replaces the running binary — skip the confirmation prompt with `-y`/`--yes`, or check
+availability only with `--check`. It detects a `cargo install`-managed binary and prefers
+downloading the matching release asset over a source rebuild; a dev build under `target/` is left
+alone.
 
 ## Keys
 
