@@ -13,6 +13,7 @@
 //! `app` のテストは本物の jj repo を temp dir に作り、キー列を流して
 //! repo の状態を検証している。
 
+pub mod ai;
 pub mod app;
 pub mod cli;
 pub mod jj;

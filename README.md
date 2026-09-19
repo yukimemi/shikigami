@@ -77,6 +77,7 @@ Without `-r`, shikigami uses jj's own `revsets.log`, i.e. the same set of change
 | `Enter`           | `jj edit` — make the selected change the working copy         |
 | `n`               | `jj new` — child of the selected change (description prompt)  |
 | `e`               | `jj describe` — edit the description                          |
+| Ctrl-g            | (in the `n`/`e` prompt) fill the message from the diff via AI |
 | `b`               | `jj bookmark set`                                             |
 | `m`               | mark the selected change as the squash / rebase target (`◆`)  |
 | `s`               | `jj squash` — selected change into the marked one             |
@@ -92,6 +93,21 @@ Without `-r`, shikigami uses jj's own `revsets.log`, i.e. the same set of change
 
 Everything that rewrites history asks first (`y` / `Enter` confirms; **any** other key cancels), and
 the status bar always shows the working copy, the marked target, and the current rebase mode.
+
+## AI-generated messages
+
+Inside the `n` (`jj new`) and `e` (`jj describe`) description prompt, `Ctrl-g` fills the input
+with a message generated from the selected change's diff. shikigami does not talk to any AI
+vendor itself: set `SHIKIGAMI_AI_CMD` to a shell command that reads a diff on stdin and prints a
+message on stdout, e.g.
+
+```sh
+export SHIKIGAMI_AI_CMD='opencode run -m sonnet "write a one-line commit message for this diff:" -'
+```
+
+Any CLI that can read a diff on stdin works (`aichat`, `sgpt`, `mods`, your own script, …). The
+output is folded to a single line; the prompt only ever holds one. Without `SHIKIGAMI_AI_CMD` set,
+`Ctrl-g` reports the missing configuration in the status bar instead of doing nothing silently.
 
 ## Design notes
 

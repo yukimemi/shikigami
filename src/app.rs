@@ -4,7 +4,7 @@
 //! 状態遷移 → jj 呼び出しまでをここで完結させる。おかげで、端末を開かずに
 //! 「このキーで本当にこの jj コマンドが飛ぶか」をテストできる。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::Text;
 
@@ -33,6 +33,20 @@ pub enum InputAction {
     RebaseOnto { rev: String, mode: RebaseMode },
     /// log pane の revset を差し替える
     Revset,
+}
+
+impl InputAction {
+    /// AI 生成の元にする diff の対象 rev。bookmark 名や revset のように
+    /// diff と無関係な入力では `None` (Ctrl-g を「使えない」と伝えるため
+    /// 使う)。
+    pub fn ai_rev(&self) -> Option<&str> {
+        match self {
+            InputAction::Describe { rev } | InputAction::NewChild { rev } => Some(rev.as_str()),
+            InputAction::Bookmark { .. } | InputAction::RebaseOnto { .. } | InputAction::Revset => {
+                None
+            }
+        }
+    }
 }
 
 /// 確認待ちの用途。
@@ -124,6 +138,9 @@ pub struct App {
     diff_of: Option<String>,
     pub diff_scroll: u16,
     pub working_copy: String,
+    /// `SHIKIGAMI_AI_CMD` の値。起動時に一度だけ読む (`App::new`)。
+    /// `None` なら AI 生成 (Ctrl-g) は使えない。
+    pub ai_cmd: Option<String>,
     pub should_quit: bool,
 }
 
@@ -143,6 +160,9 @@ impl App {
             diff_of: None,
             diff_scroll: 0,
             working_copy: String::new(),
+            ai_cmd: std::env::var(crate::ai::AI_CMD_ENV)
+                .ok()
+                .filter(|cmd| !cmd.trim().is_empty()),
             should_quit: false,
         };
         app.reload()?;
@@ -407,12 +427,45 @@ impl App {
                 input.value.clear();
                 self.mode = Mode::Input(input);
             }
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.fill_with_ai(input);
+            }
             KeyCode::Char(c) => {
                 input.value.push(c);
                 self.mode = Mode::Input(input);
             }
             _ => self.mode = Mode::Input(input),
         }
+    }
+
+    /// 入力中に Ctrl-g を押したときの処理。
+    ///
+    /// 対象 rev (Describe/NewChild が持つもの) の diff を `ai_cmd` に
+    /// 渡し、返ってきたメッセージで入力値を丸ごと置き換える。diff を
+    /// 持たない入力 (bookmark 名や revset) では意味がないので何もしない。
+    fn fill_with_ai(&mut self, mut input: Input) {
+        let Some(rev) = input.action.ai_rev().map(str::to_string) else {
+            self.status = Status::error("ai: not available for this prompt");
+            self.mode = Mode::Input(input);
+            return;
+        };
+        match self.generate_ai_message(&rev) {
+            Ok(message) => {
+                input.value = message;
+                self.status = Status::info("ai: message generated");
+            }
+            Err(err) => self.status = Status::error(format!("ai: {err}")),
+        }
+        self.mode = Mode::Input(input);
+    }
+
+    fn generate_ai_message(&self, rev: &str) -> Result<String> {
+        let cmd = self
+            .ai_cmd
+            .as_deref()
+            .with_context(|| format!("{} is not set", crate::ai::AI_CMD_ENV))?;
+        let diff = self.jj.diff_plain(rev)?;
+        crate::ai::generate_message(cmd, &diff)
     }
 
     fn handle_confirm(&mut self, key: KeyEvent, confirm: Confirm) {
@@ -1015,5 +1068,74 @@ mod tests {
             .unwrap();
         assert!(wc.is_empty);
         assert_eq!(wc.description, "");
+    }
+
+    #[cfg(unix)]
+    fn echo_message_cmd(msg: &str) -> String {
+        format!("echo '{msg}'")
+    }
+    #[cfg(windows)]
+    fn echo_message_cmd(msg: &str) -> String {
+        format!("echo {msg}")
+    }
+
+    #[test]
+    fn ai_ctrl_g_fills_the_describe_prompt_from_the_diff() {
+        let (_tmp, mut app) = repo_or_skip!();
+        app.ai_cmd = Some(echo_message_cmd("feat: ai generated message"));
+        while app.selected_change().unwrap().description != "second change" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.handle_key(key(KeyCode::Char('e')));
+        app.handle_key(ctrl('g'));
+        let Mode::Input(input) = &app.mode else {
+            panic!("expected input mode, got {:?}", app.mode);
+        };
+        assert_eq!(input.value, "feat: ai generated message");
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+
+        // Enter で、生成された値がそのまま describe される。
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+        assert!(
+            descriptions(&app).contains(&"feat: ai generated message".to_string()),
+            "{:?}",
+            descriptions(&app)
+        );
+    }
+
+    #[test]
+    fn ai_ctrl_g_is_unavailable_for_bookmark_prompt() {
+        let (_tmp, mut app) = repo_or_skip!();
+        app.ai_cmd = Some(echo_message_cmd("should not be used"));
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(ctrl('g'));
+        let Mode::Input(input) = &app.mode else {
+            panic!("expected input mode, got {:?}", app.mode);
+        };
+        // bookmark 入力は diff と無関係なので、値は変わらない。
+        assert_eq!(input.value, "");
+        assert_eq!(app.status.kind, StatusKind::Error, "{:?}", app.status);
+        assert!(
+            app.status.text.contains("not available"),
+            "{:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn ai_ctrl_g_without_configured_command_reports_error() {
+        let (_tmp, mut app) = repo_or_skip!();
+        app.ai_cmd = None;
+        app.handle_key(key(KeyCode::Char('e')));
+        app.handle_key(ctrl('g'));
+        assert_eq!(app.status.kind, StatusKind::Error, "{:?}", app.status);
+        assert!(
+            app.status.text.contains("SHIKIGAMI_AI_CMD"),
+            "{:?}",
+            app.status
+        );
+        // 失敗しても入力は消えず、キャンセルもされない。
+        assert!(matches!(app.mode, Mode::Input(_)));
     }
 }
