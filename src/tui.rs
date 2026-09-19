@@ -75,8 +75,14 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         // ブロックしない。
         app.poll_startup();
         // 描画の直前に 1 回だけ diff を取る。j/k の連打中に 1 行ごと
-        // `jj diff` を起動しない (app::App::sync_diff 参照)。
-        app.sync_diff();
+        // `jj diff` を起動しない (app::App::sync_diff 参照)。SIGWINCH
+        // 直後で size 取得自体が失敗することがあるので、その場合は前回
+        // フレームの終端に近い幅として 80 桁にフォールバックする。
+        let diff_width = terminal
+            .size()
+            .map(|size| ui::diff_pane_width(size.width))
+            .unwrap_or(80);
+        app.sync_diff(diff_width);
         terminal.draw(|frame| ui::draw(frame, app))?;
         // `should_quit` (poll_startup が起動失敗で立てることがある) が
         // 既に立っていたら、次ループの先頭で即座に抜ける。ここで

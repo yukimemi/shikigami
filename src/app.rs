@@ -187,6 +187,10 @@ pub struct App {
     /// `SHIKIGAMI_AI_CMD` の値。起動時に一度だけ読む (`App::new`)。
     /// `None` なら AI 生成 (Ctrl-g) は使えない。
     pub ai_cmd: Option<String>,
+    /// `SHIKIGAMI_DIFF_FILTER` の値。起動時に一度だけ読む (`App::new`)。
+    /// `None` なら diff pane は jj の生出力をそのまま使う
+    /// (`crate::diff_filter` 参照)。
+    pub diff_filter_cmd: Option<String>,
     pub should_quit: bool,
 }
 
@@ -218,6 +222,9 @@ impl App {
             diff_scroll: 0,
             working_copy: String::new(),
             ai_cmd: std::env::var(crate::ai::AI_CMD_ENV)
+                .ok()
+                .filter(|cmd| !cmd.trim().is_empty()),
+            diff_filter_cmd: std::env::var(crate::diff_filter::DIFF_FILTER_ENV)
                 .ok()
                 .filter(|cmd| !cmd.trim().is_empty()),
             should_quit: false,
@@ -441,7 +448,13 @@ impl App {
     /// (`parse_ansi`) はキャッシュ命中時も毎回やり直す — プロセス起動と
     /// 違って純 CPU 処理なので、これを避けるために生文字列と
     /// `Text` を二重にキャッシュする価値はない。
-    pub fn sync_diff(&mut self) {
+    ///
+    /// `diff_width` は `SHIKIGAMI_DIFF_FILTER` (`crate::diff_filter`) が
+    /// 設定されているときだけ使う — フィルタの子プロセスへ `COLUMNS` と
+    /// して渡す diff pane の実幅。選択が変わらない限り取り直さないので、
+    /// 端末リサイズ中は次に選択を動かすまで古い幅のまま — diff pane 自体
+    /// が折り返しをしない設計 (`ui::draw_diff` 参照) と同じ割り切り。
+    pub fn sync_diff(&mut self, diff_width: u16) {
         let Some(change) = self.selected_change() else {
             self.files = Vec::new();
             self.file_selected = 0;
@@ -513,7 +526,23 @@ impl App {
             if diff_raw.trim().is_empty() {
                 text.extend(Text::from("(no changes)"));
             } else {
-                text.extend(parse_ansi(&diff_raw));
+                let rendered = match &self.diff_filter_cmd {
+                    Some(cmd) => match crate::diff_filter::apply(cmd, &diff_raw, diff_width) {
+                        Ok(filtered) => filtered,
+                        Err(err) => {
+                            // フィルタが壊れていても diff pane を空にはしない —
+                            // jj の生出力にフォールバックしつつ、原因は
+                            // status bar に出す。
+                            self.status = Status::error(format!(
+                                "{}: {err}",
+                                crate::diff_filter::DIFF_FILTER_ENV
+                            ));
+                            diff_raw.clone()
+                        }
+                    },
+                    None => diff_raw.clone(),
+                };
+                text.extend(parse_ansi(&rendered));
             }
             self.diff = text;
             self.shown_diff = Some(key);
@@ -1224,7 +1253,7 @@ mod tests {
         while app.selected_change().unwrap().description != "second change" {
             app.handle_key(key(KeyCode::Char('j')));
         }
-        app.sync_diff();
+        app.sync_diff(80);
         let text = app
             .diff
             .lines
@@ -1267,6 +1296,79 @@ mod tests {
         assert_eq!(app.selected_change().unwrap().id, selected);
     }
 
+    #[cfg(unix)]
+    fn wrap_cmd() -> &'static str {
+        "cat; echo FILTERED_MARKER; echo \"WIDTH:$COLUMNS\""
+    }
+    #[cfg(windows)]
+    fn wrap_cmd() -> &'static str {
+        "more & echo FILTERED_MARKER & echo WIDTH:%COLUMNS%"
+    }
+
+    #[test]
+    fn diff_filter_cmd_rewrites_the_diff_and_receives_the_pane_width() {
+        let (_tmp, mut app) = repo_or_skip!();
+        while app.selected_change().unwrap().description != "second change" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.diff_filter_cmd = Some(wrap_cmd().to_string());
+        app.sync_diff(42);
+        let text = app
+            .diff
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("FILTERED_MARKER"),
+            "diff was not routed through the filter: {text}"
+        );
+        assert!(text.contains("b.txt"), "original diff content lost: {text}");
+        assert!(
+            text.contains("WIDTH:42"),
+            "pane width not passed through COLUMNS: {text}"
+        );
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+    }
+
+    #[test]
+    fn broken_diff_filter_cmd_falls_back_to_the_raw_diff() {
+        let (_tmp, mut app) = repo_or_skip!();
+        while app.selected_change().unwrap().description != "second change" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.diff_filter_cmd = Some("exit 1".to_string());
+        app.sync_diff(80);
+        let text = app
+            .diff
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("b.txt"),
+            "diff pane went blank instead of falling back to raw jj output: {text}"
+        );
+        assert_eq!(
+            app.status.kind,
+            StatusKind::Error,
+            "filter failure should be surfaced in the status bar: {:?}",
+            app.status
+        );
+    }
+
     #[test]
     fn files_pane_lists_every_changed_file_and_diff_follows_the_selection() {
         let (_tmp, mut app) = repo_or_skip!();
@@ -1276,7 +1378,7 @@ mod tests {
         std::fs::write(app.jj.root().join("x.txt"), "x\n").unwrap();
         std::fs::write(app.jj.root().join("y.txt"), "y\n").unwrap();
         app.reload().unwrap();
-        app.sync_diff();
+        app.sync_diff(80);
 
         let mut paths: Vec<&str> = app.files.iter().map(|f| f.path.as_str()).collect();
         paths.sort_unstable();
@@ -1308,7 +1410,7 @@ mod tests {
         assert_eq!(app.focus, Focus::Files);
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.file_selected, 1);
-        app.sync_diff();
+        app.sync_diff(80);
         let second_text = text_of(&app);
         assert!(second_text.contains(&format!("diff --git a/{second_path}")));
         assert!(!second_text.contains(&format!("diff --git a/{first_path}")));
@@ -1332,14 +1434,14 @@ mod tests {
         };
 
         // 先頭 (working copy = third change) の diff/files を一度取ってキャッシュさせる。
-        app.sync_diff();
+        app.sync_diff(80);
         let first_id = app.selected_change().unwrap().commit_id.clone();
         let first_text = text_of(&app);
         let first_files: Vec<String> = app.files.iter().map(|f| f.path.clone()).collect();
 
         // 別 commit (second change) へ移動して files/diff を取り直させる。
         app.handle_key(key(KeyCode::Char('j')));
-        app.sync_diff();
+        app.sync_diff(80);
         assert_ne!(app.selected_change().unwrap().commit_id, first_id);
 
         // ここで repo 自体を消す: これ以降に本当に `jj` を叩けば必ず失敗する。
@@ -1348,7 +1450,7 @@ mod tests {
         // 元の commit に戻る。commit_id は content-addressed で不変なので、
         // キャッシュヒットするなら jj を一切呼ばずに同じ内容が復元されるはず。
         app.handle_key(key(KeyCode::Char('k')));
-        app.sync_diff();
+        app.sync_diff(80);
         assert_eq!(app.selected_change().unwrap().commit_id, first_id);
         assert_eq!(text_of(&app), first_text);
         let files_again: Vec<String> = app.files.iter().map(|f| f.path.clone()).collect();
@@ -1359,7 +1461,7 @@ mod tests {
     fn jj_failures_are_not_cached_and_are_retried_on_the_next_view() {
         let (_tmp, mut app) = repo_or_skip!();
         // 先頭 (working copy) はここでキャッシュさせておき、壊す対象から外す。
-        app.sync_diff();
+        app.sync_diff(80);
         // 壊す対象 (second change) へ移動するが、まだ sync_diff は呼ばない —
         // ここでキャッシュしてしまうと失敗を注入する前に成功が残ってしまう。
         app.handle_key(key(KeyCode::Char('j')));
@@ -1369,7 +1471,7 @@ mod tests {
         let jj_dir = app.jj.root().join(".jj");
         let hidden = app.jj.root().join(".jj-hidden");
         std::fs::rename(&jj_dir, &hidden).unwrap();
-        app.sync_diff();
+        app.sync_diff(80);
         std::fs::rename(&hidden, &jj_dir).unwrap();
 
         assert!(
@@ -1386,9 +1488,9 @@ mod tests {
         // repo を戻して別 commit を経由 → 同じ commit に戻ると、
         // キャッシュされていないので jj を叩き直し、今度は成功する。
         app.handle_key(key(KeyCode::Char('j')));
-        app.sync_diff();
+        app.sync_diff(80);
         app.handle_key(key(KeyCode::Char('k')));
-        app.sync_diff();
+        app.sync_diff(80);
         assert!(
             app.diff_cache.contains(&commit_id),
             "リトライ後は成功データがキャッシュされているはず"

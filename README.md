@@ -124,6 +124,30 @@ including editing files in whatever directory it's launched from. E.g. for Claud
 `--allowedTools ""` to deny every tool; running with tools denied is also markedly more reliable
 for this one-line-summary use case than leaving them enabled.
 
+## Nicer diffs (difftastic, delta, …)
+
+shikigami never picks a diff format itself — `jj diff` decides, so two knobs from your existing jj
+setup carry straight through:
+
+- **`ui.diff-formatter`** (jj-side). shikigami no longer forces `--git`, so if you've configured an
+  external diff generator (e.g. [difftastic](https://difftastic.wilfred.me.uk/), which diffs trees
+  directly and syntax-highlights the result), the diff pane shows exactly that — same as running
+  `jj diff` in your shell.
+- **`SHIKIGAMI_DIFF_FILTER`** (shikigami-side). A shell command that receives the diff (ANSI
+  included) on stdin and must print ANSI on stdout; useful for pager-style tools like
+  [delta](https://github.com/dandavison/delta), which shikigami never invokes on its own since it
+  always runs jj with `--no-pager`:
+
+  ```sh
+  export SHIKIGAMI_DIFF_FILTER='delta --paging=never --side-by-side --width "$COLUMNS"'
+  ```
+
+  The diff pane's actual rendered width is passed to the command as `COLUMNS`, so a wrapper that
+  reads it (as above) gets side-by-side output that fits the pane instead of wrapping at a fixed
+  80 columns. If the command fails (missing binary, bad flags, non-zero exit), the diff pane falls
+  back to jj's raw output and the error shows in the status bar — a broken filter never blanks the
+  diff.
+
 ## Design notes
 
 - **jj CLI, not `jj-lib`.** `jj-lib` has no semver guarantee; the CLI's template language and flags
@@ -133,8 +157,10 @@ for this one-line-summary use case than leaving them enabled.
 - **No editor surprises.** Mutating commands always pass `-m` / `--use-destination-message`, and are
   additionally run with `ui.editor` pointed at a non-existent program: if jj ever wants an editor it
   fails visibly in the status bar instead of hijacking the alternate screen.
-- **Diff colors are jj's.** `jj diff --color always` output is converted to styled terminal text, so
-  the diff looks exactly as it does in your shell.
+- **Diff colors are jj's (optionally filtered).** `jj diff --color always` output is converted to
+  styled terminal text as-is, and the format is whatever `ui.diff-formatter` resolves to — no
+  `--git` is forced. `SHIKIGAMI_DIFF_FILTER` (see "Nicer diffs" above) can post-process that ANSI
+  through an external pager-style tool; shikigami never re-derives or re-highlights a diff itself.
 - **Files pane, one file at a time.** The right column is split into a file list
   (`jj diff --summary`) above the diff. The diff pane only ever shows the file currently selected
   there — like lazygit — instead of the whole change's diff scrolling past all at once.

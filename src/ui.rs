@@ -67,6 +67,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
+/// 現在の端末幅から diff pane の実描画幅 (枠線を除く) を計算する。
+/// `tui.rs` が `draw` より前に `App::sync_diff` を呼ぶ際、
+/// `SHIKIGAMI_DIFF_FILTER` へ渡す `COLUMNS` を出すのに使う。`draw` 内の
+/// レイアウトと同じ `Layout::horizontal` を通すことで、実際の描画幅と
+/// ずれない。
+pub fn diff_pane_width(total_width: u16) -> u16 {
+    let [_, right_area] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .areas(Rect::new(0, 0, total_width, 1));
+    right_area.width.saturating_sub(2) // 左右の枠線
+}
+
 fn pane_block(title: String, focused: bool) -> Block<'static> {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -340,7 +352,7 @@ mod tests {
     /// 空白が落ちるため、実際の見た目の検証は TestBackend で行う。
     fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        app.sync_diff();
+        app.sync_diff(diff_pane_width(width));
         terminal.draw(|frame| draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)

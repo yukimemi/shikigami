@@ -17,6 +17,7 @@ pub mod ai;
 pub mod app;
 pub mod cache;
 pub mod cli;
+pub mod diff_filter;
 pub mod jj;
 pub mod tui;
 pub mod ui;
