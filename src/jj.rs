@@ -238,6 +238,12 @@ impl Jj {
         )
     }
 
+    /// [`Jj::diff`] の色なし版。AI コマンドなど、ANSI を混ぜたくない
+    /// 消費者へ渡す用途に使う。
+    pub fn diff_plain(&self, rev: &str) -> Result<String> {
+        self.read(&["diff", "-r", rev, "--git"])
+    }
+
     /// diff pane のヘッダに出す `jj show --no-patch` 相当。
     pub fn show(&self, rev: &str) -> Result<String> {
         self.exec(

@@ -19,6 +19,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Enter", "jj edit — make the change the working copy"),
     ("n", "jj new — child of the selected change"),
     ("e", "jj describe — edit the description"),
+    ("Ctrl-g (in n/e prompt)", "AI: fill message from the diff"),
     ("b", "jj bookmark set"),
     ("m", "mark the selected change as squash/rebase target"),
     ("s", "jj squash — selected into the marked change"),
@@ -48,7 +49,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     match &app.mode {
         Mode::Help => draw_help(frame),
-        Mode::Input(input) => draw_input(frame, &input.prompt, &input.value),
+        Mode::Input(input) => draw_input(
+            frame,
+            &input.prompt,
+            &input.value,
+            input.action.ai_rev().is_some(),
+        ),
         Mode::Confirm(confirm) => draw_confirm(frame, &confirm.prompt),
         Mode::Normal => {}
     }
@@ -229,9 +235,10 @@ fn draw_help(frame: &mut Frame) {
     );
 }
 
-fn draw_input(frame: &mut Frame, prompt: &str, value: &str) {
+fn draw_input(frame: &mut Frame, prompt: &str, value: &str, ai_available: bool) {
     let area = centered(frame, 72, 3);
     frame.render_widget(Clear, area);
+    let hint = if ai_available { " / Ctrl-g: ai" } else { "" };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw(value.to_string()),
@@ -242,7 +249,7 @@ fn draw_input(frame: &mut Frame, prompt: &str, value: &str) {
         .block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .title(format!(" {prompt}  (Enter: ok / Esc: cancel) "))
+                .title(format!(" {prompt}  (Enter: ok / Esc: cancel{hint}) "))
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
         area,
@@ -398,5 +405,20 @@ mod tests {
             joined.contains(&selected.short_id) && joined.contains(&selected.commit_id),
             "diff pane title missing ids:\n{joined}"
         );
+    }
+
+    #[test]
+    fn input_overlay_hints_ai_only_when_the_prompt_supports_it() {
+        let (_tmp, mut app) = repo_or_skip!();
+        // describe: diff を持つので Ctrl-g のヒントが出る。
+        app.handle_key(key(KeyCode::Char('e')));
+        let joined = render(&mut app, 120, 20).join("\n");
+        assert!(joined.contains("Ctrl-g: ai"), "{joined}");
+        app.handle_key(key(KeyCode::Esc));
+
+        // bookmark: diff と無関係なのでヒントは出ない。
+        app.handle_key(key(KeyCode::Char('b')));
+        let joined = render(&mut app, 120, 20).join("\n");
+        assert!(!joined.contains("Ctrl-g"), "{joined}");
     }
 }
