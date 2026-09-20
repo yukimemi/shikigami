@@ -801,6 +801,15 @@ impl App {
                     Focus::Diff => Focus::Log,
                 }
             }
+            // 端末は Shift-Tab を独立した `BackTab` として送る (`Tab` +
+            // SHIFT 修飾子ではない) — crossterm もそう解釈する。
+            KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    Focus::Log => Focus::Diff,
+                    Focus::Files => Focus::Log,
+                    Focus::Diff => Focus::Files,
+                }
+            }
             KeyCode::Char('d') if ctrl => self.step(PAGE as isize),
             KeyCode::Char('u') if ctrl => self.step(-(PAGE as isize)),
             KeyCode::Char('j') | KeyCode::Down => self.step(1),
@@ -1341,6 +1350,23 @@ mod tests {
         let selected = app.selected_change().unwrap().id.clone();
         app.handle_key(ctrl('d'));
         assert_eq!(app.selected_change().unwrap().id, selected);
+    }
+
+    #[test]
+    fn shift_tab_cycles_focus_in_reverse() {
+        let (_tmp, mut app) = repo_or_skip!();
+        assert_eq!(app.focus, Focus::Log);
+        // Shift-Tab は Tab の逆順で回る: log -> diff -> files -> log。
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Diff);
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Files);
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Log);
+        // Tab / Shift-Tab は互いの逆であるべき: 往復すると元に戻る。
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Log);
     }
 
     #[cfg(unix)]

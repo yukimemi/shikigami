@@ -15,7 +15,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("j / k, ↓ / ↑", "move (log) or scroll (diff)"),
     ("g / G", "first / last"),
     ("Ctrl-d / Ctrl-u", "half-page move"),
-    ("Tab", "cycle focus: log -> files -> diff"),
+    (
+        "Tab / Shift-Tab",
+        "cycle focus: log -> files -> diff (reverse)",
+    ),
     ("Enter", "jj edit — make the change the working copy"),
     ("n", "jj new — child of the selected change"),
     ("e", "jj describe — edit the description"),
