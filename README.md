@@ -85,6 +85,8 @@ alone.
 | `n`               | `jj new` — child of the selected change (description prompt)  |
 | `e`               | `jj describe` — edit the description                          |
 | Ctrl-g            | (in the `n`/`e` prompt) fill the message from the diff via AI |
+| `r`               | `jj restore` — discard the selected file's change (files pane)|
+| `p`               | `jj absorb` — move the selected file's change into ancestor commits (files pane) |
 | `b`               | `jj bookmark set`                                             |
 | `m`               | mark the selected change as the squash / rebase target (`◆`)  |
 | `s`               | `jj squash` — selected change into the marked one             |

@@ -61,6 +61,53 @@ pub struct DiffFile {
     pub path: String,
 }
 
+impl DiffFile {
+    /// jj のファイルセット引数として渡せるパス。
+    ///
+    /// リネーム/コピーは現在その change に存在する新パス側を返す。
+    pub fn target_path(&self) -> String {
+        match split_rename(&self.path) {
+            Some((_old, new)) => new,
+            None => self.path.clone(),
+        }
+    }
+
+    /// `jj restore --changes-in` に渡すファイルセット。
+    ///
+    /// リネームで新パス側だけを渡すと、jj は新パス側の中身を消すだけで
+    /// 旧パス側を復元しないため、ファイルの内容ごと失われる (`jj status`
+    /// は旧パスの `D` を表示する)。旧/新パス両方を渡せば `jj restore` が
+    /// リネームごと元に戻す。
+    pub fn restore_paths(&self) -> Vec<String> {
+        match split_rename(&self.path) {
+            Some((old, new)) => vec![old, new],
+            None => vec![self.path.clone()],
+        }
+    }
+}
+
+/// `jj diff --summary` のリネーム表記 (`prefix{old => new}suffix`) から
+/// 旧パス・新パスのフルパスを組み立てる。
+///
+/// jj は git の diffstat と同じく、共通の prefix/suffix を `{}` の外に
+/// 出して差分部分だけを `old => new` で囲む — 共通部分が無い場合も
+/// `{old => new}` のように必ず `{}` で囲まれる (`" => "` を素の文字列と
+/// して直接 split すると、共通 prefix/suffix を持つリネームで壊れた
+/// パスになる: 例 `sub\{a.rs => b.rs}` を `" => "` で割ると
+/// `"sub\{a.rs"` / `"b.rs}"` になってしまい、どちらも実在しないパスに
+/// なる)。
+fn split_rename(path: &str) -> Option<(String, String)> {
+    let start = path.find('{')?;
+    let end = start + path[start..].find('}')?;
+    let (old_mid, new_mid) = path[start + 1..end].split_once(" => ")?;
+    let prefix = &path[..start];
+    let suffix = &path[end + 1..];
+    Some((
+        format!("{prefix}{old_mid}{suffix}"),
+        format!("{prefix}{new_mid}{suffix}"),
+    ))
+}
+
 /// log に出てくる 1 change。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
@@ -331,6 +378,21 @@ impl Jj {
         self.write(&["abandon", rev])
     }
 
+    /// `path` について、選択中 change (`rev`) に対する変更だけを取り消す。
+    /// files pane での「このファイルの変更を破棄する」に対応する。
+    pub fn restore_file(&self, rev: &str, paths: &[String]) -> Result<String> {
+        let mut args = vec!["restore", "--changes-in", rev];
+        args.extend(paths.iter().map(String::as_str));
+        self.write(&args)
+    }
+
+    /// `path` について、`rev` にある変更を祖先の mutable な change へ
+    /// 分散させる (`jj absorb`)。files pane での「このファイルの変更を
+    /// 適切な commit に配る」に対応する。
+    pub fn absorb_file(&self, rev: &str, path: &str) -> Result<String> {
+        self.write(&["absorb", "--from", rev, path])
+    }
+
     pub fn bookmark_set(&self, name: &str, rev: &str) -> Result<String> {
         // `bookmark set` は既存 bookmark の移動も新規作成も担う
         // (`create` は既存だとエラー)。TUI から「この change に名前を
@@ -567,6 +629,73 @@ mod tests {
                     path: "from.rs => to.rs".to_string()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn target_path_uses_the_new_side_of_a_rename() {
+        assert_eq!(
+            DiffFile {
+                status: 'M',
+                path: "src/app.rs".to_string(),
+            }
+            .target_path(),
+            "src/app.rs"
+        );
+        // jj は共通部分が無くても必ず `{}` で囲む (git の diffstat と同じ
+        // 圧縮記法): `jj diff --summary` の実出力に合わせたケース。
+        assert_eq!(
+            DiffFile {
+                status: 'R',
+                path: "{from.rs => to.rs}".to_string(),
+            }
+            .target_path(),
+            "to.rs"
+        );
+        // 共通の prefix/suffix があるケース (実際に jj が出す形)。
+        assert_eq!(
+            DiffFile {
+                status: 'R',
+                path: "sub/{a.rs => b.rs}".to_string(),
+            }
+            .target_path(),
+            "sub/b.rs"
+        );
+        assert_eq!(
+            DiffFile {
+                status: 'R',
+                path: "{old => new}/file.rs".to_string(),
+            }
+            .target_path(),
+            "new/file.rs"
+        );
+    }
+
+    #[test]
+    fn restore_paths_includes_both_sides_of_a_rename() {
+        assert_eq!(
+            DiffFile {
+                status: 'M',
+                path: "src/app.rs".to_string(),
+            }
+            .restore_paths(),
+            vec!["src/app.rs"]
+        );
+        assert_eq!(
+            DiffFile {
+                status: 'R',
+                path: "{from.rs => to.rs}".to_string(),
+            }
+            .restore_paths(),
+            vec!["from.rs", "to.rs"]
+        );
+        assert_eq!(
+            DiffFile {
+                status: 'R',
+                path: "sub/{a.rs => b.rs}".to_string(),
+            }
+            .restore_paths(),
+            vec!["sub/a.rs", "sub/b.rs"]
         );
     }
 

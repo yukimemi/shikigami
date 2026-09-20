@@ -84,6 +84,12 @@ pub enum ConfirmAction {
         onto: String,
         mode: RebaseMode,
     },
+    /// `jj restore --changes-in <rev> <path>` — files pane でファイル 1 件
+    /// の変更を破棄する。
+    RestoreFile {
+        rev: String,
+        paths: Vec<String>,
+    },
     Undo,
     Redo,
 }
@@ -690,6 +696,10 @@ impl App {
                 let result = self.jj.rebase(&rev, &onto, mode);
                 self.report("rebase", result);
             }
+            ConfirmAction::RestoreFile { rev, paths } => {
+                let result = self.jj.restore_file(&rev, &paths);
+                self.report("restore", result);
+            }
             ConfirmAction::Undo => {
                 let result = self.jj.undo();
                 self.report("undo", result);
@@ -864,6 +874,8 @@ impl App {
             KeyCode::Char('b') => self.prompt_bookmark(),
             KeyCode::Char('a') => self.confirm_abandon(),
             KeyCode::Char('x') => self.confirm_rebase(),
+            KeyCode::Char('r') if self.focus == Focus::Files => self.confirm_restore_file(),
+            KeyCode::Char('p') if self.focus == Focus::Files => self.absorb_file(),
             KeyCode::Char('u') => {
                 self.mode = Mode::Confirm(Confirm {
                     prompt: "undo the last jj operation?".into(),
@@ -1030,12 +1042,65 @@ impl App {
             action: ConfirmAction::Abandon { rev: change.id },
         });
     }
+
+    /// files pane で選択中のファイルについて、選択中 change での変更を
+    /// 破棄する確認ダイアログを開く。`jj restore --changes-in` は内容を
+    /// 失う操作なので abandon と同様に確認を挟む。
+    fn confirm_restore_file(&mut self) {
+        let Some(change) = self.selected_change().cloned() else {
+            return;
+        };
+        let Some(file) = self.selected_file().cloned() else {
+            return;
+        };
+        let paths = file.restore_paths();
+        self.mode = Mode::Confirm(Confirm {
+            prompt: format!(
+                "restore {} — discard this file's change in {}?",
+                file.path, change.short_id
+            ),
+            action: ConfirmAction::RestoreFile {
+                rev: change.id,
+                paths,
+            },
+        });
+    }
+
+    /// files pane で選択中のファイルについて、選択中 change の変更を
+    /// 祖先の mutable な change へ分散させる (`jj absorb`)。内容は失わず
+    /// 置き場所が変わるだけなので、他の非破壊操作 (edit/describe 等) と
+    /// 同じく確認なしで即実行する。
+    ///
+    /// リネーム/コピー (`R`/`C`) は対象外: `jj absorb` は新パスの行を
+    /// 祖先の同名パスへ blame で辿るため、パスが変わった行は祖先側に
+    /// 一致する行が無いと判定され、渡すパスの組み合わせ次第で
+    /// 「何も起きない (無言の no-op)」か「祖先からファイルの中身ごと
+    /// 消えて現在の change に丸ごと new として残る (実質的な巻き戻し)」
+    /// のどちらかになる — どちらも「選択ファイルの変更が祖先へ移る」
+    /// という期待から外れるので、実行前に弾いて理由を出す。
+    fn absorb_file(&mut self) {
+        let Some(change) = self.selected_change().cloned() else {
+            return;
+        };
+        let Some(file) = self.selected_file().cloned() else {
+            return;
+        };
+        if matches!(file.status, 'R' | 'C') {
+            self.status = Status::error(format!(
+                "absorb: renamed/copied file {} is not supported — jj can't attribute changes across a rename",
+                file.path
+            ));
+            return;
+        }
+        let result = self.jj.absorb_file(&change.id, &file.target_path());
+        self.report("absorb", result);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::repo_or_skip;
+    use crate::testutil::{jj_available, repo_or_skip, report_skip, run};
     use std::path::Path;
     use std::process::Command;
 
@@ -1204,6 +1269,217 @@ mod tests {
             "undo did not restore the change: {:?}",
             descriptions(&app)
         );
+    }
+
+    #[test]
+    fn restore_file_discards_the_files_change() {
+        let (_tmp, mut app) = repo_or_skip!();
+        while app.selected_change().unwrap().description != "second change" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.sync_diff(80);
+        assert_eq!(app.files.len(), 1, "{:?}", app.files);
+        assert_eq!(app.files[0].path, "b.txt");
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('r')));
+        let Mode::Confirm(confirm) = &app.mode else {
+            panic!("expected confirm mode, got {:?}", app.mode);
+        };
+        assert!(
+            confirm.prompt.starts_with("restore b.txt"),
+            "{}",
+            confirm.prompt
+        );
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+        // change_id は書き換えでも変わらないので、選択はそのまま
+        // "second change" を指す。description も残る (empty にはなるが
+        // abandon はされない)。
+        assert_eq!(app.selected_change().unwrap().description, "second change");
+        app.sync_diff(80);
+        assert!(app.files.is_empty(), "{:?}", app.files);
+    }
+
+    #[test]
+    fn restore_and_absorb_keys_are_ignored_outside_files_focus() {
+        let (_tmp, mut app) = repo_or_skip!();
+        while app.selected_change().unwrap().description != "second change" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.sync_diff(80);
+        assert_eq!(app.files.len(), 1, "{:?}", app.files);
+
+        // focus は既定で Log。files pane 向けのキーは効かないはず。
+        assert_eq!(app.focus, Focus::Log);
+        let status_before = app.status.clone();
+        app.handle_key(key(KeyCode::Char('r')));
+        assert!(matches!(app.mode, Mode::Normal), "{:?}", app.mode);
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(matches!(app.mode, Mode::Normal), "{:?}", app.mode);
+        assert_eq!(app.status, status_before);
+    }
+
+    #[test]
+    fn restore_file_on_a_rename_restores_the_original_file() {
+        // リネームされたファイルは `path` に `"old => new"` が入る。
+        // target_path() (new 側) だけを `jj restore` に渡すと new 側を
+        // 消すだけで old 側が復元されず、内容ごと失われる。old/new
+        // 両方を渡すことでリネームごと元に戻ることを確認する。
+        if !jj_available() {
+            report_skip();
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[user]\nname = \"test\"\nemail = \"test@example.com\"\n",
+        )
+        .unwrap();
+        run(dir, &["git", "init"]);
+        std::fs::write(dir.join("old.rs"), "hello\n").unwrap();
+        run(dir, &["describe", "-m", "add old.rs"]);
+        run(dir, &["new", "-m", "rename"]);
+        std::fs::rename(dir.join("old.rs"), dir.join("new.rs")).unwrap();
+        run(dir, &["config", "set", "--repo", "user.name", "test"]);
+        run(
+            dir,
+            &["config", "set", "--repo", "user.email", "test@example.com"],
+        );
+
+        let jj = Jj::discover(dir).unwrap();
+        let mut app = App::new(jj, Some("all()".to_string())).unwrap();
+        app.wait_for_startup();
+
+        while app.selected_change().unwrap().description != "rename" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.sync_diff(80);
+        assert_eq!(app.files.len(), 1, "{:?}", app.files);
+        assert_eq!(app.files[0].path, "{old.rs => new.rs}");
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('r')));
+        let Mode::Confirm(confirm) = &app.mode else {
+            panic!("expected confirm mode, got {:?}", app.mode);
+        };
+        assert!(
+            confirm.prompt.starts_with("restore {old.rs => new.rs}"),
+            "{}",
+            confirm.prompt
+        );
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+
+        app.sync_diff(80);
+        assert!(app.files.is_empty(), "{:?}", app.files);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("old.rs")).unwrap(),
+            "hello\n",
+            "restore must bring back the original file, not just delete the renamed one"
+        );
+        assert!(!dir.join("new.rs").exists());
+    }
+
+    #[test]
+    fn absorb_file_moves_the_change_into_its_mutable_ancestor() {
+        if !jj_available() {
+            report_skip();
+            return;
+        }
+        // absorb は既存行を最後に触った祖先を探す操作なので、共有 repo()
+        // fixture の「ファイル追加のみ」では宛先が決まらない。行の編集を
+        // 含む専用 repo をここで組み立てる。
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[user]\nname = \"test\"\nemail = \"test@example.com\"\n",
+        )
+        .unwrap();
+        run(dir, &["git", "init"]);
+        std::fs::write(dir.join("f.txt"), "line1\nline2\nline3\n").unwrap();
+        run(dir, &["describe", "-m", "base"]);
+        run(dir, &["new", "-m", "top"]);
+        std::fs::write(dir.join("f.txt"), "line1\nline2-edited\nline3\n").unwrap();
+        run(dir, &["config", "set", "--repo", "user.name", "test"]);
+        run(
+            dir,
+            &["config", "set", "--repo", "user.email", "test@example.com"],
+        );
+
+        let jj = Jj::discover(dir).unwrap();
+        let mut app = App::new(jj, Some("all()".to_string())).unwrap();
+        app.wait_for_startup();
+
+        while app.selected_change().unwrap().description != "top" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.sync_diff(80);
+        assert_eq!(app.files.len(), 1, "{:?}", app.files);
+        assert_eq!(app.files[0].path, "f.txt");
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+
+        // "top" にはもう f.txt の変更が残っていない — 祖先 "base" に
+        // 吸収された。description が付いているので abandon はされず、
+        // change 自体は空のまま残る。
+        assert_eq!(app.selected_change().unwrap().description, "top");
+        app.sync_diff(80);
+        assert!(app.files.is_empty(), "{:?}", app.files);
+    }
+
+    #[test]
+    fn absorb_refuses_a_renamed_file_instead_of_silently_doing_nothing() {
+        // jj absorb は blame でパスを祖先まで辿るので、リネーム後の新
+        // パスだけを渡しても祖先には同名の行が無く「何も起きない」。
+        // それを黙って "absorb" 成功扱いにはせず、明示的に断る。
+        if !jj_available() {
+            report_skip();
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[user]\nname = \"test\"\nemail = \"test@example.com\"\n",
+        )
+        .unwrap();
+        run(dir, &["git", "init"]);
+        std::fs::write(dir.join("old.rs"), "line1\n").unwrap();
+        run(dir, &["describe", "-m", "base"]);
+        run(dir, &["new", "-m", "rename and edit"]);
+        std::fs::rename(dir.join("old.rs"), dir.join("new.rs")).unwrap();
+        std::fs::write(dir.join("new.rs"), "line1\nline2\n").unwrap();
+        run(dir, &["config", "set", "--repo", "user.name", "test"]);
+        run(
+            dir,
+            &["config", "set", "--repo", "user.email", "test@example.com"],
+        );
+
+        let jj = Jj::discover(dir).unwrap();
+        let mut app = App::new(jj, Some("all()".to_string())).unwrap();
+        app.wait_for_startup();
+
+        while app.selected_change().unwrap().description != "rename and edit" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.sync_diff(80);
+        assert_eq!(app.files.len(), 1, "{:?}", app.files);
+        assert_eq!(app.files[0].status, 'R');
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.status.kind, StatusKind::Error, "{:?}", app.status);
+
+        // 何もしていないので、選択中 change の diff はまだ元のまま。
+        app.sync_diff(80);
+        assert_eq!(app.files.len(), 1, "{:?}", app.files);
+        assert_eq!(app.files[0].status, 'R');
     }
 
     #[test]
