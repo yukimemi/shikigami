@@ -23,6 +23,14 @@ pub const KEYS: &[(&str, &str)] = &[
     ("n", "jj new — child of the selected change"),
     ("e", "jj describe — edit the description"),
     ("Ctrl-g (in n/e prompt)", "AI: fill message from the diff"),
+    (
+        "r (files pane)",
+        "jj restore — discard the selected file's change",
+    ),
+    (
+        "p (files pane)",
+        "jj absorb — move the selected file's change into ancestor commits",
+    ),
     ("b", "jj bookmark set"),
     ("m", "mark the selected change as squash/rebase target"),
     ("s", "jj squash — selected into the marked change"),

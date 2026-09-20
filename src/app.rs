@@ -84,6 +84,12 @@ pub enum ConfirmAction {
         onto: String,
         mode: RebaseMode,
     },
+    /// `jj restore --changes-in <rev> <path>` — files pane でファイル 1 件
+    /// の変更を破棄する。
+    RestoreFile {
+        rev: String,
+        path: String,
+    },
     Undo,
     Redo,
 }
@@ -690,6 +696,10 @@ impl App {
                 let result = self.jj.rebase(&rev, &onto, mode);
                 self.report("rebase", result);
             }
+            ConfirmAction::RestoreFile { rev, path } => {
+                let result = self.jj.restore_file(&rev, &path);
+                self.report("restore", result);
+            }
             ConfirmAction::Undo => {
                 let result = self.jj.undo();
                 self.report("undo", result);
@@ -864,6 +874,8 @@ impl App {
             KeyCode::Char('b') => self.prompt_bookmark(),
             KeyCode::Char('a') => self.confirm_abandon(),
             KeyCode::Char('x') => self.confirm_rebase(),
+            KeyCode::Char('r') => self.confirm_restore_file(),
+            KeyCode::Char('p') => self.absorb_file(),
             KeyCode::Char('u') => {
                 self.mode = Mode::Confirm(Confirm {
                     prompt: "undo the last jj operation?".into(),
@@ -1030,12 +1042,50 @@ impl App {
             action: ConfirmAction::Abandon { rev: change.id },
         });
     }
+
+    /// files pane で選択中のファイルについて、選択中 change での変更を
+    /// 破棄する確認ダイアログを開く。`jj restore --changes-in` は内容を
+    /// 失う操作なので abandon と同様に確認を挟む。
+    fn confirm_restore_file(&mut self) {
+        let Some(change) = self.selected_change().cloned() else {
+            return;
+        };
+        let Some(file) = self.selected_file().cloned() else {
+            return;
+        };
+        let path = file.target_path().to_string();
+        self.mode = Mode::Confirm(Confirm {
+            prompt: format!(
+                "restore {path} — discard this file's change in {}?",
+                change.short_id
+            ),
+            action: ConfirmAction::RestoreFile {
+                rev: change.id,
+                path,
+            },
+        });
+    }
+
+    /// files pane で選択中のファイルについて、選択中 change の変更を
+    /// 祖先の mutable な change へ分散させる (`jj absorb`)。内容は失わず
+    /// 置き場所が変わるだけなので、他の非破壊操作 (edit/describe 等) と
+    /// 同じく確認なしで即実行する。
+    fn absorb_file(&mut self) {
+        let Some(change) = self.selected_change().cloned() else {
+            return;
+        };
+        let Some(file) = self.selected_file().cloned() else {
+            return;
+        };
+        let result = self.jj.absorb_file(&change.id, file.target_path());
+        self.report("absorb", result);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::repo_or_skip;
+    use crate::testutil::{jj_available, report_skip, repo_or_skip, run};
     use std::path::Path;
     use std::process::Command;
 
@@ -1204,6 +1254,88 @@ mod tests {
             "undo did not restore the change: {:?}",
             descriptions(&app)
         );
+    }
+
+    #[test]
+    fn restore_file_discards_the_files_change() {
+        let (_tmp, mut app) = repo_or_skip!();
+        while app.selected_change().unwrap().description != "second change" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.sync_diff(80);
+        assert_eq!(app.files.len(), 1, "{:?}", app.files);
+        assert_eq!(app.files[0].path, "b.txt");
+
+        app.handle_key(key(KeyCode::Char('r')));
+        let Mode::Confirm(confirm) = &app.mode else {
+            panic!("expected confirm mode, got {:?}", app.mode);
+        };
+        assert!(
+            confirm.prompt.starts_with("restore b.txt"),
+            "{}",
+            confirm.prompt
+        );
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+        // change_id は書き換えでも変わらないので、選択はそのまま
+        // "second change" を指す。description も残る (empty にはなるが
+        // abandon はされない)。
+        assert_eq!(
+            app.selected_change().unwrap().description,
+            "second change"
+        );
+        app.sync_diff(80);
+        assert!(app.files.is_empty(), "{:?}", app.files);
+    }
+
+    #[test]
+    fn absorb_file_moves_the_change_into_its_mutable_ancestor() {
+        if !jj_available() {
+            report_skip();
+            return;
+        }
+        // absorb は既存行を最後に触った祖先を探す操作なので、共有 repo()
+        // fixture の「ファイル追加のみ」では宛先が決まらない。行の編集を
+        // 含む専用 repo をここで組み立てる。
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[user]\nname = \"test\"\nemail = \"test@example.com\"\n",
+        )
+        .unwrap();
+        run(dir, &["git", "init"]);
+        std::fs::write(dir.join("f.txt"), "line1\nline2\nline3\n").unwrap();
+        run(dir, &["describe", "-m", "base"]);
+        run(dir, &["new", "-m", "top"]);
+        std::fs::write(dir.join("f.txt"), "line1\nline2-edited\nline3\n").unwrap();
+        run(dir, &["config", "set", "--repo", "user.name", "test"]);
+        run(
+            dir,
+            &["config", "set", "--repo", "user.email", "test@example.com"],
+        );
+
+        let jj = Jj::discover(dir).unwrap();
+        let mut app = App::new(jj, Some("all()".to_string())).unwrap();
+        app.wait_for_startup();
+
+        while app.selected_change().unwrap().description != "top" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.sync_diff(80);
+        assert_eq!(app.files.len(), 1, "{:?}", app.files);
+        assert_eq!(app.files[0].path, "f.txt");
+
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+
+        // "top" にはもう f.txt の変更が残っていない — 祖先 "base" に
+        // 吸収された。description が付いているので abandon はされず、
+        // change 自体は空のまま残る。
+        assert_eq!(app.selected_change().unwrap().description, "top");
+        app.sync_diff(80);
+        assert!(app.files.is_empty(), "{:?}", app.files);
     }
 
     #[test]

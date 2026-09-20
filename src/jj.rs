@@ -61,6 +61,20 @@ pub struct DiffFile {
     pub path: String,
 }
 
+impl DiffFile {
+    /// jj のファイルセット引数として渡せるパス。
+    ///
+    /// リネーム/コピーは `path` に `"old => new"` がそのまま入っている
+    /// ので、そのまま jj に渡すとファイルセットとして解釈できない。
+    /// 現在その change に存在するのは新パス側なので、`=>` の右側を返す。
+    pub fn target_path(&self) -> &str {
+        match self.path.split_once(" => ") {
+            Some((_old, new)) => new,
+            None => &self.path,
+        }
+    }
+}
+
 /// log に出てくる 1 change。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
@@ -331,6 +345,19 @@ impl Jj {
         self.write(&["abandon", rev])
     }
 
+    /// `path` について、選択中 change (`rev`) に対する変更だけを取り消す。
+    /// files pane での「このファイルの変更を破棄する」に対応する。
+    pub fn restore_file(&self, rev: &str, path: &str) -> Result<String> {
+        self.write(&["restore", "--changes-in", rev, path])
+    }
+
+    /// `path` について、`rev` にある変更を祖先の mutable な change へ
+    /// 分散させる (`jj absorb`)。files pane での「このファイルの変更を
+    /// 適切な commit に配る」に対応する。
+    pub fn absorb_file(&self, rev: &str, path: &str) -> Result<String> {
+        self.write(&["absorb", "--from", rev, path])
+    }
+
     pub fn bookmark_set(&self, name: &str, rev: &str) -> Result<String> {
         // `bookmark set` は既存 bookmark の移動も新規作成も担う
         // (`create` は既存だとエラー)。TUI から「この change に名前を
@@ -567,6 +594,26 @@ mod tests {
                     path: "from.rs => to.rs".to_string()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn target_path_uses_the_new_side_of_a_rename() {
+        assert_eq!(
+            DiffFile {
+                status: 'M',
+                path: "src/app.rs".to_string(),
+            }
+            .target_path(),
+            "src/app.rs"
+        );
+        assert_eq!(
+            DiffFile {
+                status: 'R',
+                path: "from.rs => to.rs".to_string(),
+            }
+            .target_path(),
+            "to.rs"
         );
     }
 
