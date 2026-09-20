@@ -76,8 +76,14 @@ fn shell_command(cmd: &str) -> Command {
 
 #[cfg(windows)]
 fn shell_command(cmd: &str) -> Command {
+    // `ai.rs::shell_command` と同じ理由・同じ対処 (詳細はそちらのコメント
+    // 参照): `raw_arg` に加えて文字列全体をもう 1 組の `"..."` で包み、
+    // 先頭が `"C:\Program Files\tool.exe" ...` のような引用符付き絶対
+    // パスでも `cmd /C` が誤認識しないようにする。
+    use std::os::windows::process::CommandExt;
     let mut command = Command::new("cmd");
-    command.arg("/C").arg(cmd);
+    command.arg("/C");
+    command.raw_arg(format!("\"{cmd}\""));
     command
 }
 
@@ -132,5 +138,17 @@ mod tests {
         // 存在確認だけ: プラットフォーム別コマンド名を使っているテストが
         // 環境依存で無意味に落ちていないことのメモ用。
         let _ = cat_cmd();
+    }
+
+    // `ai.rs::quoted_argument_with_spaces_survives_cmd_reparsing` と同じ
+    // 回帰。`SHIKIGAMI_DIFF_FILTER` に `delta --width "%COLUMNS%"
+    // --side-by-side` のような引用符付き引数付きコマンドを書いても、
+    // `cmd /C` 越しに引数がバラけないことを確認する。
+    #[cfg(windows)]
+    #[test]
+    fn quoted_argument_with_spaces_survives_cmd_reparsing() {
+        let cmd = r#"findstr /C:"needle with spaces""#;
+        let out = apply(cmd, "before\nneedle with spaces\nafter\n", 80).unwrap();
+        assert!(out.contains("needle with spaces"), "{out}");
     }
 }

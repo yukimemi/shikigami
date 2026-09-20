@@ -86,8 +86,28 @@ fn shell_command(cmd: &str) -> Command {
 
 #[cfg(windows)]
 fn shell_command(cmd: &str) -> Command {
+    // `.arg(cmd)` は Rust の CreateProcess 向けクォート規則で `cmd` 全体を
+    // 1 引数としてエスケープしてしまう。だが `cmd /C` はそのルールを使わず
+    // 自前のパーサで再分割するため、二重エスケープで壊れる — 例えば
+    // `-p "multi word text" --flag ""` のような (ユーザが `SHIKIGAMI_AI_CMD`
+    // に書く典型的な) コマンドラインは、引用符付きの語がバラバラの単語に
+    // 分解されてしまい、子プロセスには全く違う引数列が渡る。
+    // `raw_arg` でユーザの文字列をそのまま渡し、`cmd.exe` に「ターミナルで
+    // 直接打った場合と同じ」解釈をさせることで防ぐ。
+    //
+    // それだけだと `"C:\Program Files\tool.exe" -p "..."` のように先頭の
+    // 実行ファイル名自体が引用符付き絶対パスのケースでまだ壊れる —
+    // `cmd /C` は「文字列全体が `"` で始まり `"` で終わる」ときだけ外側の
+    // 引用符を 1 組剥がしてから再解釈する仕様なので、先頭トークンだけが
+    // 引用符付きで文字列全体はそうでない今回の形だと `cmd` が
+    // 「内部コマンドでも外部コマンドでもない」と誤認識する
+    // (Raymond Chen の古典的な `cmd /C` の罠と同じ)。文字列全体をもう
+    // 1 組の `"..."` で包むことで、剥がされる引用符と実引数の引用符を
+    // 分離し、どちらの形のコマンドでも意図通りに動く。
+    use std::os::windows::process::CommandExt;
     let mut command = Command::new("cmd");
-    command.arg("/C").arg(cmd);
+    command.arg("/C");
+    command.raw_arg(format!("\"{cmd}\""));
     command
 }
 
@@ -139,5 +159,35 @@ mod tests {
         let cmd = "more";
         let out = generate_message(cmd, "hello from diff").unwrap();
         assert_eq!(out, "hello from diff");
+    }
+
+    // 実際に事故った形 (`SHIKIGAMI_AI_CMD` に
+    // `claude -p "long text with spaces" --model sonnet --allowedTools ""`
+    // のような複数語の引用符付き引数を書く) の回帰テスト。`.arg(cmd)` の
+    // 二重エスケープだと `"needle with spaces"` が `needle`/`with`/
+    // `spaces"` の 3 引数にバラけ、`findstr` はそれぞれを (存在しない)
+    // ファイル名として開こうとして失敗する。正しく 1 引数のまま渡れば
+    // stdin (diff) の中からそのフレーズを見つけて返す。
+    #[cfg(windows)]
+    #[test]
+    fn quoted_argument_with_spaces_survives_cmd_reparsing() {
+        let cmd = r#"findstr /C:"needle with spaces""#;
+        let out = generate_message(cmd, "before\nneedle with spaces\nafter\n").unwrap();
+        assert_eq!(out, "needle with spaces");
+    }
+
+    // 別の壊れ方: 先頭の実行ファイル名自体が引用符付き絶対パスの場合
+    // (`SHIKIGAMI_AI_CMD` に `"C:\Program Files\tool\claude.exe" -p "..."`
+    // のように書くケース)。文字列全体を包む外側の `"..."` が無いと、
+    // `cmd /C` は「内部コマンドでも外部コマンドでもない」と誤認識して
+    // 起動に失敗する。
+    #[cfg(windows)]
+    #[test]
+    fn quoted_executable_path_as_the_first_token_still_runs() {
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let findstr = format!("{system_root}\\System32\\findstr.exe");
+        let cmd = format!(r#""{findstr}" /C:"needle with spaces""#);
+        let out = generate_message(&cmd, "before\nneedle with spaces\nafter\n").unwrap();
+        assert_eq!(out, "needle with spaces");
     }
 }
