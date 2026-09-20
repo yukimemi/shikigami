@@ -88,7 +88,7 @@ pub enum ConfirmAction {
     /// の変更を破棄する。
     RestoreFile {
         rev: String,
-        path: String,
+        paths: Vec<String>,
     },
     Undo,
     Redo,
@@ -696,8 +696,8 @@ impl App {
                 let result = self.jj.rebase(&rev, &onto, mode);
                 self.report("rebase", result);
             }
-            ConfirmAction::RestoreFile { rev, path } => {
-                let result = self.jj.restore_file(&rev, &path);
+            ConfirmAction::RestoreFile { rev, paths } => {
+                let result = self.jj.restore_file(&rev, &paths);
                 self.report("restore", result);
             }
             ConfirmAction::Undo => {
@@ -874,8 +874,8 @@ impl App {
             KeyCode::Char('b') => self.prompt_bookmark(),
             KeyCode::Char('a') => self.confirm_abandon(),
             KeyCode::Char('x') => self.confirm_rebase(),
-            KeyCode::Char('r') => self.confirm_restore_file(),
-            KeyCode::Char('p') => self.absorb_file(),
+            KeyCode::Char('r') if self.focus == Focus::Files => self.confirm_restore_file(),
+            KeyCode::Char('p') if self.focus == Focus::Files => self.absorb_file(),
             KeyCode::Char('u') => {
                 self.mode = Mode::Confirm(Confirm {
                     prompt: "undo the last jj operation?".into(),
@@ -1053,15 +1053,15 @@ impl App {
         let Some(file) = self.selected_file().cloned() else {
             return;
         };
-        let path = file.target_path().to_string();
+        let paths = file.restore_paths();
         self.mode = Mode::Confirm(Confirm {
             prompt: format!(
-                "restore {path} — discard this file's change in {}?",
-                change.short_id
+                "restore {} — discard this file's change in {}?",
+                file.path, change.short_id
             ),
             action: ConfirmAction::RestoreFile {
                 rev: change.id,
-                path,
+                paths,
             },
         });
     }
@@ -1077,7 +1077,7 @@ impl App {
         let Some(file) = self.selected_file().cloned() else {
             return;
         };
-        let result = self.jj.absorb_file(&change.id, file.target_path());
+        let result = self.jj.absorb_file(&change.id, &file.target_path());
         self.report("absorb", result);
     }
 }
@@ -1266,6 +1266,7 @@ mod tests {
         assert_eq!(app.files.len(), 1, "{:?}", app.files);
         assert_eq!(app.files[0].path, "b.txt");
 
+        app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Char('r')));
         let Mode::Confirm(confirm) = &app.mode else {
             panic!("expected confirm mode, got {:?}", app.mode);
@@ -1287,6 +1288,83 @@ mod tests {
         );
         app.sync_diff(80);
         assert!(app.files.is_empty(), "{:?}", app.files);
+    }
+
+    #[test]
+    fn restore_and_absorb_keys_are_ignored_outside_files_focus() {
+        let (_tmp, mut app) = repo_or_skip!();
+        while app.selected_change().unwrap().description != "second change" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.sync_diff(80);
+        assert_eq!(app.files.len(), 1, "{:?}", app.files);
+
+        // focus は既定で Log。files pane 向けのキーは効かないはず。
+        assert_eq!(app.focus, Focus::Log);
+        let status_before = app.status.clone();
+        app.handle_key(key(KeyCode::Char('r')));
+        assert!(matches!(app.mode, Mode::Normal), "{:?}", app.mode);
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(matches!(app.mode, Mode::Normal), "{:?}", app.mode);
+        assert_eq!(app.status, status_before);
+    }
+
+    #[test]
+    fn restore_file_on_a_rename_restores_the_original_file() {
+        // リネームされたファイルは `path` に `"old => new"` が入る。
+        // target_path() (new 側) だけを `jj restore` に渡すと new 側を
+        // 消すだけで old 側が復元されず、内容ごと失われる。old/new
+        // 両方を渡すことでリネームごと元に戻ることを確認する。
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[user]\nname = \"test\"\nemail = \"test@example.com\"\n",
+        )
+        .unwrap();
+        run(dir, &["git", "init"]);
+        std::fs::write(dir.join("old.rs"), "hello\n").unwrap();
+        run(dir, &["describe", "-m", "add old.rs"]);
+        run(dir, &["new", "-m", "rename"]);
+        std::fs::rename(dir.join("old.rs"), dir.join("new.rs")).unwrap();
+        run(dir, &["config", "set", "--repo", "user.name", "test"]);
+        run(
+            dir,
+            &["config", "set", "--repo", "user.email", "test@example.com"],
+        );
+
+        let jj = Jj::discover(dir).unwrap();
+        let mut app = App::new(jj, Some("all()".to_string())).unwrap();
+        app.wait_for_startup();
+
+        while app.selected_change().unwrap().description != "rename" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.sync_diff(80);
+        assert_eq!(app.files.len(), 1, "{:?}", app.files);
+        assert_eq!(app.files[0].path, "{old.rs => new.rs}");
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('r')));
+        let Mode::Confirm(confirm) = &app.mode else {
+            panic!("expected confirm mode, got {:?}", app.mode);
+        };
+        assert!(
+            confirm.prompt.starts_with("restore {old.rs => new.rs}"),
+            "{}",
+            confirm.prompt
+        );
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+
+        app.sync_diff(80);
+        assert!(app.files.is_empty(), "{:?}", app.files);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("old.rs")).unwrap(),
+            "hello\n",
+            "restore must bring back the original file, not just delete the renamed one"
+        );
+        assert!(!dir.join("new.rs").exists());
     }
 
     #[test]
@@ -1327,6 +1405,7 @@ mod tests {
         assert_eq!(app.files.len(), 1, "{:?}", app.files);
         assert_eq!(app.files[0].path, "f.txt");
 
+        app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Char('p')));
         assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
 
