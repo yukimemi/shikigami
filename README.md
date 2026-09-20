@@ -80,7 +80,7 @@ alone.
 | `j` / `k`         | move (log pane), select a file (files pane), or scroll (diff pane) |
 | `g` / `G`         | first / last (in whichever pane has focus)                    |
 | `Ctrl-d`/`Ctrl-u` | half-page move                                                |
-| `Tab`             | cycle focus: log → files → diff                                |
+| `Tab` / `Shift-Tab` | cycle focus: log → files → diff (`Shift-Tab` reverses)   |
 | `Enter`           | `jj edit` — make the selected change the working copy         |
 | `n`               | `jj new` — child of the selected change (description prompt)  |
 | `e`               | `jj describe` — edit the description                          |
