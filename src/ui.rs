@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::app::{App, Focus, Mode, StatusKind};
+use crate::app::{App, Focus, Mode, PaneLayout, StatusKind};
 use crate::jj::{DiffFile, Row};
 
 /// help overlay に出すキー一覧。`doc` と二重管理にならないよう、
@@ -39,6 +39,7 @@ pub const KEYS: &[(&str, &str)] = &[
         "jj rebase — selected onto the marked change (or a revset)",
     ),
     ("R", "cycle rebase mode: -r / -s / -b"),
+    ("L", "cycle pane layout: stacked / diff-below"),
     ("a", "jj abandon"),
     ("u / U", "jj undo / jj redo"),
     ("/", "set the log revset"),
@@ -51,14 +52,7 @@ pub const KEYS: &[(&str, &str)] = &[
 pub fn draw(frame: &mut Frame, app: &App) {
     let [body, status] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
-    let [log_area, right_area] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
-    // files pane はファイル数 + 枠 2 行で伸縮させ、余白を無駄にしない。
-    // ただし diff pane を 3 行未満に潰さない上限は付ける。
-    let files_max = right_area.height.saturating_sub(3).max(3);
-    let files_height = (app.files.len() as u16 + 2).clamp(3, files_max);
-    let [files_area, diff_area] =
-        Layout::vertical([Constraint::Length(files_height), Constraint::Min(1)]).areas(right_area);
+    let (log_area, files_area, diff_area) = split_panes(body, app.layout, app.files.len());
 
     draw_log(frame, log_area, app);
     draw_files(frame, files_area, app);
@@ -78,16 +72,46 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
+/// `draw` 本体の pane 分割。`PaneLayout::Stacked` は現状どおり
+/// `log | (files - diff)` (右カラムを files/diff で縦分け)、
+/// `PaneLayout::DiffBelow` は `(log | files) - diff` (上段を log/files で
+/// 横分けし、diff は下段で全幅を使う — delta の side-by-side など幅が
+/// 要る diff フィルタ向け)。`diff_pane_width` もここを通すことで、実描画
+/// 幅とフィルタへ渡す `COLUMNS` がずれない。
+fn split_panes(body: Rect, layout: PaneLayout, files_len: usize) -> (Rect, Rect, Rect) {
+    match layout {
+        PaneLayout::Stacked => {
+            let [log_area, right_area] =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .areas(body);
+            // files pane はファイル数 + 枠 2 行で伸縮させ、余白を無駄にしない。
+            // ただし diff pane を 3 行未満に潰さない上限は付ける。
+            let files_max = right_area.height.saturating_sub(3).max(3);
+            let files_height = (files_len as u16 + 2).clamp(3, files_max);
+            let [files_area, diff_area] =
+                Layout::vertical([Constraint::Length(files_height), Constraint::Min(1)])
+                    .areas(right_area);
+            (log_area, files_area, diff_area)
+        }
+        PaneLayout::DiffBelow => {
+            let [top_area, diff_area] =
+                Layout::vertical([Constraint::Percentage(45), Constraint::Min(1)]).areas(body);
+            let [log_area, files_area] =
+                Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
+                    .areas(top_area);
+            (log_area, files_area, diff_area)
+        }
+    }
+}
+
 /// 現在の端末幅から diff pane の実描画幅 (枠線を除く) を計算する。
 /// `tui.rs` が `draw` より前に `App::sync_diff` を呼ぶ際、
-/// `SHIKIGAMI_DIFF_FILTER` へ渡す `COLUMNS` を出すのに使う。`draw` 内の
-/// レイアウトと同じ `Layout::horizontal` を通すことで、実際の描画幅と
-/// ずれない。
-pub fn diff_pane_width(total_width: u16) -> u16 {
-    let [_, right_area] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .areas(Rect::new(0, 0, total_width, 1));
-    right_area.width.saturating_sub(2) // 左右の枠線
+/// `SHIKIGAMI_DIFF_FILTER` へ渡す `COLUMNS` を出すのに使う。`split_panes`
+/// を通すことで、実際の描画幅とずれない (幅は高さ・files 件数に依存しない
+/// ので、ダミーの高さ/0 件で構わない)。
+pub fn diff_pane_width(total_width: u16, layout: PaneLayout) -> u16 {
+    let (_, _, diff_area) = split_panes(Rect::new(0, 0, total_width, 1), layout, 0);
+    diff_area.width.saturating_sub(2) // 左右の枠線
 }
 
 fn pane_block(title: String, focused: bool) -> Block<'static> {
@@ -363,7 +387,7 @@ mod tests {
     /// 空白が落ちるため、実際の見た目の検証は TestBackend で行う。
     fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        app.sync_diff(diff_pane_width(width));
+        app.sync_diff(diff_pane_width(width, app.layout));
         terminal.draw(|frame| draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -379,6 +403,40 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn diff_below_layout_widens_the_diff_pane_past_stacked() {
+        let stacked = diff_pane_width(120, PaneLayout::Stacked);
+        let diff_below = diff_pane_width(120, PaneLayout::DiffBelow);
+        assert!(
+            diff_below > stacked,
+            "diff-below ({diff_below}) should widen the diff pane past stacked ({stacked})"
+        );
+        // stacked only gives the diff pane the right half of the terminal;
+        // diff-below gives it (nearly) the full width instead.
+        assert_eq!(stacked, 58);
+        assert_eq!(diff_below, 118);
+    }
+
+    #[test]
+    fn diff_below_layout_renders_the_diff_pane_spanning_the_full_width() {
+        let (_tmp, mut app) = repo_or_skip!();
+        app.handle_key(key(KeyCode::Char('L')));
+        assert_eq!(app.layout, PaneLayout::DiffBelow);
+        let lines = render(&mut app, 120, 24);
+        // diff pane's bottom border is the last content row before the
+        // status bar; in `DiffBelow` it must span (nearly) the full
+        // terminal width, not just the right half like `Stacked`.
+        let border = lines
+            .iter()
+            .rev()
+            .find(|l| l.starts_with('╰'))
+            .unwrap_or_else(|| panic!("diff pane bottom border missing:\n{}", lines.join("\n")));
+        assert!(
+            border.chars().count() >= 118,
+            "diff pane border is not full width: {border:?}"
+        );
     }
 
     #[test]
