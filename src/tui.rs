@@ -142,14 +142,17 @@ fn open_editor(
     let result = crate::editor::command(&req.editor, &req.path)
         .and_then(|mut cmd| cmd.status().context("failed to launch the editor"));
 
-    if let Err(err) = enable_raw_mode() {
-        // raw mode どころか alternate screen もまだ外にいる。event_loop
-        // はこのエラーをステータス表示に変換するだけでループを継続する
-        // ので、ここで諦めて `?` すると raw mode 無しのまま壊れた対話
-        // 状態が続く。best effort で alternate screen だけでも戻して
-        // おく。
-        let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
-        return Err(err).context("failed to re-enter raw mode after the editor");
+    if enable_raw_mode().is_err() {
+        // 一度失敗しても諦めずに best effort でもう一度だけ試す。
+        // event_loop はこのエラーをステータス表示に変換するだけで
+        // ループを継続するので、ここで raw mode を諦めたまま `?` する
+        // と以降ずっと raw mode 無しの壊れた対話状態が固定化する。
+        if let Err(err) = enable_raw_mode() {
+            // 再試行も駄目だった。raw mode は諦めるほかないので、
+            // alternate screen だけでも best effort で戻しておく。
+            let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+            return Err(err).context("failed to re-enter raw mode after the editor");
+        }
     }
     if let Err(err) = execute!(terminal.backend_mut(), EnterAlternateScreen) {
         // raw mode は戻っているので、入力自体は壊れない。
