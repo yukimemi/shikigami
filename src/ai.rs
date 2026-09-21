@@ -55,7 +55,7 @@ pub fn generate_message(cmd: &str, diff: &str) -> Result<String> {
     let _ = writer.join();
 
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = crate::decode::decode(&out.stderr);
         let msg = stderr.trim();
         if msg.is_empty() {
             bail!("{AI_CMD_ENV} failed with {}", out.status);
@@ -63,7 +63,7 @@ pub fn generate_message(cmd: &str, diff: &str) -> Result<String> {
         bail!("{msg}");
     }
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = crate::decode::decode(&out.stdout);
     // shikigami の入力欄は 1 行なので、複数行の出力は 1 行に畳む。
     let message = stdout
         .lines()
@@ -139,6 +139,23 @@ mod tests {
         let cmd = "echo boom 1>&2 & exit 1";
         let err = generate_message(cmd, "diff").unwrap_err();
         assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    // 実際に踏んだ事故 (`SHIKIGAMI_AI_CMD` の実行ファイルが呼び出し元の
+    // 環境の PATH に無い) の回帰テスト。cmd.exe 自身の「見つからない」
+    // 診断メッセージはシステムのロケールに応じてローカライズされ、
+    // UTF-8 ではなくシステムの OEM コードページ (例: 日本語 Windows なら
+    // CP932) で書かれる。`String::from_utf8_lossy` のみに頼ると
+    // U+FFFD だらけの文字化けになっていた (`crate::decode` 参照)。CI の
+    // ロケールに関わらず検証できるよう、期待する言語文言ではなく
+    // 「置換文字が出ないこと」を確認する。
+    #[cfg(windows)]
+    #[test]
+    fn command_not_found_error_is_readable_regardless_of_console_locale() {
+        let err = generate_message("nonexistent-tool-shikigami-repro", "diff").unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.is_empty(), "{msg}");
+        assert!(!msg.contains('\u{FFFD}'), "{msg}");
     }
 
     #[test]
