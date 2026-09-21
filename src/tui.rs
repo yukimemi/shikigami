@@ -16,7 +16,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::App;
+use crate::app::{App, EditorRequest, Status};
 use crate::ui;
 
 /// 入力待ちの上限。
@@ -91,7 +91,18 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         let poll_timeout = if app.is_loading() { STARTUP_POLL } else { POLL };
         if !app.should_quit && event::poll(poll_timeout)? {
             match event::read()? {
-                Event::Key(key) => app.handle_key(key),
+                Event::Key(key) => {
+                    app.handle_key(key);
+                    if let Some(req) = app.take_pending_editor() {
+                        app.status = match open_editor(terminal, &req) {
+                            Ok(status) if status.success() => {
+                                Status::info(format!("closed editor for {}", req.path.display()))
+                            }
+                            Ok(status) => Status::error(format!("editor exited with {status}")),
+                            Err(err) => Status::error(format!("{err:#}")),
+                        };
+                    }
+                }
                 // Resize は draw が次のループで拾うので、ここでは
                 // ループを回すだけでよい。
                 Event::Resize(..) => {}
@@ -100,4 +111,59 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         }
     }
     Ok(())
+}
+
+/// [`App::take_pending_editor`] が返した要求を実際に起動する。
+///
+/// vim/nvim/emacs -nw のようなエディタは raw mode やカーソル位置を直接
+/// 操作するので、shikigami が alternate screen に居座ったまま子プロセス
+/// を起動すると画面が壊れる。`TerminalGuard` と同じ手順で一旦端末を
+/// 明け渡し、戻り値に関わらず (子プロセスの起動自体が失敗した場合も)
+/// 必ず復元してから結果を返す。
+fn open_editor(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    req: &EditorRequest,
+) -> Result<std::process::ExitStatus> {
+    disable_raw_mode().context("failed to leave raw mode for the editor")?;
+    if let Err(err) = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    ) {
+        // raw mode は既に抜けてしまっている。ここで抜けたまま返すと
+        // 呼び出し元 (event_loop) はエラーをステータス表示に変換する
+        // だけでループを継続するので、以降ずっと raw mode 無しの壊れた
+        // 対話状態になる。TerminalGuard と同じベストエフォートで
+        // 復元してからエラーを返す。
+        let _ = enable_raw_mode();
+        return Err(err).context("failed to leave the alternate screen for the editor");
+    }
+
+    let result = crate::editor::command(&req.editor, &req.path)
+        .and_then(|mut cmd| cmd.status().context("failed to launch the editor"));
+
+    if enable_raw_mode().is_err() {
+        // 一度失敗しても諦めずに best effort でもう一度だけ試す。
+        // event_loop はこのエラーをステータス表示に変換するだけで
+        // ループを継続するので、ここで raw mode を諦めたまま `?` する
+        // と以降ずっと raw mode 無しの壊れた対話状態が固定化する。
+        if let Err(err) = enable_raw_mode() {
+            // 再試行も駄目だった。raw mode は諦めるほかないので、
+            // alternate screen だけでも best effort で戻しておく。
+            let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+            return Err(err).context("failed to re-enter raw mode after the editor");
+        }
+    }
+    if let Err(err) = execute!(terminal.backend_mut(), EnterAlternateScreen) {
+        // raw mode は戻っているので、入力自体は壊れない。
+        return Err(err).context("failed to re-enter the alternate screen after the editor");
+    }
+    terminal.hide_cursor()?;
+    // エディタが端末に何を残したか分からないので、次フレームで必ず
+    // 全面再描画させる。
+    terminal
+        .clear()
+        .context("failed to redraw after the editor")?;
+
+    result
 }

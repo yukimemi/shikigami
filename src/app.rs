@@ -4,6 +4,7 @@
 //! 状態遷移 → jj 呼び出しまでをここで完結させる。おかげで、端末を開かずに
 //! 「このキーで本当にこの jj コマンドが飛ぶか」をテストできる。
 
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
@@ -159,19 +160,30 @@ pub struct Status {
 }
 
 impl Status {
-    fn info(text: impl Into<String>) -> Self {
+    pub(crate) fn info(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             kind: StatusKind::Info,
         }
     }
 
-    fn error(text: impl Into<String>) -> Self {
+    pub(crate) fn error(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             kind: StatusKind::Error,
         }
     }
+}
+
+/// files pane の選択ファイルを `$EDITOR`/`$VISUAL` で開くリクエスト。
+/// 実際に子プロセスを起動して端末を明け渡すのは `tui::event_loop`
+/// 側 (alternate screen / raw mode を握っているのはそちら) — ここでは
+/// 「開きたい」という意思とパスだけを持たせて手渡す
+/// ([`App::open_selected_file_in_editor`] / [`App::take_pending_editor`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorRequest {
+    pub editor: String,
+    pub path: PathBuf,
 }
 
 pub struct App {
@@ -232,6 +244,13 @@ pub struct App {
     /// `None` なら diff pane は jj の生出力をそのまま使う
     /// (`crate::diff_filter` 参照)。
     pub diff_filter_cmd: Option<String>,
+    /// `EDITOR`/`VISUAL` の値。起動時に一度だけ読む (`App::new`) — `ai_cmd`
+    /// と同じ方針。`None` なら `o` (files pane) は使えない。
+    pub editor_cmd: Option<String>,
+    /// `o` (files pane) が立てた、まだ処理していないエディタ起動要求。
+    /// `tui::event_loop` が `handle_key` の直後に [`Self::take_pending_editor`]
+    /// で取り出して消費する。
+    pending_editor: Option<EditorRequest>,
     /// 直前の `handle_key` が `status` を実際に書き換えたか。
     /// `sync_diff` はこのフラグが立っている次の 1 回だけ、diff-filter
     /// 失敗による status 上書きを控える — 描画順が `handle_key` の次に
@@ -277,6 +296,8 @@ impl App {
             diff_filter_cmd: std::env::var(crate::diff_filter::DIFF_FILTER_ENV)
                 .ok()
                 .filter(|cmd| !cmd.trim().is_empty()),
+            editor_cmd: crate::editor::resolve(),
+            pending_editor: None,
             status_fresh: false,
             should_quit: false,
         };
@@ -911,6 +932,7 @@ impl App {
             KeyCode::Char('x') => self.confirm_rebase(),
             KeyCode::Char('r') if self.focus == Focus::Files => self.confirm_restore_file(),
             KeyCode::Char('p') if self.focus == Focus::Files => self.absorb_file(),
+            KeyCode::Char('o') if self.focus == Focus::Files => self.open_selected_file_in_editor(),
             KeyCode::Char('u') => {
                 self.mode = Mode::Confirm(Confirm {
                     prompt: "undo the last jj operation?".into(),
@@ -1129,6 +1151,38 @@ impl App {
         }
         let result = self.jj.absorb_file(&change.id, &file.target_path());
         self.report("absorb", result);
+    }
+
+    /// files pane で選択中のファイルを `EDITOR`/`VISUAL` で開くリクエストを
+    /// 立てる。実際の子プロセス起動と端末の明け渡しは
+    /// `tui::event_loop` が [`Self::take_pending_editor`] で拾って行う —
+    /// ここは Terminal を持っていないので、それ自体は起動しない。
+    ///
+    /// リネーム/コピーは新パス側 (`target_path`) を開く。削除された
+    /// ファイル (`status == 'D'`) はディスクに存在しないので、多くの
+    /// エディタは新規ファイルとして開く — それ自体は誤りではないので
+    /// 特別扱いしない。
+    fn open_selected_file_in_editor(&mut self) {
+        let Some(file) = self.selected_file().cloned() else {
+            return;
+        };
+        let Some(editor) = self.editor_cmd.clone() else {
+            self.status = Status::error(format!(
+                "{}/{} is not set",
+                crate::editor::EDITOR_ENV,
+                crate::editor::VISUAL_ENV
+            ));
+            return;
+        };
+        let path = self.jj.root().join(file.target_path());
+        self.pending_editor = Some(EditorRequest { editor, path });
+    }
+
+    /// [`Self::open_selected_file_in_editor`] が立てたリクエストを取り出す。
+    /// `tui::event_loop` が `handle_key` の直後に呼ぶ — `Some` が返ったら
+    /// 子プロセスに端末を明け渡す。
+    pub fn take_pending_editor(&mut self) -> Option<EditorRequest> {
+        self.pending_editor.take()
     }
 }
 
@@ -1353,7 +1407,46 @@ mod tests {
         assert!(matches!(app.mode, Mode::Normal), "{:?}", app.mode);
         app.handle_key(key(KeyCode::Char('p')));
         assert!(matches!(app.mode, Mode::Normal), "{:?}", app.mode);
+        app.editor_cmd = Some("does-not-matter".to_string());
+        app.handle_key(key(KeyCode::Char('o')));
+        assert!(app.take_pending_editor().is_none());
         assert_eq!(app.status, status_before);
+    }
+
+    #[test]
+    fn open_in_editor_sets_a_pending_request_for_the_selected_file() {
+        let (_tmp, mut app) = repo_or_skip!();
+        while app.selected_change().unwrap().description != "second change" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.sync_diff(80);
+        assert_eq!(app.files[0].path, "b.txt");
+        app.editor_cmd = Some("code --wait".to_string());
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('o')));
+
+        let req = app.take_pending_editor().expect("pending editor request");
+        assert_eq!(req.editor, "code --wait");
+        assert_eq!(req.path, app.jj.root().join("b.txt"));
+        // 消費したら空になる: 次フレームで二重に子プロセスを起動しない。
+        assert!(app.take_pending_editor().is_none());
+    }
+
+    #[test]
+    fn open_in_editor_errors_when_editor_and_visual_are_unset() {
+        let (_tmp, mut app) = repo_or_skip!();
+        while app.selected_change().unwrap().description != "second change" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.sync_diff(80);
+        app.editor_cmd = None;
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('o')));
+
+        assert!(app.take_pending_editor().is_none());
+        assert_eq!(app.status.kind, StatusKind::Error, "{:?}", app.status);
     }
 
     #[test]
