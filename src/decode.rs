@@ -86,15 +86,33 @@ mod tests {
 
     // cmd.exe の日本語ローカライズ診断メッセージを模した CP932 バイト列。
     // 「'foo' は、内部コマンドまたは外部コマンドとして認識されていません。」
-    // の一部を CP932 でエンコードしたもの (`chcp` 依存の統合テストは環境
-    // のロケール設定に左右されるため避け、既知バイト列で decode() 単体を
-    // 検証する)。
+    // の一部を CP932 でエンコードしたもの。ただし `decode_oem` が使う
+    // `CP_OEMCP` はテストを実行するマシンの既定 OEM コードページであり、
+    // CI ランナーが ja-JP (CP932) とは限らない。そのため特定の文字への
+    // デコード結果を固定で期待せず、「UTF-8 lossy にフォールバックした
+    // ときの置換文字だらけの結果とは異なる」ことだけを確認する
+    // (ai.rs/diff_filter.rs の回帰テストと同じ考え方)。
     #[cfg(windows)]
     #[test]
     fn invalid_utf8_falls_back_to_oem_codepage_on_windows() {
+        use windows_sys::Win32::Globalization::GetOEMCP;
+        // マシンの既定 OEM コードページ自体が UTF-8 (65001) に設定されて
+        // いる稀な構成 (Windows の「ベータ: ワールドワイド言語サポートに
+        // Unicode UTF-8 を使用する」設定) では、この 2 バイトはその
+        // コードページでも無効なので `decode_oem` は失敗し、`decode()`
+        // は意図通り lossy フォールバックに落ちる — その場合は本テスト
+        // が検証したい「非 UTF-8 な OEM CP でのデコード成功」という前提
+        // 自体が成り立たないのでスキップする。
+        // SAFETY: `GetOEMCP` は引数を取らず、失敗しても 0 を返すだけで
+        // メモリ安全性に関わる副作用はない。
+        if unsafe { GetOEMCP() } == 65001 {
+            return;
+        }
         // 「は」(CP932: 82 CD) だけを含む、UTF-8 としては不正なバイト列。
         let cp932_ha = [0x82, 0xCD];
-        assert_eq!(decode(&cp932_ha), "は");
+        let decoded = decode(&cp932_ha);
+        assert_ne!(decoded, String::from_utf8_lossy(&cp932_ha));
+        assert!(!decoded.contains('\u{FFFD}'), "{decoded}");
     }
 
     #[test]
