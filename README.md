@@ -84,7 +84,8 @@ alone.
 | `Enter`           | `jj edit` — make the selected change the working copy         |
 | `n`               | `jj new` — child of the selected change (description prompt)  |
 | `e`               | `jj describe` — edit the description                          |
-| Ctrl-g            | (in the `n`/`e` prompt) fill the message from the diff via AI |
+| `c`               | `jj commit` — describe + new in one step (working copy only)  |
+| Ctrl-g            | (in the `n`/`e`/`c` prompt) fill the message from the diff via AI |
 | `r`               | `jj restore` — discard the selected file's change (files pane)|
 | `p`               | `jj absorb` — move the selected file's change into ancestor commits (files pane) |
 | `o`               | open the selected file in `$EDITOR` (or `$VISUAL`) (files pane) |
@@ -107,7 +108,7 @@ the status bar always shows the working copy, the marked target, and the current
 
 ## AI-generated messages
 
-Inside the `n` (`jj new`) and `e` (`jj describe`) description prompt, `Ctrl-g` fills the input
+Inside the `n` (`jj new`), `e` (`jj describe`), and `c` (`jj commit`) description prompt, `Ctrl-g` fills the input
 with a message generated from the selected change's diff. shikigami does not talk to any AI
 vendor itself: set `SHIKIGAMI_AI_CMD` to a shell command that reads a diff on stdin and prints a
 message on stdout, e.g.

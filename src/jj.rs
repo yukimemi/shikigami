@@ -353,6 +353,16 @@ impl Jj {
         self.write(&["describe", "-r", rev, "-m", message])
     }
 
+    /// working copy (`@`) を describe して新しい空 change に進む、
+    /// `describe` + `new_child` の 1 操作版 (`jj commit`)。
+    ///
+    /// `-r` は渡さない: `jj commit` は working copy 専用の操作で、他の
+    /// change を指す使い方は無い。呼び出し側 (`App::prompt_commit`) が
+    /// 選択中 change が `@` であることを事前に確かめる。
+    pub fn commit(&self, message: &str) -> Result<String> {
+        self.write(&["commit", "-m", message])
+    }
+
     /// `from` の変更を `into` に押し込む。
     ///
     /// `--use-destination-message` を常に付ける: 付けないと「両方に
