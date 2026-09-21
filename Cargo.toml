@@ -64,7 +64,7 @@ dirs = "7.0.0"
 # `src/decode.rs` がその場合だけ `MultiByteToWideChar` で読み直す
 # (詳細は同ファイルのコメント参照)。
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Globalization"] }
 
 [dev-dependencies]
 tempfile = "3.27"
