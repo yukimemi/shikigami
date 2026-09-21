@@ -40,6 +40,34 @@ pub enum Focus {
     Diff,
 }
 
+/// pane の配置。`L` でトグルする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneLayout {
+    /// 現状のデフォルト: `log | (files - diff)`。log が全高、右カラムを
+    /// files (上, 内容量に応じて伸縮) / diff (下) で縦に分ける。
+    Stacked,
+    /// `(log | files) - diff`。上段を log/files で横に分け、diff は
+    /// 下段で全幅を使う — delta の side-by-side など、幅が要る diff
+    /// フィルタ向け。
+    DiffBelow,
+}
+
+impl PaneLayout {
+    pub fn label(self) -> &'static str {
+        match self {
+            PaneLayout::Stacked => "stacked",
+            PaneLayout::DiffBelow => "diff-below",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            PaneLayout::Stacked => PaneLayout::DiffBelow,
+            PaneLayout::DiffBelow => PaneLayout::Stacked,
+        }
+    }
+}
+
 /// 入力待ちの用途。確定したときに何をするかを持つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
@@ -158,6 +186,8 @@ pub struct App {
     /// squash / rebase の相手。`m` で置く。
     pub marked: Option<Change>,
     pub rebase_mode: RebaseMode,
+    /// pane 配置。`L` でトグル (`ui::draw` 参照)。
+    pub layout: PaneLayout,
     /// diff pane の中身 (ANSI を解決済みの ratatui Text)。
     pub diff: Text<'static>,
     /// 選択中 change で変更されたファイル一覧 (lazygit の files pane 相当)。
@@ -228,6 +258,7 @@ impl App {
             status: Status::info("loading…"),
             marked: None,
             rebase_mode: RebaseMode::Revision,
+            layout: PaneLayout::Stacked,
             diff: Text::default(),
             files: Vec::new(),
             file_selected: 0,
@@ -867,6 +898,10 @@ impl App {
                 self.rebase_mode = self.rebase_mode.next();
                 self.status = Status::info(format!("rebase mode: {}", self.rebase_mode.label()));
             }
+            KeyCode::Char('L') => {
+                self.layout = self.layout.next();
+                self.status = Status::info(format!("layout: {}", self.layout.label()));
+            }
             KeyCode::Enter => self.edit_selected(),
             KeyCode::Char('n') => self.prompt_new(),
             KeyCode::Char('e') => self.prompt_describe(),
@@ -1319,6 +1354,18 @@ mod tests {
         app.handle_key(key(KeyCode::Char('p')));
         assert!(matches!(app.mode, Mode::Normal), "{:?}", app.mode);
         assert_eq!(app.status, status_before);
+    }
+
+    #[test]
+    fn pane_layout_toggle_cycles_and_updates_status() {
+        let (_tmp, mut app) = repo_or_skip!();
+        assert_eq!(app.layout, PaneLayout::Stacked);
+        app.handle_key(key(KeyCode::Char('L')));
+        assert_eq!(app.layout, PaneLayout::DiffBelow);
+        assert!(app.status.text.contains("diff-below"), "{:?}", app.status);
+        app.handle_key(key(KeyCode::Char('L')));
+        assert_eq!(app.layout, PaneLayout::Stacked);
+        assert!(app.status.text.contains("stacked"), "{:?}", app.status);
     }
 
     #[test]

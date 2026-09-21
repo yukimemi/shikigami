@@ -92,6 +92,7 @@ alone.
 | `s`               | `jj squash` — selected change into the marked one             |
 | `x`               | `jj rebase` — selected onto the marked change, or onto a revset you type |
 | `R`               | cycle rebase mode: `-r` / `-s` / `-b`                         |
+| `L`               | cycle pane layout: `stacked` (log \| files-over-diff) / `diff-below` (log+files on top, full-width diff below) |
 | `a`               | `jj abandon`                                                  |
 | `u` / `U`         | `jj undo` / `jj redo`                                         |
 | `/`               | set the log revset                                            |
@@ -146,9 +147,11 @@ setup carry straight through:
 
   The diff pane's actual rendered width is passed to the command as `COLUMNS`, so a wrapper that
   reads it (as above) gets side-by-side output that fits the pane instead of wrapping at a fixed
-  80 columns. If the command fails (missing binary, bad flags, non-zero exit), the diff pane falls
-  back to jj's raw output and the error shows in the status bar — a broken filter never blanks the
-  diff.
+  80 columns. Since the default layout only gives the diff pane half the terminal width, press `L`
+  to switch to the `diff-below` layout (log/files on top, full-width diff below) for more room —
+  see "Keys" above. If the command fails (missing binary, bad flags, non-zero exit), the diff pane
+  falls back to jj's raw output and the error shows in the status bar — a broken filter never
+  blanks the diff.
 
 ## Design notes
 

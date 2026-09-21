@@ -80,7 +80,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         // フレームの終端に近い幅として 80 桁にフォールバックする。
         let diff_width = terminal
             .size()
-            .map(|size| ui::diff_pane_width(size.width))
+            .map(|size| ui::diff_pane_width(size.width, app.layout))
             .unwrap_or(80);
         app.sync_diff(diff_width);
         terminal.draw(|frame| ui::draw(frame, app))?;
