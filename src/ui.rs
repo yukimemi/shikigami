@@ -22,7 +22,11 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Enter", "jj edit — make the change the working copy"),
     ("n", "jj new — child of the selected change"),
     ("e", "jj describe — edit the description"),
-    ("Ctrl-g (in n/e prompt)", "AI: fill message from the diff"),
+    (
+        "c",
+        "jj commit — describe + new in one step (working copy only)",
+    ),
+    ("Ctrl-g (in n/e/c prompt)", "AI: fill message from the diff"),
     (
         "r (files pane)",
         "jj restore — discard the selected file's change",

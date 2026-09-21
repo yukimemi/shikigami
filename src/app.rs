@@ -76,6 +76,10 @@ pub enum InputAction {
     Describe { rev: String },
     /// `jj new <rev> -m <input>` (input 空なら `-m` なし)
     NewChild { rev: String },
+    /// `jj commit -m <input>` — working copy (`@`) の describe + new を
+    /// 1 操作で済ませる。`rev` は working copy の change id (AI 補完の元
+    /// diff を選ぶのに使うだけで、コマンドには渡さない)。
+    Commit { rev: String },
     /// `jj bookmark set <input> -r <rev>`
     Bookmark { rev: String },
     /// `jj rebase <mode> <rev> --onto <input>`
@@ -90,7 +94,9 @@ impl InputAction {
     /// 使う)。
     pub fn ai_rev(&self) -> Option<&str> {
         match self {
-            InputAction::Describe { rev } | InputAction::NewChild { rev } => Some(rev.as_str()),
+            InputAction::Describe { rev }
+            | InputAction::NewChild { rev }
+            | InputAction::Commit { rev } => Some(rev.as_str()),
             InputAction::Bookmark { .. } | InputAction::RebaseOnto { .. } | InputAction::Revset => {
                 None
             }
@@ -701,6 +707,10 @@ impl App {
                 let result = self.jj.new_child(&rev, message);
                 self.report("new", result);
             }
+            InputAction::Commit { .. } => {
+                let result = self.jj.commit(&input.value);
+                self.report("commit", result);
+            }
             InputAction::Bookmark { rev } => {
                 if input.value.trim().is_empty() {
                     self.status = Status::error("bookmark: empty name");
@@ -926,6 +936,7 @@ impl App {
             KeyCode::Enter => self.edit_selected(),
             KeyCode::Char('n') => self.prompt_new(),
             KeyCode::Char('e') => self.prompt_describe(),
+            KeyCode::Char('c') => self.prompt_commit(),
             KeyCode::Char('s') => self.confirm_squash(),
             KeyCode::Char('b') => self.prompt_bookmark(),
             KeyCode::Char('a') => self.confirm_abandon(),
@@ -1007,6 +1018,27 @@ impl App {
             // を直接使う方が早い。
             value: change.description.clone(),
             action: InputAction::Describe {
+                rev: change.id.clone(),
+            },
+        });
+    }
+
+    /// `jj commit` — 選択中の working copy (`@`) を describe して新しい
+    /// 空 change に進む、`e` (describe) + `n` (new) の 1 操作版。
+    /// `@` 以外を対象にすると `jj commit` の意味と食い違うので、その場合は
+    /// プロンプトを出さずにエラーを出す (jj 側の `-r` 指定を待たない)。
+    fn prompt_commit(&mut self) {
+        let Some(change) = self.selected_change() else {
+            return;
+        };
+        if !change.is_working_copy {
+            self.status = Status::error("commit: only the working copy (@) can be committed");
+            return;
+        }
+        self.mode = Mode::Input(Input {
+            prompt: format!("commit {} (describe + new)", change.short_id),
+            value: change.description.clone(),
+            action: InputAction::Commit {
                 rev: change.id.clone(),
             },
         });
@@ -1279,6 +1311,93 @@ mod tests {
             app.selected_change().unwrap().description,
             "second change-renamed"
         );
+    }
+
+    #[test]
+    fn commit_describes_the_working_copy_and_advances() {
+        let (_tmp, mut app) = repo_or_skip!();
+        let before = app.rows.len();
+        let old_id = app.selected_change().unwrap().id.clone();
+        assert!(app.selected_change().unwrap().is_working_copy);
+
+        app.handle_key(key(KeyCode::Char('c')));
+        let Mode::Input(input) = &app.mode else {
+            panic!("expected input mode, got {:?}", app.mode);
+        };
+        // 既存 description (working copy) が初期値。
+        assert_eq!(input.value, "third change");
+        for c in "-final".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+        assert!(app.rows.len() > before);
+        assert!(
+            descriptions(&app).contains(&"third change-final".to_string()),
+            "{:?}",
+            descriptions(&app)
+        );
+        // 元の change は describe され、working copy ではなくなっている。
+        let old = app
+            .rows
+            .iter()
+            .find_map(|row| match row {
+                Row::Change { change, .. } if change.id == old_id => Some(change),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(old.description, "third change-final");
+        assert!(!old.is_working_copy);
+        // 新しい working copy が空 change として立っている。
+        let wc = app
+            .rows
+            .iter()
+            .find_map(|row| match row {
+                Row::Change { change, .. } if change.is_working_copy => Some(change),
+                _ => None,
+            })
+            .unwrap();
+        assert!(wc.is_empty);
+        assert_eq!(wc.description, "");
+        assert_ne!(wc.id, old_id);
+    }
+
+    #[test]
+    fn commit_with_empty_message_is_allowed() {
+        let (_tmp, mut app) = repo_or_skip!();
+        app.handle_key(key(KeyCode::Char('c')));
+        // working copy の既存 description を消して空メッセージにする。
+        app.handle_key(ctrl('u'));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+        assert!(descriptions(&app).contains(&"(no description set)".to_string()));
+        let wc = app
+            .rows
+            .iter()
+            .find_map(|row| match row {
+                Row::Change { change, .. } if change.is_working_copy => Some(change),
+                _ => None,
+            })
+            .unwrap();
+        assert!(wc.is_empty);
+        assert_eq!(wc.description, "");
+    }
+
+    #[test]
+    fn commit_refuses_a_change_that_is_not_the_working_copy() {
+        let (_tmp, mut app) = repo_or_skip!();
+        // 2 番目 (second change, working copy ではない) に合わせる。
+        while app.selected_change().unwrap().description != "second change" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        assert!(!app.selected_change().unwrap().is_working_copy);
+
+        app.handle_key(key(KeyCode::Char('c')));
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.status.kind, StatusKind::Error, "{:?}", app.status);
     }
 
     #[test]
