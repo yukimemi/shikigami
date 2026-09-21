@@ -125,12 +125,19 @@ fn open_editor(
     req: &EditorRequest,
 ) -> Result<std::process::ExitStatus> {
     disable_raw_mode().context("failed to leave raw mode for the editor")?;
-    execute!(
+    if let Err(err) = execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         crossterm::cursor::Show
-    )
-    .context("failed to leave the alternate screen for the editor")?;
+    ) {
+        // raw mode は既に抜けてしまっている。ここで抜けたまま返すと
+        // 呼び出し元 (event_loop) はエラーをステータス表示に変換する
+        // だけでループを継続するので、以降ずっと raw mode 無しの壊れた
+        // 対話状態になる。TerminalGuard と同じベストエフォートで
+        // 復元してからエラーを返す。
+        let _ = enable_raw_mode();
+        return Err(err).context("failed to leave the alternate screen for the editor");
+    }
 
     let result = crate::editor::command(&req.editor, &req.path)
         .and_then(|mut cmd| cmd.status().context("failed to launch the editor"));
