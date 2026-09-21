@@ -56,7 +56,7 @@ pub fn apply(cmd: &str, diff: &str, width: u16) -> Result<String> {
     let _ = writer.join();
 
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = crate::decode::decode(&out.stderr);
         let msg = stderr.trim();
         if msg.is_empty() {
             bail!("{DIFF_FILTER_ENV} failed with {}", out.status);
@@ -64,7 +64,7 @@ pub fn apply(cmd: &str, diff: &str, width: u16) -> Result<String> {
         bail!("{msg}");
     }
 
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(crate::decode::decode(&out.stdout))
 }
 
 #[cfg(unix)]
@@ -150,5 +150,19 @@ mod tests {
         let cmd = r#"findstr /C:"needle with spaces""#;
         let out = apply(cmd, "before\nneedle with spaces\nafter\n", 80).unwrap();
         assert!(out.contains("needle with spaces"), "{out}");
+    }
+
+    // `ai.rs::command_not_found_error_is_readable_regardless_of_console_locale`
+    // と同じ回帰: `SHIKIGAMI_DIFF_FILTER` の実行ファイルが PATH に無いと
+    // cmd.exe 自身の (ロケール依存で UTF-8 ではない) 診断メッセージが
+    // 出る。CI のロケールに関わらず検証できるよう、文言ではなく置換文字
+    // が出ないことを確認する。
+    #[cfg(windows)]
+    #[test]
+    fn command_not_found_error_is_readable_regardless_of_console_locale() {
+        let err = apply("nonexistent-tool-shikigami-repro", "diff", 80).unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.is_empty(), "{msg}");
+        assert!(!msg.contains('\u{FFFD}'), "{msg}");
     }
 }
