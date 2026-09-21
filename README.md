@@ -87,6 +87,7 @@ alone.
 | Ctrl-g            | (in the `n`/`e` prompt) fill the message from the diff via AI |
 | `r`               | `jj restore` — discard the selected file's change (files pane)|
 | `p`               | `jj absorb` — move the selected file's change into ancestor commits (files pane) |
+| `o`               | open the selected file in `$EDITOR` (or `$VISUAL`) (files pane) |
 | `b`               | `jj bookmark set`                                             |
 | `m`               | mark the selected change as the squash / rebase target (`◆`)  |
 | `s`               | `jj squash` — selected change into the marked one             |
@@ -153,6 +154,19 @@ setup carry straight through:
   falls back to jj's raw output and the error shows in the status bar — a broken filter never
   blanks the diff.
 
+## Opening files in your editor
+
+Press `o` in the files pane to open the currently selected file in `$EDITOR` (falling back to
+`$VISUAL` if `$EDITOR` is unset). shikigami leaves the alternate screen for the duration — so
+full-screen editors (`vim`, `nvim`, `emacs -nw`) work normally — and redraws once the editor exits.
+Renamed/copied files open their new path; if neither `$EDITOR` nor `$VISUAL` is set, `o` reports
+that in the status bar instead of doing nothing.
+
+`$EDITOR`/`$VISUAL` is split on whitespace (no shell, no quoting) before the file path is appended,
+e.g. `EDITOR='code --wait'` becomes `code --wait <path>`. This is the one place shikigami hands the
+terminal to another interactive program on purpose — contrast with "No editor surprises" below,
+which is about jj's own *implicit* editor invocation (`ui.editor`), always blocked.
+
 ## Design notes
 
 - **jj CLI, not `jj-lib`.** `jj-lib` has no semver guarantee; the CLI's template language and flags
@@ -161,7 +175,9 @@ setup carry straight through:
   before it is jj's own graph drawing (`│ ○`, `├─╮`). shikigami never re-derives topology.
 - **No editor surprises.** Mutating commands always pass `-m` / `--use-destination-message`, and are
   additionally run with `ui.editor` pointed at a non-existent program: if jj ever wants an editor it
-  fails visibly in the status bar instead of hijacking the alternate screen.
+  fails visibly in the status bar instead of hijacking the alternate screen. This only blocks jj's
+  own *implicit* invocation — `o` in the files pane still opens `$EDITOR` on purpose (see
+  "Opening files in your editor" above).
 - **Diff colors are jj's (optionally filtered).** `jj diff --color always` output is converted to
   styled terminal text as-is, and the format is whatever `ui.diff-formatter` resolves to — no
   `--git` is forced. `SHIKIGAMI_DIFF_FILTER` (see "Nicer diffs" above) can post-process that ANSI

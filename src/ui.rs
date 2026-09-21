@@ -31,6 +31,10 @@ pub const KEYS: &[(&str, &str)] = &[
         "p (files pane)",
         "jj absorb — move the selected file's change into ancestor commits",
     ),
+    (
+        "o (files pane)",
+        "open the selected file in $EDITOR (or $VISUAL)",
+    ),
     ("b", "jj bookmark set"),
     ("m", "mark the selected change as squash/rebase target"),
     ("s", "jj squash — selected into the marked change"),
