@@ -120,6 +120,9 @@ export SHIKIGAMI_AI_CMD='opencode run -m sonnet "write a one-line commit message
 Any CLI that can read a diff on stdin works (`aichat`, `sgpt`, `mods`, your own script, …). The
 output is folded to a single line; the prompt only ever holds one. Without `SHIKIGAMI_AI_CMD` set,
 `Ctrl-g` reports the missing configuration in the status bar instead of doing nothing silently.
+While the command runs, the prompt shows a spinner and the elapsed seconds, and other keys are
+ignored; `Esc` cancels the generation and leaves the prompt open with its previous value. The
+command itself is not killed — it runs to completion in the background and its output is discarded.
 
 **If your `SHIKIGAMI_AI_CMD` is an agentic coding CLI (Claude Code, opencode, Codex, …)
 rather than a plain completion tool, disable its tool/file-edit access.** The diff is untrusted
