@@ -1,20 +1,20 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-09-18T15:11:08.2516743Z"
+applied_at = "2026-09-23T22:58:00.897317634Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "e5ad02c4f60ce83f12ffeb7537c5665367a50aa2"
+rev = "b97e6bd59845f1151a1e34fdc508dafa751af7c8"
 version = "0.18.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "fd6f663deac5e832793f412e0845935397760252"
+rev = "324a00b775447fe8217bcb4717b5cc24cfc23c8f"
 version = "0.8.1"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust-cli"
-rev = "29eb636eec8882f416878f3bc30134048eacdfe5"
-version = "0.4.1"
+rev = "417d0d7c550cca1adeff701fa18325e86596fd7d"
+version = "0.5.0"
 
 [files.".agents/skills/renri/SKILL.md"]
 once_applied = true
@@ -45,7 +45,7 @@ content_hash = "4aae1c2f39d146003164245b2da6e1d75a8668dc227f1851db6082481ebe515a
 content_hash = "7000353151b01b5d14cb8f56e314b1a25b020e22bdf5842dcaf5686efb59facb"
 
 [files.".github/workflows/release.yml"]
-content_hash = "ef4db54ac86c63962de0e95bcdca4fe7d6ca8f6b28c358a65c98686aa984b5f0"
+content_hash = "9589a591b96282bb9b9aa7b8fd94a3cb2c327e23bafca27dcb175660af49ee90"
 
 [files.".gitignore"]
 content_hash = "4bebd1c3417c33f9d1c51f011694f6d82b098bbb1a5a102ba56e97ab01a866ef"
@@ -64,7 +64,7 @@ content_hash = "3670f70a2f0be4013926bab6e878b90a42ad64c17899080aef4d193b246fa390
 once_applied = true
 
 [files."Makefile.toml"]
-content_hash = "1878da79392360cca5f1af54f9bfb2017b50e678d8b278cf4c5d86c71a2b8897"
+content_hash = "73bb6f6eb0f7e9121db5d29d41c6be1d2255600568a961d23529ff69f5bf9c73"
 
 [files."OPENCODE.md"]
 content_hash = "11993dc7feec5fca8e83934f135de33879b88f100c48aeba0729de2f57a11a48"
