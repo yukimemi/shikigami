@@ -74,6 +74,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             &input.prompt,
             &input.value,
             input.action.ai_rev().is_some(),
+            app.ai_elapsed(),
         ),
         Mode::Confirm(confirm) => draw_confirm(frame, &confirm.prompt),
         Mode::Normal => {}
@@ -338,21 +339,57 @@ fn draw_help(frame: &mut Frame) {
     );
 }
 
-fn draw_input(frame: &mut Frame, prompt: &str, value: &str, ai_available: bool) {
+/// AI 生成中に入力欄で回すスピナーのコマ。
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// スピナー 1 コマの長さ。描画ループはこの間隔以下で回す (`tui::ANIM_POLL`)。
+pub const SPINNER_FRAME_MS: u128 = 80;
+
+/// `ai_elapsed` が `Some` の間 (Ctrl-g の生成中) は、値の代わりに
+/// スピナーと経過秒数を出す — 押せたのか分からないまま待たせない。
+fn draw_input(
+    frame: &mut Frame,
+    prompt: &str,
+    value: &str,
+    ai_available: bool,
+    ai_elapsed: Option<std::time::Duration>,
+) {
     let area = centered(frame, 72, 3);
     frame.render_widget(Clear, area);
-    let hint = if ai_available { " / Ctrl-g: ai" } else { "" };
+    let (content, hint) = match ai_elapsed {
+        Some(elapsed) => {
+            let spinner =
+                SPINNER[(elapsed.as_millis() / SPINNER_FRAME_MS) as usize % SPINNER.len()];
+            (
+                Line::from(Span::styled(
+                    format!(
+                        "{spinner} generating commit message with AI… {}s",
+                        elapsed.as_secs()
+                    ),
+                    Style::default().fg(Color::Yellow),
+                )),
+                " / Esc: cancel ai",
+            )
+        }
+        None => (
+            Line::from(vec![
+                Span::raw(value.to_string()),
+                // 端末の cursor は raw mode 中は隠しているので、入力位置は
+                // ブロックカーソルを自分で描いて示す。
+                Span::styled("█", Style::default().fg(Color::Cyan)),
+            ]),
+            if ai_available { " / Ctrl-g: ai" } else { "" },
+        ),
+    };
+    let keys = if ai_elapsed.is_some() {
+        "please wait"
+    } else {
+        "Enter: ok / Esc: cancel"
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw(value.to_string()),
-            // 端末の cursor は raw mode 中は隠しているので、入力位置は
-            // ブロックカーソルを自分で描いて示す。
-            Span::styled("█", Style::default().fg(Color::Cyan)),
-        ]))
-        .block(
+        Paragraph::new(content).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .title(format!(" {prompt}  (Enter: ok / Esc: cancel{hint}) "))
+                .title(format!(" {prompt}  ({keys}{hint}) "))
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
         area,
@@ -557,5 +594,33 @@ mod tests {
         app.handle_key(key(KeyCode::Char('b')));
         let joined = render(&mut app, 120, 20).join("\n");
         assert!(!joined.contains("Ctrl-g"), "{joined}");
+    }
+
+    #[test]
+    fn input_overlay_shows_a_spinner_while_ai_is_generating() {
+        let (_tmp, mut app) = repo_or_skip!();
+        app.ai_cmd = Some(if cfg!(windows) {
+            "ping -n 4 127.0.0.1 >nul & echo late".into()
+        } else {
+            "sleep 3; echo late".into()
+        });
+        app.handle_key(key(KeyCode::Char('e')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        let joined = render(&mut app, 120, 20).join("\n");
+        assert!(
+            joined.contains("generating commit message with AI"),
+            "{joined}"
+        );
+        assert!(
+            SPINNER.iter().any(|frame| joined.contains(frame)),
+            "{joined}"
+        );
+        assert!(joined.contains("Esc: cancel ai"), "{joined}");
+
+        // 中止すると通常の入力欄に戻る。
+        app.handle_key(key(KeyCode::Esc));
+        let joined = render(&mut app, 120, 20).join("\n");
+        assert!(!joined.contains("generating"), "{joined}");
+        assert!(joined.contains("Ctrl-g: ai"), "{joined}");
     }
 }

@@ -7,8 +7,9 @@
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::Text;
 
@@ -21,6 +22,17 @@ const PAGE: usize = 10;
 /// [`App::begin_reload`] が背景スレッドから返す `jj log`/`jj status` の
 /// 結果。
 type ReloadResult = Result<(Vec<Row>, String)>;
+
+/// Ctrl-g で走らせた AI メッセージ生成 1 回分。
+///
+/// AI コマンド (と元になる `jj diff`) は数秒〜数十秒かかることがあり、
+/// メインスレッドで待つと画面が固まって「押せたのか」が分からない。
+/// 背景スレッドに逃がし、結果は [`App::poll_ai`] が描画ループから拾う。
+/// その間 `started` からの経過でスピナーを回す (`ui::draw_input`)。
+struct AiJob {
+    rx: mpsc::Receiver<Result<String>>,
+    started: Instant,
+}
 
 /// `jj` の ANSI 出力を ratatui の `Text` にパースする。パース自体が
 /// 失敗したら (通常は起きない) エラー文をそのまま表示用テキストにする。
@@ -241,6 +253,9 @@ pub struct App {
     /// ここに退避し、`tui::run` が終了コードに変換する
     /// ([`Self::take_startup_error`])。
     startup_error: Option<anyhow::Error>,
+    /// 実行中の AI メッセージ生成 (Ctrl-g)。`Some` の間は入力 prompt に
+    /// スピナーを出し、Esc (生成の中止) 以外のキーを受け付けない。
+    ai_job: Option<AiJob>,
     pub diff_scroll: u16,
     pub working_copy: String,
     /// `SHIKIGAMI_AI_CMD` の値。起動時に一度だけ読む (`App::new`)。
@@ -294,6 +309,7 @@ impl App {
             shown_diff_width: None,
             startup_rx: None,
             startup_error: None,
+            ai_job: None,
             diff_scroll: 0,
             working_copy: String::new(),
             ai_cmd: std::env::var(crate::ai::AI_CMD_ENV)
@@ -385,6 +401,51 @@ impl App {
             self.poll_startup();
             if self.is_loading() {
                 thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// AI メッセージ生成 (Ctrl-g) が走っている間の経過時間。走って
+    /// いなければ `None`。描画側はこれでスピナーのコマと秒数を決める。
+    pub fn ai_elapsed(&self) -> Option<Duration> {
+        self.ai_job.as_ref().map(|job| job.started.elapsed())
+    }
+
+    /// [`Self::fill_with_ai`] が背景で走らせた生成の結果をノンブロッキング
+    /// で拾い、入力値に反映する。描画ループから毎フレーム呼ぶ想定。
+    pub fn poll_ai(&mut self) {
+        let Some(job) = &self.ai_job else {
+            return;
+        };
+        let result = match job.rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!("generator thread died")),
+        };
+        self.ai_job = None;
+        match result {
+            // 生成中は Esc 以外のキーを受け付けない (`handle_input`) ので、
+            // mode はまだ Ctrl-g を押した prompt のまま。
+            Ok(message) => match &mut self.mode {
+                Mode::Input(input) => {
+                    input.value = message;
+                    self.status = Status::info("ai: message generated");
+                }
+                _ => return,
+            },
+            Err(err) => self.status = Status::error(format!("ai: {err}")),
+        }
+        // `handle_key` と同じく、次の `sync_diff` に status を上書きさせない。
+        self.status_fresh = true;
+    }
+
+    /// テスト用: AI 生成が終わるまで待って結果を反映する。
+    #[cfg(test)]
+    pub fn wait_for_ai(&mut self) {
+        while self.ai_job.is_some() {
+            self.poll_ai();
+            if self.ai_job.is_some() {
+                thread::sleep(Duration::from_millis(1));
             }
         }
     }
@@ -797,6 +858,19 @@ impl App {
     }
 
     fn handle_input(&mut self, key: KeyEvent, mut input: Input) {
+        if self.ai_job.is_some() {
+            // 生成中。Esc は prompt ごとではなく生成だけを取り消す — 押した
+            // 直後の値に戻るだけで、prompt は開いたまま。それ以外のキーは
+            // 捨てる (打った文字が届いた結果で丸ごと消えるのを避ける)。
+            // 子プロセス自体は止めないが、結果は受信側ごと捨てるので反映
+            // されない。
+            if key.code == KeyCode::Esc {
+                self.ai_job = None;
+                self.status = Status::info("ai: cancelled");
+            }
+            self.mode = Mode::Input(input);
+            return;
+        }
         match key.code {
             KeyCode::Esc => self.status = Status::info("cancelled"),
             KeyCode::Enter => self.submit_input(input),
@@ -821,32 +895,35 @@ impl App {
 
     /// 入力中に Ctrl-g を押したときの処理。
     ///
-    /// 対象 rev (Describe/NewChild が持つもの) の diff を `ai_cmd` に
-    /// 渡し、返ってきたメッセージで入力値を丸ごと置き換える。diff を
-    /// 持たない入力 (bookmark 名や revset) では意味がないので何もしない。
-    fn fill_with_ai(&mut self, mut input: Input) {
-        let Some(rev) = input.action.ai_rev().map(str::to_string) else {
+    /// 対象 rev (Describe/NewChild/Commit が持つもの) の diff を `ai_cmd`
+    /// に渡し、返ってきたメッセージで入力値を丸ごと置き換える。`jj diff`
+    /// と AI コマンドは背景スレッドで走らせ、結果は [`Self::poll_ai`] が
+    /// 反映する。diff を持たない入力 (bookmark 名や revset) や `ai_cmd`
+    /// 未設定はその場でエラーにする。
+    fn fill_with_ai(&mut self, input: Input) {
+        let rev = input.action.ai_rev().map(str::to_string);
+        self.mode = Mode::Input(input);
+        let Some(rev) = rev else {
             self.status = Status::error("ai: not available for this prompt");
-            self.mode = Mode::Input(input);
             return;
         };
-        match self.generate_ai_message(&rev) {
-            Ok(message) => {
-                input.value = message;
-                self.status = Status::info("ai: message generated");
-            }
-            Err(err) => self.status = Status::error(format!("ai: {err}")),
-        }
-        self.mode = Mode::Input(input);
-    }
-
-    fn generate_ai_message(&self, rev: &str) -> Result<String> {
-        let cmd = self
-            .ai_cmd
-            .as_deref()
-            .with_context(|| format!("{} is not set", crate::ai::AI_CMD_ENV))?;
-        let diff = self.jj.diff_plain(rev)?;
-        crate::ai::generate_message(cmd, &diff)
+        let Some(cmd) = self.ai_cmd.clone() else {
+            self.status = Status::error(format!("ai: {} is not set", crate::ai::AI_CMD_ENV));
+            return;
+        };
+        let jj = self.jj.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = jj
+                .diff_plain(&rev)
+                .and_then(|diff| crate::ai::generate_message(&cmd, &diff));
+            let _ = tx.send(result);
+        });
+        self.ai_job = Some(AiJob {
+            rx,
+            started: Instant::now(),
+        });
+        self.status = Status::info("ai: generating message… (Esc: cancel)");
     }
 
     fn handle_confirm(&mut self, key: KeyEvent, confirm: Confirm) {
@@ -2277,6 +2354,15 @@ mod tests {
     fn echo_message_cmd(msg: &str) -> String {
         format!("echo {msg}")
     }
+    /// 数秒かかってから `late` を返す AI コマンド。生成中の状態を観測する用。
+    #[cfg(unix)]
+    fn slow_message_cmd() -> String {
+        "sleep 3; echo late".into()
+    }
+    #[cfg(windows)]
+    fn slow_message_cmd() -> String {
+        "ping -n 4 127.0.0.1 >nul & echo late".into()
+    }
 
     #[test]
     fn ai_ctrl_g_fills_the_describe_prompt_from_the_diff() {
@@ -2287,6 +2373,10 @@ mod tests {
         }
         app.handle_key(key(KeyCode::Char('e')));
         app.handle_key(ctrl('g'));
+        // 生成は背景で走る: 押した直後は生成中として見えている。
+        assert!(app.ai_elapsed().is_some());
+        app.wait_for_ai();
+        assert!(app.ai_elapsed().is_none());
         let Mode::Input(input) = &app.mode else {
             panic!("expected input mode, got {:?}", app.mode);
         };
@@ -2301,6 +2391,38 @@ mod tests {
             "{:?}",
             descriptions(&app)
         );
+    }
+
+    #[test]
+    fn ai_generation_ignores_typing_and_esc_cancels_only_the_generation() {
+        let (_tmp, mut app) = repo_or_skip!();
+        app.ai_cmd = Some(slow_message_cmd());
+        app.handle_key(key(KeyCode::Char('e')));
+        let Mode::Input(input) = &app.mode else {
+            panic!("expected input mode, got {:?}", app.mode);
+        };
+        let before = input.value.clone();
+        app.handle_key(ctrl('g'));
+        assert!(app.ai_elapsed().is_some());
+
+        // 生成中の打鍵や Enter は捨てる — 届いた結果で消えるか、生成途中の
+        // 値で describe してしまうため。
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Enter));
+        let Mode::Input(input) = &app.mode else {
+            panic!("expected input mode, got {:?}", app.mode);
+        };
+        assert_eq!(input.value, before);
+        assert!(app.ai_elapsed().is_some());
+
+        // Esc は生成だけを止め、prompt は開いたまま。
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.ai_elapsed().is_none());
+        let Mode::Input(input) = &app.mode else {
+            panic!("expected input mode, got {:?}", app.mode);
+        };
+        assert_eq!(input.value, before);
+        assert!(app.status.text.contains("cancelled"), "{:?}", app.status);
     }
 
     #[test]

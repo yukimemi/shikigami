@@ -21,10 +21,14 @@ use crate::ui;
 
 /// 入力待ちの上限。
 ///
-/// アニメーションは無いので本来ブロックしていて構わないが、上限を
+/// アニメーションが無い間は本来ブロックしていて構わないが、上限を
 /// 入れておくと SIGWINCH 以外で描画が取り残された場合にも自然に
 /// 復帰する。長めにして idle 時の CPU は使わない。
 const POLL: Duration = Duration::from_millis(500);
+
+/// AI 生成中 (Ctrl-g) のスピナーを回すための poll 間隔。結果の到着も
+/// この間隔で拾う。生成が終われば `POLL` に戻る。
+const ANIM_POLL: Duration = Duration::from_millis(ui::SPINNER_FRAME_MS as u64);
 
 /// 起動時のバックグラウンド `jj log` が終わっていない間だけ使う短い
 /// poll 間隔。`POLL` のままだと結果が届いてから最大 500ms 表示が
@@ -74,6 +78,9 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         // ノンブロッキングに反映する — メインスレッドは一度も
         // ブロックしない。
         app.poll_startup();
+        // Ctrl-g の AI 生成も背景スレッド (`App::fill_with_ai`)。同じく
+        // ノンブロッキングで結果を拾う。
+        app.poll_ai();
         // 描画の直前に 1 回だけ diff を取る。j/k の連打中に 1 行ごと
         // `jj diff` を起動しない (app::App::sync_diff 参照)。SIGWINCH
         // 直後で size 取得自体が失敗することがあるので、その場合は前回
@@ -88,7 +95,13 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         // 既に立っていたら、次ループの先頭で即座に抜ける。ここで
         // `event::poll` を待つと最大 `POLL`/`STARTUP_POLL` 分、来ない
         // キー入力を無駄に待ってから終了することになる。
-        let poll_timeout = if app.is_loading() { STARTUP_POLL } else { POLL };
+        let poll_timeout = if app.is_loading() {
+            STARTUP_POLL
+        } else if app.ai_elapsed().is_some() {
+            ANIM_POLL
+        } else {
+            POLL
+        };
         if !app.should_quit && event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) => {
