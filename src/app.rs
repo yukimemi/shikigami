@@ -429,7 +429,7 @@ impl App {
     /// 上限に) まとめて温める。結果は [`Self::poll_diff_prefetch`] が
     /// ノンブロッキングで拾う。
     fn begin_diff_prefetch(&mut self) {
-        let targets: Vec<(String, String)> = self
+        let targets: Vec<String> = self
             .rows
             .iter()
             .filter_map(|row| match row {
@@ -438,7 +438,7 @@ impl App {
             })
             .filter(|change| !self.diff_cache.contains(&change.commit_id))
             .take(DIFF_PREFETCH)
-            .map(|change| (change.id.clone(), change.commit_id.clone()))
+            .map(|change| change.commit_id.clone())
             .collect();
         if targets.is_empty() {
             return;
@@ -446,7 +446,11 @@ impl App {
         let jj = self.jj.clone();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            for (rev, commit_id) in targets {
+            for commit_id in targets {
+                // 可変な change id ではなく不変な commit id で問い合わせる。
+                // 先読み中に describe/rebase されても、キャッシュキーと
+                // 取得内容が食い違わない。
+                let rev = commit_id.clone();
                 // 失敗はキャッシュしない — `sync_diff` と同じ方針
                 // (一時的な失敗を content-addressed キャッシュへ焼き付けて
                 // 表示し続けてしまわないため)。次に選択されたときは
