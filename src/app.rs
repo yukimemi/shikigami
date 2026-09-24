@@ -19,6 +19,19 @@ use crate::jj::{Change, DiffFile, Jj, RebaseMode, Row};
 /// 一度に動かす行数 (Ctrl-d / Ctrl-u)。
 const PAGE: usize = 10;
 
+/// 起動直後にバックグラウンドで diff を先読みする commit 数。
+/// 上から (現在の revset での log 順) この件数だけ — 無制限にすると
+/// リポジトリが大きいときに起動直後の `jj` プロセス数/CPU が跳ね上がる。
+/// ちょうど j/k で最初に触るあたりを狙った控えめな値。
+const DIFF_PREFETCH: usize = 10;
+
+/// 先読み対象の 1 commit あたり、files pane 分の diff を先読みする
+/// ファイル数の上限。initial commit のように変更ファイルが極端に
+/// 多い commit 1 件が先読みキューを長時間占有しないための安全弁 —
+/// 超えた分は今までどおり、files pane で実際に選んだときに遅延取得
+/// される (`sync_diff` 参照)。
+const DIFF_PREFETCH_FILES_PER_COMMIT: usize = 20;
+
 /// [`App::begin_reload`] が背景スレッドから返す `jj log`/`jj status` の
 /// 結果。
 type ReloadResult = Result<(Vec<Row>, String)>;
@@ -33,6 +46,10 @@ struct AiJob {
     rx: mpsc::Receiver<Result<String>>,
     started: Instant,
 }
+
+/// [`App::begin_diff_prefetch`] が背景スレッドから返す、1 commit 分の
+/// 先読み結果。
+type DiffPrefetchResult = (String, CommitCache);
 
 /// `jj` の ANSI 出力を ratatui の `Text` にパースする。パース自体が
 /// 失敗したら (通常は起きない) エラー文をそのまま表示用テキストにする。
@@ -256,6 +273,9 @@ pub struct App {
     /// 実行中の AI メッセージ生成 (Ctrl-g)。`Some` の間は入力 prompt に
     /// スピナーを出し、Esc (生成の中止) 以外のキーを受け付けない。
     ai_job: Option<AiJob>,
+    /// 起動直後に背景スレッドで先読みした diff (`begin_diff_prefetch`)
+    /// の結果を受け取るチャネル。`startup_rx` と同じパターン。
+    diff_prefetch_rx: Option<mpsc::Receiver<DiffPrefetchResult>>,
     pub diff_scroll: u16,
     pub working_copy: String,
     /// `SHIKIGAMI_AI_CMD` の値。起動時に一度だけ読む (`App::new`)。
@@ -310,6 +330,7 @@ impl App {
             startup_rx: None,
             startup_error: None,
             ai_job: None,
+            diff_prefetch_rx: None,
             diff_scroll: 0,
             working_copy: String::new(),
             ai_cmd: std::env::var(crate::ai::AI_CMD_ENV)
@@ -362,6 +383,9 @@ impl App {
                 if self.status.text == "loading…" {
                     self.status = Status::info("? for help");
                 }
+                // log が届いた直後、上から DIFF_PREFETCH 件ぶんの diff を
+                // 背景で温めておく (詳細は begin_diff_prefetch)。
+                self.begin_diff_prefetch();
             }
             Ok(Err(err)) => {
                 self.status = Status::error(format!("log failed: {err}"));
@@ -392,14 +416,124 @@ impl App {
         self.startup_rx.is_some()
     }
 
-    /// 起動直後のテスト用: バックグラウンドの初回 `jj log` が終わるまで
-    /// 待つ。TUI 本体はブロッキングしない (`poll_startup` 参照) が、
-    /// テストは rows が同期的に揃っている前提の方が書きやすい。
+    /// 起動直後、上から [`DIFF_PREFETCH`] 件ぶんの diff を背景スレッドで
+    /// 先読みしてキャッシュを温める。
+    ///
+    /// `sync_diff` は selection が変わるたびに同期で `jj diff` を叩く
+    /// 構造のまま (連打中に 1 回だけ取る設計 — `sync_diff` 参照) だが、
+    /// 起動直後の最初の j/k はほぼ必ずログの上の方に当たるので、そこだけ
+    /// 先に別スレッドで済ませておけば、実際に選択したときは
+    /// `diff_cache` 命中になり `jj` を呼び直さずに済む。commit pane の
+    /// j/k だけでなく files pane の j/k もこの対象 — files pane で選べる
+    /// 各ファイルの diff まで (`DIFF_PREFETCH_FILES_PER_COMMIT` 件を
+    /// 上限に) まとめて温める。結果は [`Self::poll_diff_prefetch`] が
+    /// ノンブロッキングで拾う。
+    fn begin_diff_prefetch(&mut self) {
+        let targets: Vec<(String, String)> = self
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Change { change, .. } => Some(change),
+                Row::Connector(_) => None,
+            })
+            .filter(|change| !self.diff_cache.contains(&change.commit_id))
+            .take(DIFF_PREFETCH)
+            .map(|change| (change.id.clone(), change.commit_id.clone()))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let jj = self.jj.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for (rev, commit_id) in targets {
+                // 失敗はキャッシュしない — `sync_diff` と同じ方針
+                // (一時的な失敗を content-addressed キャッシュへ焼き付けて
+                // 表示し続けてしまわないため)。次に選択されたときは
+                // `sync_diff` 側で改めて同期に試される。
+                let (Ok(files), Ok(header_raw)) = (jj.diff_summary(&rev), jj.show(&rev)) else {
+                    continue;
+                };
+                let mut entry = CommitCache::new(files.clone(), header_raw);
+                if files.is_empty() {
+                    // 変更ファイルが無い commit (files pane が空になる
+                    // ケース) は change 全体の diff だけ温めておく。
+                    if let Ok(diff_raw) = jj.diff(&rev, None) {
+                        entry.diffs_raw.insert(None, diff_raw);
+                    }
+                } else {
+                    // files pane で選べる各ファイルぶんまとめて先読み。
+                    // 上限を超えた分は今までどおり遅延取得 (`sync_diff`)。
+                    for file in files.iter().take(DIFF_PREFETCH_FILES_PER_COMMIT) {
+                        if let Ok(diff_raw) = jj.diff(&rev, Some(&file.path)) {
+                            entry.diffs_raw.insert(Some(file.path.clone()), diff_raw);
+                        }
+                    }
+                }
+                if tx.send((commit_id, entry)).is_err() {
+                    // 受け手 (App) がもう無い = 終了処理中。続けても無駄。
+                    break;
+                }
+            }
+        });
+        self.diff_prefetch_rx = Some(rx);
+    }
+
+    /// [`Self::begin_diff_prefetch`] の結果をノンブロッキングで拾う。
+    /// 描画ループから毎フレーム呼ぶ。
+    pub fn poll_diff_prefetch(&mut self) {
+        let Some(rx) = &self.diff_prefetch_rx else {
+            return;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok((commit_id, entry)) => {
+                    // 先読みが届く前に `sync_diff` が (実際の選択で) 同じ
+                    // commit を一部だけ埋めていることがある —
+                    // その場合は既存エントリを消さず、まだ無いファイル分
+                    // だけ merge する (files/header は同じ commit なら
+                    // 内容も同じはずなので、既存のものをそのまま残す)。
+                    if let Some(existing) = self.diff_cache.get_mut(&commit_id) {
+                        for (path, diff_raw) in entry.diffs_raw {
+                            existing.diffs_raw.entry(path).or_insert(diff_raw);
+                        }
+                    } else {
+                        self.diff_cache.insert(commit_id, entry);
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.diff_prefetch_rx = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// 起動直後の diff 先読みがまだ走っているか。描画ループのポーリング
+    /// 間隔を詰めるのに使う (`is_loading` 参照)。
+    pub fn is_diff_prefetching(&self) -> bool {
+        self.diff_prefetch_rx.is_some()
+    }
+
+    /// 起動直後のテスト用: バックグラウンドの初回 `jj log` と、それに
+    /// 続けて始まる diff 先読み (`begin_diff_prefetch`) の両方が終わる
+    /// まで待つ。TUI 本体はどちらもブロッキングしない (`poll_startup`/
+    /// `poll_diff_prefetch` 参照) が、テストは repo を消す/壊すケースが
+    /// あり、背景スレッドがまだ `jj` を呼んでいる状態で repo を触ると
+    /// 素の I/O エラー (Windows ではファイルロック) になってしまう。
+    /// なので `App::new` 直後のテストは常にこれで揃えてから使う。
     #[cfg(test)]
     pub fn wait_for_startup(&mut self) {
         while self.is_loading() {
             self.poll_startup();
             if self.is_loading() {
+                thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        while self.is_diff_prefetching() {
+            self.poll_diff_prefetch();
+            if self.is_diff_prefetching() {
                 thread::sleep(std::time::Duration::from_millis(1));
             }
         }
@@ -2251,6 +2385,12 @@ mod tests {
         // ここでキャッシュしてしまうと失敗を注入する前に成功が残ってしまう。
         app.handle_key(key(KeyCode::Char('j')));
         let commit_id = app.selected_change().unwrap().commit_id.clone();
+        // 起動直後の diff 先読み (`begin_diff_prefetch`, `wait_for_startup`
+        // 経由で `repo_or_skip!` が待ち切っている) がこの commit も既に
+        // 温めてしまっている可能性がある — このテストは「まだ
+        // キャッシュされていない commit で jj が失敗したら焼き付かない」
+        // ことを見たいので、先読み分は一旦忘れさせる。
+        app.diff_cache.forget(&commit_id);
 
         // repo を一時的に隠して `jj diff --summary`/`jj show` を失敗させる。
         let jj_dir = app.jj.root().join(".jj");

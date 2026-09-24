@@ -122,6 +122,15 @@ impl DiffStore {
         }
     }
 
+    /// テスト用: 1 commit ぶんのエントリを消す。起動直後の diff 先読み
+    /// (`App::begin_diff_prefetch`) が対象を既に埋めてしまっているケースを
+    /// 「まだキャッシュされていない」状態へ戻すのに使う。
+    #[cfg(test)]
+    pub fn forget(&mut self, commit_id: &str) {
+        self.forget_order(commit_id);
+        self.map.remove(commit_id);
+    }
+
     fn forget_order(&mut self, commit_id: &str) {
         if let Some(pos) = self.order.iter().position(|id| id == commit_id) {
             self.order.remove(pos);

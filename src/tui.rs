@@ -81,6 +81,9 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         // Ctrl-g の AI 生成も背景スレッド (`App::fill_with_ai`)。同じく
         // ノンブロッキングで結果を拾う。
         app.poll_ai();
+        // 起動直後の diff 先読み (`App::begin_diff_prefetch`) の結果も
+        // 同じくノンブロッキングで拾う。
+        app.poll_diff_prefetch();
         // 描画の直前に 1 回だけ diff を取る。j/k の連打中に 1 行ごと
         // `jj diff` を起動しない (app::App::sync_diff 参照)。SIGWINCH
         // 直後で size 取得自体が失敗することがあるので、その場合は前回
@@ -95,7 +98,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         // 既に立っていたら、次ループの先頭で即座に抜ける。ここで
         // `event::poll` を待つと最大 `POLL`/`STARTUP_POLL` 分、来ない
         // キー入力を無駄に待ってから終了することになる。
-        let poll_timeout = if app.is_loading() {
+        let poll_timeout = if app.is_loading() || app.is_diff_prefetching() {
             STARTUP_POLL
         } else if app.ai_elapsed().is_some() {
             ANIM_POLL
