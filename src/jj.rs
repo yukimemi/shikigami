@@ -399,8 +399,10 @@ impl Jj {
     /// `path` について、`rev` にある変更を祖先の mutable な change へ
     /// 分散させる (`jj absorb`)。files pane での「このファイルの変更を
     /// 適切な commit に配る」に対応する。
-    pub fn absorb_file(&self, rev: &str, path: &str) -> Result<String> {
-        self.write(&["absorb", "--from", rev, path])
+    pub fn absorb_file(&self, rev: &str, paths: &[String]) -> Result<String> {
+        let mut args = vec!["absorb", "--from", rev];
+        args.extend(paths.iter().map(String::as_str));
+        self.write(&args)
     }
 
     pub fn bookmark_set(&self, name: &str, rev: &str) -> Result<String> {
