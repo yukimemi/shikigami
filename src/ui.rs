@@ -29,15 +29,23 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl-g (in n/e/c prompt)", "AI: fill message from the diff"),
     (
         "r (files pane)",
-        "jj restore — discard the selected file's change",
+        "jj restore — discard the selected file(s)' change (one confirm)",
     ),
     (
         "p (files pane)",
-        "jj absorb — move the selected file's change into ancestor commits",
+        "jj absorb — move the selected file(s)' change into ancestor commits",
     ),
     (
         "o (files pane)",
-        "open the selected file in $EDITOR (or $VISUAL)",
+        "open the selected file(s) in $EDITOR (or $VISUAL)",
+    ),
+    (
+        "Space (files pane)",
+        "toggle a mark on the file, move down (jumpy multi-select)",
+    ),
+    (
+        "V / v (files pane)",
+        "visual range from here; V / v / Esc leaves it",
     ),
     ("b", "jj bookmark set"),
     ("m", "mark the selected change as squash/rebase target"),
@@ -54,7 +62,8 @@ pub const KEYS: &[(&str, &str)] = &[
     ("A", "toggle revset all()"),
     ("Ctrl-r", "reload"),
     ("? ", "toggle this help"),
-    ("q, Esc", "quit"),
+    ("Esc", "clear file selection (if any), else quit"),
+    ("q", "quit"),
 ];
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -229,23 +238,50 @@ fn diff_file_color(status: char) -> Color {
 }
 
 fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
+    let sel = &app.file_selection;
+    let active = sel.is_active();
     let items: Vec<ListItem> = app
         .files
         .iter()
-        .map(|f: &DiffFile| {
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{} ", f.status),
-                    Style::default()
-                        .fg(diff_file_color(f.status))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(f.path.clone()),
-            ]))
+        .enumerate()
+        .map(|(i, f): (usize, &DiffFile)| {
+            let marked = sel.is_marked(i);
+            let mut spans = Vec::new();
+            // 選択が無いときは列を足さず、従来の見た目を保つ。
+            if active {
+                spans.push(Span::styled(
+                    if marked { "● " } else { "  " },
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("{} ", f.status),
+                Style::default()
+                    .fg(diff_file_color(f.status))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            let mut path = Style::default();
+            if marked {
+                path = path.fg(Color::Yellow);
+            }
+            spans.push(Span::styled(f.path.clone(), path));
+            let mut item = ListItem::new(Line::from(spans));
+            if sel.in_range(i, app.file_selected) {
+                item = item.style(Style::default().bg(Color::Blue));
+            }
+            item
         })
         .collect();
 
-    let title = format!(" files ({}) ", app.files.len());
+    let count = sel.count(app.file_selected, app.files.len());
+    let mut title = if count > 0 {
+        format!(" files ({}, {} selected) ", app.files.len(), count)
+    } else {
+        format!(" files ({}) ", app.files.len())
+    };
+    if sel.is_visual() {
+        title.push_str("-- VISUAL -- ");
+    }
     let list = List::new(items)
         .block(pane_block(title, app.focus == Focus::Files))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -278,9 +314,15 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         StatusKind::Error => Style::default().fg(Color::White).bg(Color::Red),
     };
     let left = Span::styled(format!(" {} ", app.status.text), style);
+    let selected = app.file_selection.count(app.file_selected, app.files.len());
+    let sel = if selected > 0 {
+        format!("sel:{selected}  ")
+    } else {
+        String::new()
+    };
     let right = Span::styled(
         format!(
-            " @ {}  mark:{}  rebase:{} ",
+            " {sel}@ {}  mark:{}  rebase:{} ",
             app.working_copy,
             app.marked
                 .as_ref()

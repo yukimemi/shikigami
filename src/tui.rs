@@ -112,11 +112,23 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
                     if let Some(req) = app.take_pending_editor() {
                         app.status = match open_editor(terminal, &req) {
                             Ok(status) if status.success() => {
-                                Status::info(format!("closed editor for {}", req.path.display()))
+                                let what = match req.paths.as_slice() {
+                                    [one] => one.display().to_string(),
+                                    many => format!("{} files", many.len()),
+                                };
+                                let skipped = match req.skipped {
+                                    0 => String::new(),
+                                    n => format!(" ({n} skipped)"),
+                                };
+                                Status::info(format!("closed editor for {what}{skipped}"))
                             }
                             Ok(status) => Status::error(format!("editor exited with {status}")),
                             Err(err) => Status::error(format!("{err:#}")),
                         };
+                        // エディタでファイルが変わりうるので、一覧を取り直す。
+                        if let Err(err) = app.reload() {
+                            app.status = Status::error(format!("reload failed: {err}"));
+                        }
                     }
                 }
                 // Resize は draw が次のループで拾うので、ここでは
@@ -155,7 +167,7 @@ fn open_editor(
         return Err(err).context("failed to leave the alternate screen for the editor");
     }
 
-    let result = crate::editor::command(&req.editor, &req.path)
+    let result = crate::editor::command(&req.editor, &req.paths)
         .and_then(|mut cmd| cmd.status().context("failed to launch the editor"));
 
     if enable_raw_mode().is_err() {

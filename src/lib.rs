@@ -21,6 +21,7 @@ pub mod decode;
 pub mod diff_filter;
 pub mod editor;
 pub mod jj;
+pub mod selection;
 pub mod tui;
 pub mod ui;
 pub mod update;

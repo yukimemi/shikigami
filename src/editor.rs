@@ -17,7 +17,7 @@
 //! すると `ai.rs` の Windows 版 `shell_command` で踏んだ
 //! `cmd /C` の再クォート地雷を、対話プロセス相手にもう一度踏むことになる。
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Result, bail};
@@ -50,15 +50,15 @@ fn split(cmd: &str) -> Vec<&str> {
     cmd.split_whitespace().collect()
 }
 
-/// `cmd` (`$EDITOR` の値) に `path` を最後の引数として追加した
+/// `cmd` (`$EDITOR` の値) に `paths` を最後の引数として追加した
 /// [`Command`] を組み立てる。
-pub fn command(cmd: &str, path: &Path) -> Result<Command> {
+pub fn command(cmd: &str, paths: &[PathBuf]) -> Result<Command> {
     let parts = split(cmd);
     let Some((program, args)) = parts.split_first() else {
         bail!("editor command is empty");
     };
     let mut command = Command::new(program);
-    command.args(args).arg(path);
+    command.args(args).args(paths);
     Ok(command)
 }
 
@@ -75,7 +75,11 @@ mod tests {
 
     #[test]
     fn command_appends_the_path_as_the_last_argument() {
-        let cmd = command("code --wait", Path::new("/tmp/a b.txt")).unwrap();
+        let cmd = command(
+            "code --wait",
+            &[PathBuf::from("/tmp/a b.txt"), PathBuf::from("/tmp/c.txt")],
+        )
+        .unwrap();
         // std::process::Command には引数を直接覗く public API が無いので、
         // Debug 表示で argv を確認する (`Command { std: "code" "--wait"
         // "/tmp/a b.txt", … }` のような形式)。
@@ -83,10 +87,11 @@ mod tests {
         assert!(debug.contains("\"code\""));
         assert!(debug.contains("\"--wait\""));
         assert!(debug.contains("a b.txt"));
+        assert!(debug.contains("c.txt"));
     }
 
     #[test]
     fn command_rejects_an_empty_editor_string() {
-        assert!(command("   ", Path::new("/tmp/x")).is_err());
+        assert!(command("   ", &[PathBuf::from("/tmp/x")]).is_err());
     }
 }

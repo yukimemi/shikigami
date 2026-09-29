@@ -86,9 +86,11 @@ alone.
 | `e`               | `jj describe` — edit the description                          |
 | `c`               | `jj commit` — describe + new in one step (working copy only)  |
 | Ctrl-g            | (in the `n`/`e`/`c` prompt) fill the message from the diff via AI |
-| `r`               | `jj restore` — discard the selected file's change (files pane)|
-| `p`               | `jj absorb` — move the selected file's change into ancestor commits (files pane) |
-| `o`               | open the selected file in `$EDITOR` (or `$VISUAL`) (files pane) |
+| `Space`           | (files pane) toggle a mark on the file under the cursor and move down — jumpy multi-select |
+| `V` / `v`         | (files pane) start / leave a contiguous visual range anchored at the cursor row |
+| `r`               | `jj restore` — discard the selected file(s)' change (files pane)|
+| `p`               | `jj absorb` — move the selected file(s)' change into ancestor commits (files pane) |
+| `o`               | open the selected file(s) in `$EDITOR` (or `$VISUAL`) (files pane) |
 | `b`               | `jj bookmark set`                                             |
 | `m`               | mark the selected change as the squash / rebase target (`◆`)  |
 | `s`               | `jj squash` — selected change into the marked one             |
@@ -101,10 +103,27 @@ alone.
 | `A`               | toggle the revset `all()`                                     |
 | `Ctrl-r`          | reload                                                        |
 | `?`               | toggle help                                                   |
-| `q`, `Esc`        | quit                                                          |
+| `Esc`             | clear the file selection if there is one, otherwise quit      |
+| `q`               | quit                                                          |
 
 Everything that rewrites history asks first (`y` / `Enter` confirms; **any** other key cancels), and
 the status bar always shows the working copy, the marked target, and the current rebase mode.
+
+### Multi-selecting files
+
+In the files pane, `Space` marks files one by one and `V` (or `v`) starts a visual range anchored at
+the current row; moving the cursor grows or shrinks the range, and `V` / `v` / `Esc` leaves it. Marks
+and the visual range coexist — the target set is their union. Marked rows show `●`, range rows have a
+blue background, the cursor row stays reversed, and the files title and the status bar show the count.
+
+Every file-targeted action (`r` restore, `p` absorb, `o` open) applies to the whole target set, or to
+the file under the cursor when nothing is selected. Each runs as one `jj` call (so one `u` undoes a
+batch), and `r` asks once for the whole set ("restore 3 files …"). Files an action cannot handle are
+skipped and counted in the status line (`absorb` skips renames/copies; `open` skips deleted files when
+several are selected). jj has no index, so there is no stage/unstage. The selection is cleared after an
+action runs (a cancelled confirm keeps it), on `Esc`, and whenever the file list changes. The pane is
+a flat file list; if directory rows are ever added they are excluded from the selection rather than
+expanded.
 
 ## AI-generated messages
 

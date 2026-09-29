@@ -15,6 +15,7 @@ use ratatui::text::Text;
 
 use crate::cache::{CommitCache, DiffStore};
 use crate::jj::{Change, DiffFile, Jj, RebaseMode, Row};
+use crate::selection::{FileSelection, plan_absorb, plan_open, plan_restore};
 
 /// 一度に動かす行数 (Ctrl-d / Ctrl-u)。
 const PAGE: usize = 10;
@@ -153,6 +154,8 @@ pub enum ConfirmAction {
     RestoreFile {
         rev: String,
         paths: Vec<String>,
+        /// 対象ファイル数 (`paths` はリネームで 2 倍になりうる)。
+        count: usize,
     },
     Undo,
     Redo,
@@ -218,7 +221,9 @@ impl Status {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorRequest {
     pub editor: String,
-    pub path: PathBuf,
+    pub paths: Vec<PathBuf>,
+    /// 複数選択で対象外にした件数 (status 表示用)。
+    pub skipped: usize,
 }
 
 pub struct App {
@@ -241,6 +246,9 @@ pub struct App {
     pub files: Vec<DiffFile>,
     /// `files` の index。ここで選んだ 1 ファイルだけが `diff` に出る。
     pub file_selected: usize,
+    /// files pane の複数選択 (mark + visual 範囲)。`marked` (change の
+    /// squash/rebase 相手) とは別物。
+    pub file_selection: FileSelection,
     /// `jj show -r rev --no-patch` の結果 (ANSI 解決済み)。ファイル切り替え
     /// だけなら変わらないので、change ごとに 1 回だけ取って使い回す。
     header: Text<'static>,
@@ -322,6 +330,7 @@ impl App {
             diff: Text::default(),
             files: Vec::new(),
             file_selected: 0,
+            file_selection: FileSelection::default(),
             header: Text::default(),
             diff_cache,
             shown_commit: None,
@@ -618,6 +627,7 @@ impl App {
     /// (`begin_reload` → `poll_startup`) の両方から呼ばれる共通処理。
     fn apply_rows(&mut self, rows: Vec<Row>, working_copy: String) {
         let keep = self.selected_change().map(|c| c.id.clone());
+        self.file_selection.clear();
         self.rows = rows;
         self.selected = keep
             .and_then(|id| self.index_of(&id))
@@ -739,6 +749,7 @@ impl App {
         let Some(change) = self.selected_change() else {
             self.files = Vec::new();
             self.file_selected = 0;
+            self.file_selection.clear();
             self.header = Text::default();
             self.diff = Text::default();
             self.shown_commit = None;
@@ -779,6 +790,7 @@ impl App {
                 }
             }
             self.file_selected = 0;
+            self.file_selection.clear();
             self.shown_commit = Some(commit_id.clone());
         }
 
@@ -894,6 +906,20 @@ impl App {
         }
     }
 
+    /// [`Self::report`] のバッチ版。複数ファイルなら件数をラベルに入れ、
+    /// 対象外にした件数を末尾に足す。
+    fn report_batch(&mut self, label: &str, count: usize, skipped: usize, result: Result<String>) {
+        let label = if count > 1 {
+            format!("{label} {count} files")
+        } else {
+            label.to_string()
+        };
+        self.report(&label, result);
+        if skipped > 0 {
+            self.status.text.push_str(&format!(" ({skipped} skipped)"));
+        }
+    }
+
     /// 確定した入力を実行する。
     pub fn submit_input(&mut self, input: Input) {
         match input.action {
@@ -957,9 +983,10 @@ impl App {
                 let result = self.jj.rebase(&rev, &onto, mode);
                 self.report("rebase", result);
             }
-            ConfirmAction::RestoreFile { rev, paths } => {
+            ConfirmAction::RestoreFile { rev, paths, count } => {
                 let result = self.jj.restore_file(&rev, &paths);
-                self.report("restore", result);
+                self.file_selection.clear();
+                self.report_batch("restore", count, 0, result);
             }
             ConfirmAction::Undo => {
                 let result = self.jj.undo();
@@ -1078,7 +1105,13 @@ impl App {
     fn handle_normal(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            KeyCode::Esc if self.file_selection.is_active() => {
+                self.file_selection.clear();
+                self.status = Status::info("selection cleared");
+            }
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char(' ') if self.focus == Focus::Files => self.toggle_file_mark(),
+            KeyCode::Char('V' | 'v') if self.focus == Focus::Files => self.toggle_visual(),
             KeyCode::Char('c') if ctrl => self.should_quit = true,
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Tab => {
@@ -1111,7 +1144,7 @@ impl App {
                 Focus::Files => self.select_last_file(),
                 Focus::Diff => self.scroll_diff(isize::MAX / 2),
             },
-            KeyCode::Char('r') if ctrl => match self.reload() {
+            KeyCode::Char('r') if ctrl => match self.reload_and_clear() {
                 Ok(()) => self.status = Status::info("reloaded"),
                 Err(err) => self.status = Status::error(format!("reload failed: {err}")),
             },
@@ -1173,6 +1206,48 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Ctrl-r: 選択を捨ててから reload する。
+    fn reload_and_clear(&mut self) -> Result<()> {
+        self.file_selection.clear();
+        self.reload()
+    }
+
+    /// files pane の操作対象 (選択の和集合、無ければ cursor の 1 件)。
+    fn file_targets(&self) -> Vec<usize> {
+        self.file_selection
+            .targets(self.file_selected, self.files.len())
+    }
+
+    /// `Space`: cursor 行の mark を反転して 1 行下へ。
+    fn toggle_file_mark(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+        self.file_selection.toggle(self.file_selected);
+        self.move_file_selection(1);
+        self.announce_selection();
+    }
+
+    /// `V`/`v`: visual 範囲の開始 / 終了。
+    fn toggle_visual(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+        if self.file_selection.is_visual() {
+            self.file_selection.stop_visual();
+        } else {
+            self.file_selection.start_visual(self.file_selected);
+        }
+        self.announce_selection();
+    }
+
+    fn announce_selection(&mut self) {
+        let n = self
+            .file_selection
+            .count(self.file_selected, self.files.len());
+        self.status = Status::info(format!("{n} file(s) selected"));
     }
 
     /// focus に応じて log の選択 / files の選択 / diff の scroll を動かす。
@@ -1354,18 +1429,29 @@ impl App {
         let Some(change) = self.selected_change().cloned() else {
             return;
         };
-        let Some(file) = self.selected_file().cloned() else {
+        let targets = self.file_targets();
+        // 対象パスはここで固定する。承認後に cursor や選択を再評価しない。
+        let plan = plan_restore(&self.files, &targets);
+        if plan.count == 0 {
             return;
-        };
-        let paths = file.restore_paths();
-        self.mode = Mode::Confirm(Confirm {
-            prompt: format!(
+        }
+        let prompt = if plan.count == 1 {
+            format!(
                 "restore {} — discard this file's change in {}?",
-                file.path, change.short_id
-            ),
+                self.files[targets[0]].path, change.short_id
+            )
+        } else {
+            format!(
+                "restore {} files — discard their changes in {}?",
+                plan.count, change.short_id
+            )
+        };
+        self.mode = Mode::Confirm(Confirm {
+            prompt,
             action: ConfirmAction::RestoreFile {
                 rev: change.id,
-                paths,
+                paths: plan.paths,
+                count: plan.count,
             },
         });
     }
@@ -1386,21 +1472,32 @@ impl App {
         let Some(change) = self.selected_change().cloned() else {
             return;
         };
-        let Some(file) = self.selected_file().cloned() else {
-            return;
-        };
-        if matches!(file.status, 'R' | 'C') {
-            self.status = Status::error(format!(
-                "absorb: renamed/copied file {} is not supported — jj can't attribute changes across a rename",
-                file.path
-            ));
+        let targets = self.file_targets();
+        if targets.is_empty() {
             return;
         }
-        let result = self.jj.absorb_file(&change.id, &file.target_path());
-        self.report("absorb", result);
+        let plan = plan_absorb(&self.files, &targets);
+        if plan.paths.is_empty() {
+            self.status = Status::error(match targets.as_slice() {
+                [i] => format!(
+                    "absorb: renamed/copied file {} is not supported — jj can't attribute changes across a rename",
+                    self.files[*i].path
+                ),
+                _ => format!(
+                    "absorb: all {} selected files are renamed/copied — jj can't attribute changes across a rename",
+                    plan.skipped
+                ),
+            });
+            self.file_selection.clear();
+            return;
+        }
+        let result = self.jj.absorb_file(&change.id, &plan.paths);
+        self.file_selection.clear();
+        self.report_batch("absorb", plan.count, plan.skipped, result);
     }
 
-    /// files pane で選択中のファイルを `EDITOR`/`VISUAL` で開くリクエストを
+    /// files pane の対象ファイル (複数選択があればその全部) を
+    /// `EDITOR`/`VISUAL` で開くリクエストを
     /// 立てる。実際の子プロセス起動と端末の明け渡しは
     /// `tui::event_loop` が [`Self::take_pending_editor`] で拾って行う —
     /// ここは Terminal を持っていないので、それ自体は起動しない。
@@ -1410,9 +1507,10 @@ impl App {
     /// エディタは新規ファイルとして開く — それ自体は誤りではないので
     /// 特別扱いしない。
     fn open_selected_file_in_editor(&mut self) {
-        let Some(file) = self.selected_file().cloned() else {
+        let targets = self.file_targets();
+        if targets.is_empty() {
             return;
-        };
+        }
         let Some(editor) = self.editor_cmd.clone() else {
             self.status = Status::error(format!(
                 "{}/{} is not set",
@@ -1421,8 +1519,19 @@ impl App {
             ));
             return;
         };
-        let path = self.jj.root().join(file.target_path());
-        self.pending_editor = Some(EditorRequest { editor, path });
+        let plan = plan_open(&self.files, &targets);
+        if plan.paths.is_empty() {
+            self.status = Status::error("open: no file on disk among the selection");
+            self.file_selection.clear();
+            return;
+        }
+        let root = self.jj.root().to_path_buf();
+        self.file_selection.clear();
+        self.pending_editor = Some(EditorRequest {
+            editor,
+            paths: plan.paths.iter().map(|p| root.join(p)).collect(),
+            skipped: plan.skipped,
+        });
     }
 
     /// [`Self::open_selected_file_in_editor`] が立てたリクエストを取り出す。
@@ -1725,6 +1834,93 @@ mod tests {
         assert!(app.files.is_empty(), "{:?}", app.files);
     }
 
+    /// working copy に 3 ファイル (x/y/z) を作って files pane にフォーカスする。
+    fn app_with_wc_files() -> Option<(tempfile::TempDir, App)> {
+        let (tmp, mut app) = crate::testutil::try_repo()?;
+        while !app.selected_change().unwrap().is_working_copy {
+            app.handle_key(key(KeyCode::Char('k')));
+        }
+        for name in ["x.txt", "y.txt", "z.txt"] {
+            std::fs::write(app.jj.root().join(name), format!("{name}\n")).unwrap();
+        }
+        app.reload().unwrap();
+        app.sync_diff(80);
+        assert_eq!(app.files.len(), 3, "{:?}", app.files);
+        app.handle_key(key(KeyCode::Tab));
+        Some((tmp, app))
+    }
+
+    #[test]
+    fn space_marks_and_moves_down_and_v_extends_a_range() {
+        let Some((_tmp, mut app)) = app_with_wc_files() else {
+            report_skip();
+            return;
+        };
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.file_selected, 1);
+        assert!(app.file_selection.is_marked(0));
+        app.handle_key(key(KeyCode::Char('V')));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.file_selection.selected(app.file_selected, 3),
+            vec![0, 1, 2]
+        );
+        app.handle_key(key(KeyCode::Char('V')));
+        assert!(!app.file_selection.is_visual());
+        // Esc は選択だけを消し、quit しない。
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.file_selection.is_active());
+        assert!(!app.should_quit);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn restore_on_a_selection_confirms_once_and_clears_it() {
+        let Some((_tmp, mut app)) = app_with_wc_files() else {
+            report_skip();
+            return;
+        };
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('r')));
+        let Mode::Confirm(confirm) = &app.mode else {
+            panic!("expected confirm mode, got {:?}", app.mode);
+        };
+        assert!(confirm.prompt.contains("2 files"), "{}", confirm.prompt);
+        // 取消では選択が残る。
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(app.file_selection.is_active());
+        app.handle_key(key(KeyCode::Char('r')));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+        assert!(!app.file_selection.is_active());
+        app.sync_diff(80);
+        assert_eq!(
+            app.files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["y.txt"]
+        );
+    }
+
+    #[test]
+    fn open_on_a_selection_requests_every_file_once() {
+        let Some((_tmp, mut app)) = app_with_wc_files() else {
+            report_skip();
+            return;
+        };
+        app.editor_cmd = Some("true".into());
+        app.handle_key(key(KeyCode::Char('V')));
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('o')));
+        let req = app.take_pending_editor().unwrap();
+        assert_eq!(req.paths.len(), 2);
+        assert!(!app.file_selection.is_active());
+    }
+
     #[test]
     fn restore_and_absorb_keys_are_ignored_outside_files_focus() {
         let (_tmp, mut app) = repo_or_skip!();
@@ -1762,7 +1958,7 @@ mod tests {
 
         let req = app.take_pending_editor().expect("pending editor request");
         assert_eq!(req.editor, "code --wait");
-        assert_eq!(req.path, app.jj.root().join("b.txt"));
+        assert_eq!(req.paths, vec![app.jj.root().join("b.txt")]);
         // 消費したら空になる: 次フレームで二重に子プロセスを起動しない。
         assert!(app.take_pending_editor().is_none());
     }
