@@ -125,6 +125,10 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
                             Ok(status) => Status::error(format!("editor exited with {status}")),
                             Err(err) => Status::error(format!("{err:#}")),
                         };
+                        // エディタでファイルが変わりうるので、一覧を取り直す。
+                        if let Err(err) = app.reload() {
+                            app.status = Status::error(format!("reload failed: {err}"));
+                        }
                     }
                 }
                 // Resize は draw が次のループで拾うので、ここでは
