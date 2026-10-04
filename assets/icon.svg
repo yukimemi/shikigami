@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" width="160" height="160" role="img" aria-label="shikigami">
+  <title>shikigami</title>
+  <!-- 式神のアイコン: 呪符に jj の change graph を刻んだ正方形版。
+       wordmark は含めない。light mode 用 (濃い線)。 -->
+  <g fill="none" stroke="#1f2933" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <!-- 呪符 (paper talisman) -->
+    <path d="M36 12 h88 v136 h-88 z" fill="#fdfaf3" />
+    <path d="M54 34 h52 M54 52 h30" stroke="#b9472f" />
+    <!-- change graph: 先に線、後からノード -->
+    <path d="M62 96 v26 M62 96 l36 -22" />
+    <circle cx="62" cy="96" r="11" fill="#1f2933" />
+    <circle cx="62" cy="122" r="9" fill="#fdfaf3" />
+    <circle cx="98" cy="74" r="9" fill="#fdfaf3" />
+  </g>
+</svg>
