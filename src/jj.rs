@@ -405,6 +405,21 @@ impl Jj {
         self.write(&args)
     }
 
+    /// 作業コピーでの追跡を外す (`jj file untrack`)。呼び出し側は先に
+    /// `.gitignore` へ追記しておくこと (jj は ignore 済みでないパスを拒否する)。
+    ///
+    /// 空白や括弧を含むパスで fileset のパースが壊れないよう、他の
+    /// restore/absorb と違い `root:"…"` のリテラル指定に包む。
+    pub fn file_untrack(&self, paths: &[String]) -> Result<String> {
+        let filesets: Vec<String> = paths
+            .iter()
+            .map(|p| format!("root:\"{}\"", p.replace('\\', "/").replace('"', "\\\"")))
+            .collect();
+        let mut args = vec!["file", "untrack"];
+        args.extend(filesets.iter().map(String::as_str));
+        self.write(&args)
+    }
+
     pub fn bookmark_set(&self, name: &str, rev: &str) -> Result<String> {
         // `bookmark set` は既存 bookmark の移動も新規作成も担う
         // (`create` は既存だとエラー)。TUI から「この change に名前を

@@ -36,6 +36,10 @@ pub const KEYS: &[(&str, &str)] = &[
         "jj absorb — move the selected file(s)' change into ancestor commits",
     ),
     (
+        "i (files pane)",
+        "ignore + untrack — add the selected file(s) to .gitignore, then jj file untrack (working copy only)",
+    ),
+    (
         "o (files pane)",
         "open the selected file(s) in $EDITOR (or $VISUAL)",
     ),
