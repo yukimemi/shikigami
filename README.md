@@ -90,6 +90,7 @@ alone.
 | `V` / `v`         | (files pane) start / leave a contiguous visual range anchored at the cursor row |
 | `r`               | `jj restore` — discard the selected file(s)' change (files pane)|
 | `p`               | `jj absorb` — move the selected file(s)' change into ancestor commits (files pane) |
+| `i`               | add the selected file(s) to the repo's `.gitignore`, then `jj file untrack` (files pane, working copy only, asks first) |
 | `o`               | open the selected file(s) in `$EDITOR` (or `$VISUAL`) (files pane) |
 | `b`               | `jj bookmark set`                                             |
 | `m`               | mark the selected change as the squash / rebase target (`◆`)  |
@@ -116,7 +117,7 @@ the current row; moving the cursor grows or shrinks the range, and `V` / `v` / `
 and the visual range coexist — the target set is their union. Marked rows show `●`, range rows have a
 blue background, the cursor row stays reversed, and the files title and the status bar show the count.
 
-Every file-targeted action (`r` restore, `p` absorb, `o` open) applies to the whole target set, or to
+Every file-targeted action (`r` restore, `p` absorb, `i` ignore + untrack, `o` open) applies to the whole target set, or to
 the file under the cursor when nothing is selected. Each runs as one `jj` call (so one `u` undoes a
 batch), and `r` asks once for the whole set ("restore 3 files …"). Files an action cannot handle are
 skipped and counted in the status line (`absorb` skips renames/copies; `open` skips deleted files when

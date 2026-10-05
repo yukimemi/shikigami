@@ -15,7 +15,7 @@ use ratatui::text::Text;
 
 use crate::cache::{CommitCache, DiffStore};
 use crate::jj::{Change, DiffFile, Jj, RebaseMode, Row};
-use crate::selection::{FileSelection, plan_absorb, plan_open, plan_restore};
+use crate::selection::{FileSelection, plan_absorb, plan_open, plan_restore, plan_untrack};
 
 /// 一度に動かす行数 (Ctrl-d / Ctrl-u)。
 const PAGE: usize = 10;
@@ -156,6 +156,12 @@ pub enum ConfirmAction {
         paths: Vec<String>,
         /// 対象ファイル数 (`paths` はリネームで 2 倍になりうる)。
         count: usize,
+    },
+    /// `.gitignore` へ追記してから `jj file untrack` する。
+    UntrackFile {
+        paths: Vec<String>,
+        count: usize,
+        skipped: usize,
     },
     Undo,
     Redo,
@@ -988,6 +994,31 @@ impl App {
                 self.file_selection.clear();
                 self.report_batch("restore", count, 0, result);
             }
+            ConfirmAction::UntrackFile {
+                paths,
+                count,
+                skipped,
+            } => {
+                self.file_selection.clear();
+                // jj は ignore 済みでないパスの untrack を拒否するので、
+                // `.gitignore` が先。失敗したら jj は呼ばない。
+                if let Err(err) = crate::gitignore::ignore_paths(self.jj.root(), &paths) {
+                    self.status = Status::error(format!("untrack failed: .gitignore: {err}"));
+                    return;
+                }
+                let result = self.jj.file_untrack(&paths);
+                if result.is_err() {
+                    // 追記は巻き戻さない (再実行は dedupe で冪等)。
+                    self.report_batch(
+                        "untrack (.gitignore updated, untrack failed)",
+                        count,
+                        skipped,
+                        result,
+                    );
+                } else {
+                    self.report_batch("untrack", count, skipped, result);
+                }
+            }
             ConfirmAction::Undo => {
                 let result = self.jj.undo();
                 self.report("undo", result);
@@ -1191,6 +1222,7 @@ impl App {
             KeyCode::Char('x') => self.confirm_rebase(),
             KeyCode::Char('r') if self.focus == Focus::Files => self.confirm_restore_file(),
             KeyCode::Char('p') if self.focus == Focus::Files => self.absorb_file(),
+            KeyCode::Char('i') if self.focus == Focus::Files => self.confirm_untrack_file(),
             KeyCode::Char('o') if self.focus == Focus::Files => self.open_selected_file_in_editor(),
             KeyCode::Char('u') => {
                 self.mode = Mode::Confirm(Confirm {
@@ -1452,6 +1484,42 @@ impl App {
                 rev: change.id,
                 paths: plan.paths,
                 count: plan.count,
+            },
+        });
+    }
+
+    /// files pane で選択中のファイルを `.gitignore` に入れて追跡を外す
+    /// 確認ダイアログを開く。`jj file untrack` は作業コピーにしか効かない。
+    fn confirm_untrack_file(&mut self) {
+        let Some(change) = self.selected_change().cloned() else {
+            return;
+        };
+        let targets = self.file_targets();
+        if targets.is_empty() {
+            return;
+        }
+        if !change.is_working_copy {
+            self.status = Status::error("untrack: select the working-copy change (@) first");
+            return;
+        }
+        let plan = plan_untrack(&self.files, &targets);
+        if plan.count == 0 {
+            self.status = Status::error("untrack: deleted files cannot be untracked");
+            return;
+        }
+        let what = if plan.count == 1 {
+            plan.paths[0].clone()
+        } else {
+            format!("{} files", plan.count)
+        };
+        self.mode = Mode::Confirm(Confirm {
+            prompt: format!(
+                "untrack {what} — append to the root .gitignore and stop tracking in the working copy?"
+            ),
+            action: ConfirmAction::UntrackFile {
+                paths: plan.paths,
+                count: plan.count,
+                skipped: plan.skipped,
             },
         });
     }
@@ -1941,6 +2009,35 @@ mod tests {
         app.handle_key(key(KeyCode::Char('o')));
         assert!(app.take_pending_editor().is_none());
         assert_eq!(app.status, status_before);
+    }
+
+    #[test]
+    fn untrack_key_ignores_then_untracks_the_working_copy_file() {
+        let (tmp, mut app) = repo_or_skip!();
+        let dir = tmp.path();
+        std::fs::write(dir.join("c.txt"), "c\n").unwrap();
+        app.reload().unwrap();
+        assert!(app.selected_change().unwrap().is_working_copy);
+        app.sync_diff(80);
+        assert_eq!(app.files[0].path, "c.txt", "{:?}", app.files);
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('i')));
+        assert!(matches!(app.mode, Mode::Confirm(_)), "{:?}", app.mode);
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert_ne!(app.status.kind, StatusKind::Error, "{:?}", app.status);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".gitignore")).unwrap(),
+            "/c.txt\n"
+        );
+        let out = crate::testutil::jj_cmd(dir)
+            .args(["file", "list"])
+            .output()
+            .unwrap();
+        let listed = String::from_utf8_lossy(&out.stdout);
+        assert!(!listed.contains("c.txt"), "{listed}");
+        assert!(dir.join("c.txt").exists());
     }
 
     #[test]

@@ -24,7 +24,7 @@
 //!
 //! jj には index が無いので stage/unstage/discard に相当する操作は無く、
 //! files pane の「ファイル単位の操作」は restore (`r`) / absorb (`p`) /
-//! open (`o`) の 3 つ。すべて [`FileSelection::targets`] を通る。
+//! open (`o`) / untrack (`i`) の 4 つ。すべて [`FileSelection::targets`] を通る。
 
 use std::collections::BTreeSet;
 
@@ -162,6 +162,25 @@ pub fn plan_absorb(files: &[DiffFile], targets: &[usize]) -> BatchPlan {
     }
 }
 
+/// untrack: ディスク上に無い `D` は対象外。リネーム/コピーは新パス。
+pub fn plan_untrack(files: &[DiffFile], targets: &[usize]) -> BatchPlan {
+    let mut paths = Vec::new();
+    let mut skipped = 0;
+    for f in targets.iter().filter_map(|&i| files.get(i)) {
+        if f.status == 'D' {
+            skipped += 1;
+        } else {
+            dedup_push(&mut paths, f.target_path());
+        }
+    }
+    let count = paths.len();
+    BatchPlan {
+        paths,
+        count,
+        skipped,
+    }
+}
+
 /// open: 単一対象は従来どおり何でも開く (削除済みでも)。複数対象のときだけ、
 /// ディスクに無い `D` を除外する。
 pub fn plan_open(files: &[DiffFile], targets: &[usize]) -> BatchPlan {
@@ -264,6 +283,18 @@ mod tests {
         let plan = plan_restore(&files, &[0, 1, 0]);
         assert_eq!(plan.paths, vec!["a.rs", "x.rs", "y.rs"]);
         assert_eq!((plan.count, plan.skipped), (3, 0));
+    }
+
+    #[test]
+    fn untrack_plan_skips_deleted_and_uses_new_path_of_renames() {
+        let files = [
+            file('M', "a.rs"),
+            file('D', "gone.rs"),
+            file('R', "{x.rs => y.rs}"),
+        ];
+        let plan = plan_untrack(&files, &[0, 1, 2, 0]);
+        assert_eq!(plan.paths, vec!["a.rs", "y.rs"]);
+        assert_eq!((plan.count, plan.skipped), (2, 1));
     }
 
     #[test]

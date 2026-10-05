@@ -20,6 +20,7 @@ pub mod cli;
 pub mod decode;
 pub mod diff_filter;
 pub mod editor;
+pub mod gitignore;
 pub mod jj;
 pub mod selection;
 pub mod tui;
