@@ -413,7 +413,16 @@ impl Jj {
     pub fn file_untrack(&self, paths: &[String]) -> Result<String> {
         let filesets: Vec<String> = paths
             .iter()
-            .map(|p| format!("root:\"{}\"", p.replace('\\', "/").replace('"', "\\\"")))
+            .map(|p| {
+                // Windows の jj だけが `\` を区切りとして出す。Unix では
+                // ファイル名の一部なので、fileset 文字列内でエスケープする。
+                let p = if cfg!(windows) {
+                    p.replace('\\', "/")
+                } else {
+                    p.clone()
+                };
+                format!("root:\"{}\"", p.replace('\\', "\\\\").replace('"', "\\\""))
+            })
             .collect();
         let mut args = vec!["file", "untrack"];
         args.extend(filesets.iter().map(String::as_str));

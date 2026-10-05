@@ -15,14 +15,20 @@ fn entry_line(path: &str) -> Result<String> {
     if path.contains('\n') || path.contains('\r') {
         bail!("path contains a line break and cannot be written to .gitignore: {path:?}");
     }
-    let norm = path.replace('\\', "/");
+    // `\` は Windows の jj だけがパス区切りとして出す。Unix ではファイル名の
+    // 一部なので、そのまま (下でエスケープして) 残す。
+    let norm = if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path.to_string()
+    };
     let norm = norm.trim_start_matches('/');
     if norm.is_empty() {
         bail!("empty path");
     }
     let mut out = String::from("/");
     for (i, c) in norm.chars().enumerate() {
-        if matches!(c, '*' | '?' | '[') || (i == 0 && matches!(c, '#' | '!')) {
+        if matches!(c, '*' | '?' | '[' | '\\') || (i == 0 && matches!(c, '#' | '!')) {
             out.push('\\');
         }
         out.push(c);
@@ -30,25 +36,27 @@ fn entry_line(path: &str) -> Result<String> {
     Ok(out)
 }
 
-/// 既存行を比較用に正規化する (前後空白と先頭・末尾の `/` を除く)。
-fn normalize(line: &str) -> &str {
-    line.trim().trim_start_matches('/').trim_end_matches('/')
+/// `entry` (`/path`) と等価な既存行か。末尾 `/` の行はディレクトリ専用で
+/// 通常ファイルに効かないので等価とみなさない。先頭の空白も意味を持つ。
+/// (末尾の空白だけは gitignore が無視する。)
+fn is_equivalent(line: &str, entry: &str) -> bool {
+    let line = line.trim_end();
+    line == entry || line == &entry[1..]
 }
 
 /// `existing` に `paths` を追記した新しい内容を返す。変更不要なら `None`。
 /// 既に等価な行があるパスは足さない。常に末尾改行で終える。
 pub fn plan_append(existing: Option<&str>, paths: &[String]) -> Result<Option<String>> {
     let existing = existing.unwrap_or("");
-    let mut lines: Vec<String> = existing.lines().map(|l| normalize(l).to_string()).collect();
+    let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
     let mut added: Vec<String> = Vec::new();
     for p in paths {
         let entry = entry_line(p)?;
-        let key = normalize(&entry).to_string();
-        if lines.contains(&key) {
+        if lines.iter().any(|l| is_equivalent(l, &entry)) {
             continue;
         }
+        lines.push(entry.clone());
         added.push(entry);
-        lines.push(key);
     }
     if added.is_empty() {
         return Ok(None);
@@ -111,16 +119,32 @@ mod tests {
     fn dedupes_with_or_without_slashes() {
         assert_eq!(plan_append(Some("/x\n"), &v(&["x"])).unwrap(), None);
         assert_eq!(plan_append(Some("x\n"), &v(&["x"])).unwrap(), None);
-        assert_eq!(plan_append(Some("x/\n"), &v(&["x"])).unwrap(), None);
-        assert_eq!(plan_append(Some("  /x  \n"), &v(&["x"])).unwrap(), None);
+        assert_eq!(plan_append(Some("/x  \n"), &v(&["x"])).unwrap(), None);
         let out = plan_append(Some("/x\n"), &v(&["x", "z", "z"])).unwrap();
         assert_eq!(out.as_deref(), Some("/x\n/z\n"));
     }
 
     #[test]
-    fn escapes_special_characters_and_normalizes_separators() {
-        let out = plan_append(None, &v(&["#a", "!b", "c*d", "e\\f.rs"])).unwrap();
-        assert_eq!(out.as_deref(), Some("/\\#a\n/\\!b\n/c\\*d\n/e/f.rs\n"));
+    fn directory_only_and_indented_lines_do_not_count_as_duplicates() {
+        let out = plan_append(Some("x/\n"), &v(&["x"])).unwrap();
+        assert_eq!(out.as_deref(), Some("x/\n/x\n"));
+        let out = plan_append(Some("/x/\n"), &v(&["x"])).unwrap();
+        assert_eq!(out.as_deref(), Some("/x/\n/x\n"));
+        let out = plan_append(Some("  /x\n"), &v(&["x"])).unwrap();
+        assert_eq!(out.as_deref(), Some("  /x\n/x\n"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn keeps_literal_backslashes_on_unix() {
+        let out = plan_append(None, &v(&["a\\b.txt"])).unwrap();
+        assert_eq!(out.as_deref(), Some("/a\\\\b.txt\n"));
+    }
+
+    #[test]
+    fn escapes_special_characters() {
+        let out = plan_append(None, &v(&["#a", "!b", "c*d"])).unwrap();
+        assert_eq!(out.as_deref(), Some("/\\#a\n/\\!b\n/c\\*d\n"));
     }
 
     #[test]
