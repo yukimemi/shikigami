@@ -46,7 +46,7 @@ ansi-to-tui = "8.0.1"
 # 実質ドキュメント目的 (Builder::new_current_thread / block_on にしか
 # 使わない)。
 kaishin = "0.7.5"
-tokio = { version = "1.53.1", features = ["rt"] }
+tokio = { version = "1.53.2", features = ["rt"] }
 
 # commit ごとの `jj diff`/`jj show` 結果をディスクへ永続化するキャッシュ
 # (`src/cache.rs`) 用。jj の commit_id は content-addressed なので、一度
