@@ -59,7 +59,7 @@ pub const KEYS: &[(&str, &str)] = &[
         "jj rebase — selected onto the marked change (or a revset)",
     ),
     ("R", "cycle rebase mode: -r / -s / -b"),
-    ("L", "cycle pane layout: stacked / diff-below"),
+    ("L", "cycle pane layout: stacked / diff-below / vertical"),
     ("a", "jj abandon"),
     ("u / U", "jj undo / jj redo"),
     ("/", "set the log revset"),
@@ -98,7 +98,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// `log | (files - diff)` (右カラムを files/diff で縦分け)、
 /// `PaneLayout::DiffBelow` は `(log | files) - diff` (上段を log/files で
 /// 横分けし、diff は下段で全幅を使う — delta の side-by-side など幅が
-/// 要る diff フィルタ向け)。`diff_pane_width` もここを通すことで、実描画
+/// 要る diff フィルタ向け)、`PaneLayout::Vertical` は log / files / diff を
+/// 全幅で縦に積む (狭い端末向け。files は件数に追従しつつ高さの 1/3 まで)。
+/// `diff_pane_width` もここを通すことで、実描画
 /// 幅とフィルタへ渡す `COLUMNS` がずれない。
 fn split_panes(body: Rect, layout: PaneLayout, files_len: usize) -> (Rect, Rect, Rect) {
     match layout {
@@ -119,8 +121,21 @@ fn split_panes(body: Rect, layout: PaneLayout, files_len: usize) -> (Rect, Rect,
             let [top_area, diff_area] =
                 Layout::vertical([Constraint::Percentage(45), Constraint::Min(1)]).areas(body);
             let [log_area, files_area] =
-                Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .areas(top_area);
+            (log_area, files_area, diff_area)
+        }
+        PaneLayout::Vertical => {
+            // files は件数 + 枠 2 行、ただし高さの 1/3 を上限にして log/diff を潰さない。
+            let files_max = (body.height / 3).max(3);
+            let files_height = (files_len as u16).saturating_add(2).clamp(3, files_max);
+            let log_height = (body.height.saturating_sub(files_height) * 2 / 5).max(3);
+            let [log_area, files_area, diff_area] = Layout::vertical([
+                Constraint::Length(log_height),
+                Constraint::Length(files_height),
+                Constraint::Min(1),
+            ])
+            .areas(body);
             (log_area, files_area, diff_area)
         }
     }
@@ -508,6 +523,40 @@ mod tests {
         // diff-below gives it (nearly) the full width instead.
         assert_eq!(stacked, 58);
         assert_eq!(diff_below, 118);
+        assert_eq!(diff_pane_width(120, PaneLayout::Vertical), 118);
+    }
+
+    #[test]
+    fn diff_below_top_row_matches_the_stacked_files_width() {
+        let body = Rect::new(0, 0, 120, 40);
+        let (log, files, _) = split_panes(body, PaneLayout::DiffBelow, 3);
+        let (_, stacked_files, _) = split_panes(body, PaneLayout::Stacked, 3);
+        assert_eq!(log.width, files.width);
+        assert_eq!(files.width, stacked_files.width);
+    }
+
+    #[test]
+    fn vertical_layout_stacks_three_full_width_panes() {
+        let body = Rect::new(0, 0, 80, 45);
+        let (log, files, diff) = split_panes(body, PaneLayout::Vertical, 4);
+        for r in [log, files, diff] {
+            assert_eq!((r.x, r.width), (0, 80));
+        }
+        assert_eq!(files.height, 6); // 件数 + 枠
+        assert_eq!(log.y, 0);
+        assert_eq!(files.y, log.y + log.height);
+        assert_eq!(diff.y, files.y + files.height);
+        assert_eq!(diff.y + diff.height, 45);
+        assert!(log.height >= 3 && diff.height > files.height);
+    }
+
+    #[test]
+    fn vertical_layout_caps_files_at_a_third_and_keeps_minimums() {
+        let (log, files, diff) = split_panes(Rect::new(0, 0, 80, 45), PaneLayout::Vertical, 500);
+        assert_eq!(files.height, 15);
+        assert!(log.height >= 3 && diff.height >= 3);
+        let (log, files, _) = split_panes(Rect::new(0, 0, 80, 12), PaneLayout::Vertical, 500);
+        assert!(log.height >= 3 && files.height >= 3);
     }
 
     #[test]

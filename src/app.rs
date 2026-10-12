@@ -71,7 +71,7 @@ pub enum Focus {
     Diff,
 }
 
-/// pane の配置。`L` でトグルする。
+/// pane の配置。`L` で循環する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneLayout {
     /// 現状のデフォルト: `log | (files - diff)`。log が全高、右カラムを
@@ -81,6 +81,8 @@ pub enum PaneLayout {
     /// 下段で全幅を使う — delta の side-by-side など、幅が要る diff
     /// フィルタ向け。
     DiffBelow,
+    /// log / files / diff を全幅で縦に積む — 狭い端末向け。
+    Vertical,
 }
 
 impl PaneLayout {
@@ -88,13 +90,15 @@ impl PaneLayout {
         match self {
             PaneLayout::Stacked => "stacked",
             PaneLayout::DiffBelow => "diff-below",
+            PaneLayout::Vertical => "vertical",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
             PaneLayout::Stacked => PaneLayout::DiffBelow,
-            PaneLayout::DiffBelow => PaneLayout::Stacked,
+            PaneLayout::DiffBelow => PaneLayout::Vertical,
+            PaneLayout::Vertical => PaneLayout::Stacked,
         }
     }
 }
@@ -2083,6 +2087,9 @@ mod tests {
         app.handle_key(key(KeyCode::Char('L')));
         assert_eq!(app.layout, PaneLayout::DiffBelow);
         assert!(app.status.text.contains("diff-below"), "{:?}", app.status);
+        app.handle_key(key(KeyCode::Char('L')));
+        assert_eq!(app.layout, PaneLayout::Vertical);
+        assert!(app.status.text.contains("vertical"), "{:?}", app.status);
         app.handle_key(key(KeyCode::Char('L')));
         assert_eq!(app.layout, PaneLayout::Stacked);
         assert!(app.status.text.contains("stacked"), "{:?}", app.status);
