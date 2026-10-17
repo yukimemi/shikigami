@@ -24,7 +24,8 @@
 //!
 //! jj には index が無いので stage/unstage/discard に相当する操作は無く、
 //! files pane の「ファイル単位の操作」は restore (`r`) / absorb (`p`) /
-//! open (`o`) / untrack (`i`) の 4 つ。すべて [`FileSelection::targets`] を通る。
+//! open (`o`) / untrack (`i`) の 4 つ。files pane では [`FileSelection::targets`]、
+//! diff pane では表示中の 1 件だけを対象とする。
 
 use std::collections::BTreeSet;
 

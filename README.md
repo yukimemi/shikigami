@@ -88,10 +88,10 @@ alone.
 | Ctrl-g            | (in the `n`/`e`/`c` prompt) fill the message from the diff via AI |
 | `Space`           | (files pane) toggle a mark on the file under the cursor and move down — jumpy multi-select |
 | `V` / `v`         | (files pane) start / leave a contiguous visual range anchored at the cursor row |
-| `r`               | `jj restore` — discard the selected file(s)' change (files pane)|
-| `p`               | `jj absorb` — move the selected file(s)' change into ancestor commits (files pane) |
-| `i`               | add the selected file(s) to the repo's `.gitignore`, then `jj file untrack` (files pane, working copy only, asks first) |
-| `o`               | open the selected file(s) in `$EDITOR` (or `$VISUAL`) (files pane) |
+| `r`               | `jj restore` — discard the selected file(s)' change (files/diff panes)|
+| `p`               | `jj absorb` — move the selected file(s)' change into ancestor commits (files/diff panes) |
+| `i`               | add the selected file(s) to the repo's `.gitignore`, then `jj file untrack` (files/diff panes, working copy only, asks first) |
+| `o`               | open the selected file(s) in `$EDITOR` (or `$VISUAL`) (files/diff panes) |
 | `b`               | `jj bookmark set`                                             |
 | `m`               | mark the selected change as the squash / rebase target (`◆`)  |
 | `s`               | `jj squash` — selected change into the marked one             |
@@ -117,7 +117,7 @@ the current row; moving the cursor grows or shrinks the range, and `V` / `v` / `
 and the visual range coexist — the target set is their union. Marked rows show `●`, range rows have a
 blue background, the cursor row stays reversed, and the files title and the status bar show the count.
 
-Every file-targeted action (`r` restore, `p` absorb, `i` ignore + untrack, `o` open) applies to the whole target set, or to
+In the files pane, every file-targeted action (`r` restore, `p` absorb, `i` ignore + untrack, `o` open) applies to the whole target set, or to
 the file under the cursor when nothing is selected. Each runs as one `jj` call (so one `u` undoes a
 batch), and `r` asks once for the whole set ("restore 3 files …"). Files an action cannot handle are
 skipped and counted in the status line (`absorb` skips renames/copies; `open` skips deleted files when
@@ -125,6 +125,10 @@ several are selected). jj has no index, so there is no stage/unstage. The select
 action runs (a cancelled confirm keeps it), on `Esc`, and whenever the file list changes. The pane is
 a flat file list; if directory rows are ever added they are excluded from the selection rather than
 expanded.
+
+In the diff pane, `r`, `p`, `i`, and `o` act only on the displayed file, even while marks or a
+visual range remain in the files pane. Opening the editor or cancelling a confirmation preserves
+that selection; mutating actions clear it when executed. These keys are inactive in the log pane.
 
 ## AI-generated messages
 
@@ -181,7 +185,7 @@ setup carry straight through:
 
 ## Opening files in your editor
 
-Press `o` in the files pane to open the currently selected file in `$EDITOR` (falling back to
+Press `o` in the files or diff pane to open the currently selected file in `$EDITOR` (falling back to
 `$VISUAL` if `$EDITOR` is unset). shikigami leaves the alternate screen for the duration — so
 full-screen editors (`vim`, `nvim`, `emacs -nw`) work normally — and redraws once the editor exits.
 Renamed/copied files open their new path; if neither `$EDITOR` nor `$VISUAL` is set, `o` reports

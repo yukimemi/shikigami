@@ -28,20 +28,21 @@ pub const KEYS: &[(&str, &str)] = &[
     ),
     ("Ctrl-g (in n/e/c prompt)", "AI: fill message from the diff"),
     (
-        "r (files pane)",
-        "jj restore — discard the selected file(s)' change (one confirm)",
+        "r (files/diff)",
+        "jj restore — discard file changes (asks first)",
     ),
     (
-        "p (files pane)",
-        "jj absorb — move the selected file(s)' change into ancestor commits",
+        "p (files/diff)",
+        "jj absorb — move file changes into ancestors",
     ),
     (
-        "i (files pane)",
-        "ignore + untrack — add the selected file(s) to .gitignore, then jj file untrack (working copy only)",
+        "i (files/diff)",
+        "ignore + untrack (working copy; asks first)",
     ),
+    ("o (files/diff)", "open in $EDITOR / $VISUAL"),
     (
-        "o (files pane)",
-        "open the selected file(s) in $EDITOR (or $VISUAL)",
+        "file targets",
+        "files: selection; diff: displayed file; log: inactive",
     ),
     (
         "Space (files pane)",
@@ -298,6 +299,9 @@ fn draw_files(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         format!(" files ({}) ", app.files.len())
     };
+    if app.focus == Focus::Diff && count > 0 {
+        title.push_str("diff actions: displayed file only ");
+    }
     if sel.is_visual() {
         title.push_str("-- VISUAL -- ");
     }
@@ -657,6 +661,10 @@ mod tests {
         // 画面を十分大きくして全行出す。KEYS が増えたとき help の箱が
         // 足りなくなるのをここで検知する。
         let joined = render(&mut app, 120, KEYS.len() as u16 + 4).join("\n");
+        assert!(
+            joined.contains("files: selection; diff: displayed file; log: inactive"),
+            "file action scope is clipped: {joined}"
+        );
         for (keys, _) in KEYS {
             assert!(
                 joined.contains(keys.trim()),

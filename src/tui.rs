@@ -126,7 +126,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
                             Err(err) => Status::error(format!("{err:#}")),
                         };
                         // エディタでファイルが変わりうるので、一覧を取り直す。
-                        if let Err(err) = app.reload() {
+                        if let Err(err) = app.reload_after_editor() {
                             app.status = Status::error(format!("reload failed: {err}"));
                         }
                     }

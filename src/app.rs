@@ -633,6 +633,19 @@ impl App {
         Ok(())
     }
 
+    /// Preserve Diff's selection after the editor when the commit is unchanged.
+    pub fn reload_after_editor(&mut self) -> Result<()> {
+        let selection = self.file_selection.clone();
+        let commit = self.selected_change().map(|c| c.commit_id.clone());
+        self.reload()?;
+        if self.focus == Focus::Diff
+            && self.selected_change().map(|c| &c.commit_id) == commit.as_ref()
+        {
+            self.file_selection = selection;
+        }
+        Ok(())
+    }
+
     /// `jj log`/`jj status` の結果を反映する。同期 (`reload`) / 非同期
     /// (`begin_reload` → `poll_startup`) の両方から呼ばれる共通処理。
     fn apply_rows(&mut self, rows: Vec<Row>, working_copy: String) {
@@ -1224,10 +1237,18 @@ impl App {
             KeyCode::Char('b') => self.prompt_bookmark(),
             KeyCode::Char('a') => self.confirm_abandon(),
             KeyCode::Char('x') => self.confirm_rebase(),
-            KeyCode::Char('r') if self.focus == Focus::Files => self.confirm_restore_file(),
-            KeyCode::Char('p') if self.focus == Focus::Files => self.absorb_file(),
-            KeyCode::Char('i') if self.focus == Focus::Files => self.confirm_untrack_file(),
-            KeyCode::Char('o') if self.focus == Focus::Files => self.open_selected_file_in_editor(),
+            KeyCode::Char('r') if matches!(self.focus, Focus::Files | Focus::Diff) => {
+                self.confirm_restore_file()
+            }
+            KeyCode::Char('p') if matches!(self.focus, Focus::Files | Focus::Diff) => {
+                self.absorb_file()
+            }
+            KeyCode::Char('i') if matches!(self.focus, Focus::Files | Focus::Diff) => {
+                self.confirm_untrack_file()
+            }
+            KeyCode::Char('o') if matches!(self.focus, Focus::Files | Focus::Diff) => {
+                self.open_selected_file_in_editor()
+            }
             KeyCode::Char('u') => {
                 self.mode = Mode::Confirm(Confirm {
                     prompt: "undo the last jj operation?".into(),
@@ -1254,6 +1275,21 @@ impl App {
     fn file_targets(&self) -> Vec<usize> {
         self.file_selection
             .targets(self.file_selected, self.files.len())
+    }
+
+    /// Files uses the selection; Diff acts only on the displayed file.
+    fn action_file_targets(&self) -> Vec<usize> {
+        match self.focus {
+            Focus::Files => self.file_targets(),
+            Focus::Diff if self.selected_file().is_some() => vec![self.file_selected],
+            Focus::Diff | Focus::Log => Vec::new(),
+        }
+    }
+
+    fn clear_files_action_selection(&mut self) {
+        if self.focus == Focus::Files {
+            self.file_selection.clear();
+        }
     }
 
     /// `Space`: cursor 行の mark を反転して 1 行下へ。
@@ -1458,14 +1494,14 @@ impl App {
         });
     }
 
-    /// files pane で選択中のファイルについて、選択中 change での変更を
+    /// files pane の選択、または diff pane の表示中ファイルについて、変更を
     /// 破棄する確認ダイアログを開く。`jj restore --changes-in` は内容を
     /// 失う操作なので abandon と同様に確認を挟む。
     fn confirm_restore_file(&mut self) {
         let Some(change) = self.selected_change().cloned() else {
             return;
         };
-        let targets = self.file_targets();
+        let targets = self.action_file_targets();
         // 対象パスはここで固定する。承認後に cursor や選択を再評価しない。
         let plan = plan_restore(&self.files, &targets);
         if plan.count == 0 {
@@ -1492,13 +1528,13 @@ impl App {
         });
     }
 
-    /// files pane で選択中のファイルを `.gitignore` に入れて追跡を外す
+    /// files pane の選択、または diff pane の表示中ファイルの追跡を外す
     /// 確認ダイアログを開く。`jj file untrack` は作業コピーにしか効かない。
     fn confirm_untrack_file(&mut self) {
         let Some(change) = self.selected_change().cloned() else {
             return;
         };
-        let targets = self.file_targets();
+        let targets = self.action_file_targets();
         if targets.is_empty() {
             return;
         }
@@ -1528,7 +1564,7 @@ impl App {
         });
     }
 
-    /// files pane で選択中のファイルについて、選択中 change の変更を
+    /// files pane の選択、または diff pane の表示中ファイルの変更を
     /// 祖先の mutable な change へ分散させる (`jj absorb`)。内容は失わず
     /// 置き場所が変わるだけなので、他の非破壊操作 (edit/describe 等) と
     /// 同じく確認なしで即実行する。
@@ -1544,7 +1580,7 @@ impl App {
         let Some(change) = self.selected_change().cloned() else {
             return;
         };
-        let targets = self.file_targets();
+        let targets = self.action_file_targets();
         if targets.is_empty() {
             return;
         }
@@ -1560,7 +1596,7 @@ impl App {
                     plan.skipped
                 ),
             });
-            self.file_selection.clear();
+            self.clear_files_action_selection();
             return;
         }
         let result = self.jj.absorb_file(&change.id, &plan.paths);
@@ -1568,7 +1604,7 @@ impl App {
         self.report_batch("absorb", plan.count, plan.skipped, result);
     }
 
-    /// files pane の対象ファイル (複数選択があればその全部) を
+    /// files pane の選択、または diff pane の表示中ファイルを
     /// `EDITOR`/`VISUAL` で開くリクエストを
     /// 立てる。実際の子プロセス起動と端末の明け渡しは
     /// `tui::event_loop` が [`Self::take_pending_editor`] で拾って行う —
@@ -1579,7 +1615,7 @@ impl App {
     /// エディタは新規ファイルとして開く — それ自体は誤りではないので
     /// 特別扱いしない。
     fn open_selected_file_in_editor(&mut self) {
-        let targets = self.file_targets();
+        let targets = self.action_file_targets();
         if targets.is_empty() {
             return;
         }
@@ -1594,11 +1630,11 @@ impl App {
         let plan = plan_open(&self.files, &targets);
         if plan.paths.is_empty() {
             self.status = Status::error("open: no file on disk among the selection");
-            self.file_selection.clear();
+            self.clear_files_action_selection();
             return;
         }
         let root = self.jj.root().to_path_buf();
-        self.file_selection.clear();
+        self.clear_files_action_selection();
         self.pending_editor = Some(EditorRequest {
             editor,
             paths: plan.paths.iter().map(|p| root.join(p)).collect(),
@@ -1994,17 +2030,137 @@ mod tests {
     }
 
     #[test]
-    fn restore_and_absorb_keys_are_ignored_outside_files_focus() {
-        let (_tmp, mut app) = repo_or_skip!();
-        while app.selected_change().unwrap().description != "second change" {
-            app.handle_key(key(KeyCode::Char('j')));
+    fn diff_actions_ignore_marks_and_visual_ranges() {
+        for visual in [false, true] {
+            for action in ['o', 'r', 'i'] {
+                let Some((tmp, mut app)) = app_with_wc_files() else {
+                    report_skip();
+                    return;
+                };
+                app.editor_cmd = Some("true".into());
+                app.file_selection.toggle(0);
+                if visual {
+                    app.file_selection.start_visual(0);
+                } else {
+                    app.file_selection.toggle(2);
+                }
+                app.file_selected = 1;
+                app.sync_diff(80);
+                app.handle_key(key(KeyCode::Tab));
+                assert_eq!(app.focus, Focus::Diff);
+                let selection = app.file_selection.clone();
+                assert_eq!(app.action_file_targets(), vec![1]);
+                app.handle_key(key(KeyCode::Char(action)));
+                if action == 'o' {
+                    assert_eq!(
+                        app.take_pending_editor().unwrap().paths,
+                        vec![app.jj.root().join("y.txt")]
+                    );
+                    app.reload_after_editor().unwrap();
+                    app.sync_diff(80);
+                    assert_eq!(app.file_selection, selection);
+                    continue;
+                }
+                let Mode::Confirm(confirm) = &app.mode else {
+                    panic!("expected confirmation: {:?}", app.mode);
+                };
+                assert!(confirm.prompt.contains("y.txt"), "{}", confirm.prompt);
+                match &confirm.action {
+                    ConfirmAction::RestoreFile { paths, count, .. }
+                    | ConfirmAction::UntrackFile { paths, count, .. } => {
+                        assert_eq!(paths, &["y.txt"]);
+                        assert_eq!(*count, 1);
+                    }
+                    other => panic!("unexpected action: {other:?}"),
+                }
+                app.handle_key(key(KeyCode::Char('n')));
+                assert_eq!(app.file_selection, selection);
+                assert!(tmp.path().join("y.txt").exists());
+                app.handle_key(key(KeyCode::Char(action)));
+                // Confirmation keeps its original target even if the cursor changes.
+                app.file_selected = 2;
+                app.handle_key(key(KeyCode::Char('y')));
+                assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+                assert!(!app.file_selection.is_active());
+                if action == 'i' {
+                    assert_eq!(
+                        std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap(),
+                        "/y.txt\n"
+                    );
+                    assert!(tmp.path().join("y.txt").exists());
+                } else {
+                    assert!(!tmp.path().join("y.txt").exists());
+                }
+                app.sync_diff(80);
+                assert!(app.files.iter().any(|f| f.path == "x.txt"));
+                assert!(app.files.iter().any(|f| f.path == "z.txt"));
+                assert!(!app.files.iter().any(|f| f.path == "y.txt"));
+            }
         }
-        app.sync_diff(80);
-        assert_eq!(app.files.len(), 1, "{:?}", app.files);
+    }
 
-        // focus は既定で Log。files pane 向けのキーは効かないはず。
-        assert_eq!(app.focus, Focus::Log);
+    #[test]
+    fn diff_actions_with_no_displayed_file_preserve_selection() {
+        let (_tmp, mut app) = repo_or_skip!();
+        app.focus = Focus::Diff;
+        app.files.clear();
+        app.file_selection.toggle(0);
+        let selection = app.file_selection.clone();
+        let status = app.status.clone();
+        for action in ['o', 'i', 'r', 'p'] {
+            app.handle_key(key(KeyCode::Char(action)));
+            assert!(matches!(app.mode, Mode::Normal));
+            assert!(app.take_pending_editor().is_none());
+            assert_eq!(app.file_selection, selection);
+            assert_eq!(app.status, status);
+        }
+    }
+
+    #[test]
+    fn diff_ineligible_actions_preserve_selection() {
+        let Some((_tmp, mut app)) = app_with_wc_files() else {
+            report_skip();
+            return;
+        };
+        app.file_selection.toggle(0);
+        app.file_selected = 1;
+        app.focus = Focus::Diff;
+        app.files[1].status = 'R';
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.status.kind, StatusKind::Error);
+        assert!(app.status.text.contains("y.txt"));
+        assert!(app.file_selection.is_active());
+        app.files[1].status = 'D';
+        app.handle_key(key(KeyCode::Char('i')));
+        assert_eq!(app.status.kind, StatusKind::Error);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.file_selection.is_active());
+        let Row::Change { change, .. } = &mut app.rows[app.selected] else {
+            panic!("expected change");
+        };
+        change.is_working_copy = false;
+        app.files[1].status = 'M';
+        app.handle_key(key(KeyCode::Char('i')));
+        assert!(app.status.text.contains("working-copy"));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.file_selection.is_active());
+    }
+
+    #[test]
+    fn file_action_keys_are_ignored_in_log_focus() {
+        let Some((_tmp, mut app)) = app_with_wc_files() else {
+            report_skip();
+            return;
+        };
+        app.file_selection.toggle(0);
+        app.file_selection.start_visual(1);
+        app.file_selected = 2;
+        app.focus = Focus::Log;
+        let selection = app.file_selection.clone();
+        assert!(app.action_file_targets().is_empty());
         let status_before = app.status.clone();
+        app.handle_key(key(KeyCode::Char('i')));
+        assert!(matches!(app.mode, Mode::Normal), "{:?}", app.mode);
         app.handle_key(key(KeyCode::Char('r')));
         assert!(matches!(app.mode, Mode::Normal), "{:?}", app.mode);
         app.handle_key(key(KeyCode::Char('p')));
@@ -2013,6 +2169,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('o')));
         assert!(app.take_pending_editor().is_none());
         assert_eq!(app.status, status_before);
+        assert_eq!(app.file_selection, selection);
     }
 
     #[test]
@@ -2135,6 +2292,8 @@ mod tests {
         assert_eq!(app.files[0].path, "{old.rs => new.rs}");
 
         app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Diff);
         app.handle_key(key(KeyCode::Char('r')));
         let Mode::Confirm(confirm) = &app.mode else {
             panic!("expected confirm mode, got {:?}", app.mode);
@@ -2159,6 +2318,15 @@ mod tests {
 
     #[test]
     fn absorb_file_moves_the_change_into_its_mutable_ancestor() {
+        assert_absorb_targets(Focus::Files);
+    }
+
+    #[test]
+    fn diff_absorb_only_moves_the_displayed_file_with_multiple_selections() {
+        assert_absorb_targets(Focus::Diff);
+    }
+
+    fn assert_absorb_targets(focus: Focus) {
         if !jj_available() {
             report_skip();
             return;
@@ -2175,9 +2343,11 @@ mod tests {
         .unwrap();
         run(dir, &["git", "init"]);
         std::fs::write(dir.join("f.txt"), "line1\nline2\nline3\n").unwrap();
+        std::fs::write(dir.join("g.txt"), "other line\n").unwrap();
         run(dir, &["describe", "-m", "base"]);
         run(dir, &["new", "-m", "top"]);
         std::fs::write(dir.join("f.txt"), "line1\nline2-edited\nline3\n").unwrap();
+        std::fs::write(dir.join("g.txt"), "other line edited\n").unwrap();
         run(dir, &["config", "set", "--repo", "user.name", "test"]);
         run(
             dir,
@@ -2192,19 +2362,28 @@ mod tests {
             app.handle_key(key(KeyCode::Char('j')));
         }
         app.sync_diff(80);
-        assert_eq!(app.files.len(), 1, "{:?}", app.files);
+        assert_eq!(app.files.len(), 2, "{:?}", app.files);
         assert_eq!(app.files[0].path, "f.txt");
 
         app.handle_key(key(KeyCode::Tab));
+        app.file_selection.toggle(1);
+        app.file_selection.start_visual(1);
+        if focus == Focus::Diff {
+            app.handle_key(key(KeyCode::Tab));
+        }
+        assert_eq!(app.focus, focus);
         app.handle_key(key(KeyCode::Char('p')));
         assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
 
-        // "top" にはもう f.txt の変更が残っていない — 祖先 "base" に
-        // 吸収された。description が付いているので abandon はされず、
-        // change 自体は空のまま残る。
         assert_eq!(app.selected_change().unwrap().description, "top");
         app.sync_diff(80);
-        assert!(app.files.is_empty(), "{:?}", app.files);
+        if focus == Focus::Diff {
+            assert_eq!(app.files.len(), 1, "{:?}", app.files);
+            assert_eq!(app.files[0].path, "g.txt");
+        } else {
+            assert!(app.files.is_empty(), "{:?}", app.files);
+        }
+        assert!(!app.file_selection.is_active());
     }
 
     #[test]
