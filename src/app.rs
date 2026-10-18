@@ -481,14 +481,14 @@ impl App {
                 if files.is_empty() {
                     // 変更ファイルが無い commit (files pane が空になる
                     // ケース) は change 全体の diff だけ温めておく。
-                    if let Ok(diff_raw) = jj.diff(&rev, None) {
+                    if let Ok(diff_raw) = jj.diff(&rev, &[]) {
                         entry.diffs_raw.insert(None, diff_raw);
                     }
                 } else {
                     // files pane で選べる各ファイルぶんまとめて先読み。
                     // 上限を超えた分は今までどおり遅延取得 (`sync_diff`)。
                     for file in files.iter().take(DIFF_PREFETCH_FILES_PER_COMMIT) {
-                        if let Ok(diff_raw) = jj.diff(&rev, Some(&file.path)) {
+                        if let Ok(diff_raw) = jj.diff(&rev, &file.diff_paths()) {
                             entry.diffs_raw.insert(Some(file.path.clone()), diff_raw);
                         }
                     }
@@ -835,7 +835,13 @@ impl App {
                 Some(raw) => raw,
                 // 失敗はここでも同様にキャッシュしない (上の files/header
                 // と同じ理由)。
-                None => match self.jj.diff(&rev, path.as_deref()) {
+                None => match self.jj.diff(
+                    &rev,
+                    &self
+                        .selected_file()
+                        .map(DiffFile::diff_paths)
+                        .unwrap_or_default(),
+                ) {
                     Ok(raw) => {
                         if let Some(entry) = self.diff_cache.get_mut(&commit_id) {
                             entry.diffs_raw.insert(path.clone(), raw.clone());
@@ -2816,6 +2822,140 @@ mod tests {
         let second_text = text_of(&app);
         assert!(second_text.contains(&second_path));
         assert!(!second_text.contains(&first_path));
+    }
+
+    #[test]
+    fn selected_diffs_resolve_renames_and_literal_paths_in_every_cache_route() {
+        let (tmp, mut app) = repo_or_skip!();
+        let dir = tmp.path();
+        run(
+            dir,
+            &["config", "set", "--repo", "ui.diff-formatter", ":git"],
+        );
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/settings.json"), "rename payload\n").unwrap();
+        run(dir, &["new", "-m", "selected diffs"]);
+        std::fs::rename(
+            dir.join("nested/settings.json"),
+            dir.join("nested/settings.base.json"),
+        )
+        .unwrap();
+        let literal_paths = [
+            "(selected & ~other).txt",
+            "literal {braces}.txt",
+            "-leading.txt",
+            #[cfg(unix)]
+            "{literal => name}.txt",
+            #[cfg(unix)]
+            "glob:*.txt",
+            #[cfg(unix)]
+            "quote\"and\\slash.txt",
+        ];
+        for path in &literal_paths {
+            std::fs::write(dir.join(path), format!("payload for {path}\n")).unwrap();
+        }
+        std::fs::write(dir.join("unrelated.txt"), "unrelated payload\n").unwrap();
+        app.reload().unwrap();
+        app.wait_for_startup();
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(row,
+                    Row::Change { change, .. } if change.description == "selected diffs"
+                )
+            })
+            .unwrap();
+        let commit_id = app.selected_change().unwrap().commit_id.clone();
+        let files = app.jj.diff_summary("@").unwrap();
+        assert!(files.iter().any(|file| file.status == 'R'), "{files:?}");
+        let targets: Vec<_> = files
+            .iter()
+            .filter(|file| file.path != "unrelated.txt")
+            .cloned()
+            .collect();
+
+        // No commit cache, an existing entry without file diffs, then prefetch.
+        for route in 0..3 {
+            app.diff_cache.forget(&commit_id);
+            app.shown_commit = None;
+            app.shown_diff = None;
+            if route == 1 {
+                app.diff_cache.insert(
+                    commit_id.clone(),
+                    CommitCache::new(files.clone(), app.jj.show("@").unwrap()),
+                );
+            } else if route == 2 {
+                app.begin_diff_prefetch();
+                app.wait_for_startup();
+                let entry = app.diff_cache.get(&commit_id).unwrap();
+                for file in &targets {
+                    assert!(
+                        entry.diffs_raw.contains_key(&Some(file.path.clone())),
+                        "prefetch missed {}",
+                        file.path
+                    );
+                }
+            }
+            app.sync_diff(80);
+            for file in &targets {
+                app.file_selected = app.files.iter().position(|f| f == file).unwrap();
+                app.sync_diff(80);
+                let text = app
+                    .diff
+                    .lines
+                    .iter()
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    text.contains("diff --git"),
+                    "configured formatter missing, route {route}: {text}"
+                );
+                assert!(!text.contains("unrelated payload"), "route {route}: {text}");
+                assert!(!text.contains("unrelated.txt"), "route {route}: {text}");
+                if file.status == 'R' {
+                    assert!(
+                        text.contains("rename from nested/settings.json"),
+                        "route {route}: {text}"
+                    );
+                    assert!(
+                        text.contains("rename to nested/settings.base.json"),
+                        "route {route}: {text}"
+                    );
+                } else {
+                    assert!(text.contains("payload for"), "route {route}: {text}");
+                    assert!(!text.contains("rename from"), "route {route}: {text}");
+                }
+            }
+        }
+        // Changing the configured formatter also applies to a fresh selected diff.
+        run(
+            dir,
+            &[
+                "config",
+                "set",
+                "--repo",
+                "ui.diff-formatter",
+                ":color-words",
+            ],
+        );
+        let raw = app.jj.diff("@", &["unrelated.txt".to_owned()]).unwrap();
+        assert!(!raw.contains("diff --git"), "{raw}");
+        assert!(raw.contains("unrelated payload"), "{raw}");
+        let whole = app.jj.diff("@", &[]).unwrap();
+        assert!(whole.contains("unrelated payload"));
+        assert!(whole.contains("payload for"));
+
+        // Reusing the old name must not leak its replacement into the new file's diff.
+        std::fs::write(dir.join("nested/settings.json"), "replacement payload\n").unwrap();
+        let files = app.jj.diff_summary("@").unwrap();
+        let selected = files
+            .iter()
+            .find(|file| file.target_path() == "nested/settings.base.json")
+            .unwrap();
+        let raw = app.jj.diff("@", &selected.diff_paths()).unwrap();
+        assert!(!raw.contains("replacement payload"), "{selected:?}: {raw}");
     }
 
     #[test]

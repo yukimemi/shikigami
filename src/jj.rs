@@ -66,10 +66,23 @@ impl DiffFile {
     ///
     /// リネーム/コピーは現在その change に存在する新パス側を返す。
     pub fn target_path(&self) -> String {
-        match split_rename(&self.path) {
+        match self.rename_paths() {
             Some((_old, new)) => new,
             None => self.path.clone(),
         }
+    }
+
+    fn rename_paths(&self) -> Option<(String, String)> {
+        if matches!(self.status, 'R' | 'C') {
+            split_rename(&self.path)
+        } else {
+            None
+        }
+    }
+
+    /// diff の対象となる実パス。削除側も含めてリネームを表示する。
+    pub fn diff_paths(&self) -> Vec<String> {
+        self.restore_paths()
     }
 
     /// `jj restore --changes-in` に渡すファイルセット。
@@ -79,7 +92,7 @@ impl DiffFile {
     /// は旧パスの `D` を表示する)。旧/新パス両方を渡せば `jj restore` が
     /// リネームごと元に戻す。
     pub fn restore_paths(&self) -> Vec<String> {
-        match split_rename(&self.path) {
+        match self.rename_paths() {
             Some((old, new)) => vec![old, new],
             None => vec![self.path.clone()],
         }
@@ -97,8 +110,9 @@ impl DiffFile {
 /// `"sub\{a.rs"` / `"b.rs}"` になってしまい、どちらも実在しないパスに
 /// なる)。
 fn split_rename(path: &str) -> Option<(String, String)> {
-    let start = path.find('{')?;
-    let end = start + path[start..].find('}')?;
+    let separator = path.find(" => ")?;
+    let start = path[..separator].rfind('{')?;
+    let end = separator + path[separator..].find('}')?;
     let (old_mid, new_mid) = path[start + 1..end].split_once(" => ")?;
     let prefix = &path[..start];
     let suffix = &path[end + 1..];
@@ -106,6 +120,21 @@ fn split_rename(path: &str) -> Option<(String, String)> {
         format!("{prefix}{old_mid}{suffix}"),
         format!("{prefix}{new_mid}{suffix}"),
     ))
+}
+
+/// リポジトリ相対パスを fileset のリテラルとして渡す。
+fn literal_fileset(path: &str) -> String {
+    // Windows の jj だけが `\` を区切りとして出す。Unix では
+    // ファイル名の一部なので、fileset 文字列内でエスケープする。
+    let path = if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path.to_owned()
+    };
+    format!(
+        "root:\"{}\"",
+        path.replace('\\', "\\\\").replace('"', "\\\"")
+    )
 }
 
 /// log に出てくる 1 change。
@@ -292,13 +321,11 @@ impl Jj {
     /// `:color-words` / difftastic のような外部ツール) にそのまま従う。
     /// これにより shikigami は「シェルで見えるのと同じ見た目」という
     /// README の設計方針を、diff-formatter を自前で選んだ場合にも保つ。
-    /// `path` を渡すと、その 1 ファイル分だけに絞った diff になる
-    /// (jj のファイルセット引数をそのまま流す)。
-    pub fn diff(&self, rev: &str, path: Option<&str>) -> Result<String> {
-        let mut args = vec!["diff", "-r", rev];
-        if let Some(path) = path {
-            args.push(path);
-        }
+    /// `paths` の実パスだけに絞る。空なら change 全体を表示する。
+    pub fn diff(&self, rev: &str, paths: &[String]) -> Result<String> {
+        let filesets: Vec<String> = paths.iter().map(|path| literal_fileset(path)).collect();
+        let mut args = vec!["diff", "-r", rev, "--"];
+        args.extend(filesets.iter().map(String::as_str));
         self.exec(&["--no-pager", "--color", "always"], &args)
     }
 
@@ -411,19 +438,7 @@ impl Jj {
     /// 空白や括弧を含むパスで fileset のパースが壊れないよう、他の
     /// restore/absorb と違い `root:"…"` のリテラル指定に包む。
     pub fn file_untrack(&self, paths: &[String]) -> Result<String> {
-        let filesets: Vec<String> = paths
-            .iter()
-            .map(|p| {
-                // Windows の jj だけが `\` を区切りとして出す。Unix では
-                // ファイル名の一部なので、fileset 文字列内でエスケープする。
-                let p = if cfg!(windows) {
-                    p.replace('\\', "/")
-                } else {
-                    p.clone()
-                };
-                format!("root:\"{}\"", p.replace('\\', "\\\\").replace('"', "\\\""))
-            })
-            .collect();
+        let filesets: Vec<String> = paths.iter().map(|path| literal_fileset(path)).collect();
         let mut args = vec!["file", "untrack"];
         args.extend(filesets.iter().map(String::as_str));
         self.write(&args)
@@ -733,6 +748,66 @@ mod tests {
             .restore_paths(),
             vec!["sub/a.rs", "sub/b.rs"]
         );
+    }
+
+    #[test]
+    fn diff_paths_expand_compressed_renames_and_copies() {
+        for (display, old, new) in [
+            (
+                "home/.gemini/antigravity-cli/{settings.json => settings.base.json}",
+                "home/.gemini/antigravity-cli/settings.json",
+                "home/.gemini/antigravity-cli/settings.base.json",
+            ),
+            ("{old => new}/file.rs", "old/file.rs", "new/file.rs"),
+            ("src/{old => new}.rs", "src/old.rs", "src/new.rs"),
+            (
+                "src/{ => nested/}file.rs",
+                "src/file.rs",
+                "src/nested/file.rs",
+            ),
+            (
+                "src/{nested/ => }file.rs",
+                "src/nested/file.rs",
+                "src/file.rs",
+            ),
+            (
+                "{literal}/src/{a => b}.rs",
+                "{literal}/src/a.rs",
+                "{literal}/src/b.rs",
+            ),
+            ("{a => b}", "a", "b"),
+        ] {
+            for status in ['R', 'C'] {
+                let file = DiffFile {
+                    status,
+                    path: display.to_owned(),
+                };
+                assert_eq!(file.diff_paths(), [old, new], "{display}");
+                assert_eq!(file.target_path(), new, "{display}");
+            }
+        }
+        for status in ['M', 'A', 'D'] {
+            let path = "literal/{old => new}.rs";
+            let file = DiffFile {
+                status,
+                path: path.to_owned(),
+            };
+            assert_eq!(file.diff_paths(), [path]);
+            assert_eq!(file.target_path(), path);
+        }
+    }
+
+    #[test]
+    fn literal_filesets_quote_operators_and_escape_strings() {
+        for path in ["a b", "(a|b)&~c", "glob:*.rs", "{a => b}", "-option"] {
+            assert_eq!(literal_fileset(path), format!("root:\"{path}\""));
+        }
+        assert_eq!(literal_fileset("a\"b"), r#"root:"a\"b""#);
+        if cfg!(windows) {
+            assert_eq!(literal_fileset(r"dir\file"), r#"root:"dir/file""#);
+        } else {
+            assert_eq!(literal_fileset(r"dir\file"), r#"root:"dir\\file""#);
+        }
     }
 
     #[test]
