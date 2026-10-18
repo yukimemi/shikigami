@@ -390,8 +390,9 @@ impl Jj {
     /// `path` について、選択中 change (`rev`) に対する変更だけを取り消す。
     /// files pane での「このファイルの変更を破棄する」に対応する。
     pub fn restore_file(&self, rev: &str, paths: &[String]) -> Result<String> {
+        let filesets = root_filesets(paths);
         let mut args = vec!["restore", "--changes-in", rev];
-        args.extend(paths.iter().map(String::as_str));
+        args.extend(filesets.iter().map(String::as_str));
         self.write(&args)
     }
 
@@ -399,21 +400,16 @@ impl Jj {
     /// 分散させる (`jj absorb`)。files pane での「このファイルの変更を
     /// 適切な commit に配る」に対応する。
     pub fn absorb_file(&self, rev: &str, paths: &[String]) -> Result<String> {
+        let filesets = root_filesets(paths);
         let mut args = vec!["absorb", "--from", rev];
-        args.extend(paths.iter().map(String::as_str));
+        args.extend(filesets.iter().map(String::as_str));
         self.write(&args)
     }
 
     /// 作業コピーでの追跡を外す (`jj file untrack`)。呼び出し側は先に
     /// `.gitignore` へ追記しておくこと (jj は ignore 済みでないパスを拒否する)。
-    ///
-    /// 空白や括弧を含むパスで fileset のパースが壊れないよう、他の
-    /// restore/absorb と違い `root:"…"` のリテラル指定に包む。
     pub fn file_untrack(&self, paths: &[String]) -> Result<String> {
-        let filesets: Vec<String> = paths
-            .iter()
-            .map(|path| literal_fileset(path, "root"))
-            .collect();
+        let filesets = root_filesets(paths);
         let mut args = vec!["file", "untrack"];
         args.extend(filesets.iter().map(String::as_str));
         self.write(&args)
@@ -533,6 +529,17 @@ fn parse_change(data: &str) -> Option<Change> {
             .collect(),
         description,
     })
+}
+
+/// パスを `root:"…"` のリテラル fileset に包む。`jj` のコマンドライン引数は
+/// fileset として解釈されるので、素のパスだと `%` / 空白 / 括弧などを含む
+/// ファイル名 (例: `token%3Adefault%3Aa@b.com`) で構文エラーになる。
+/// `root:` は cwd にも依存しない。
+fn root_filesets(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| literal_fileset(path, "root"))
+        .collect()
 }
 
 #[cfg(test)]
