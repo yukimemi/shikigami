@@ -1182,6 +1182,8 @@ impl App {
             KeyCode::Char('u') if ctrl => self.step(-(PAGE as isize)),
             KeyCode::Char('j') | KeyCode::Down => self.step(1),
             KeyCode::Char('k') | KeyCode::Up => self.step(-1),
+            KeyCode::Char(']') if self.focus == Focus::Diff => self.move_file_selection(1),
+            KeyCode::Char('[') if self.focus == Focus::Diff => self.move_file_selection(-1),
             KeyCode::Char('g') | KeyCode::Home => match self.focus {
                 Focus::Log => self.select_first(),
                 Focus::Files => self.select_first_file(),
@@ -1959,6 +1961,93 @@ mod tests {
     }
 
     #[test]
+    fn diff_file_navigation_updates_diff_and_preserves_selection() {
+        let Some((_tmp, mut app)) = app_with_wc_files() else {
+            report_skip();
+            return;
+        };
+        app.file_selection.toggle(2);
+        app.file_selection.start_visual(0);
+        let selection = app.file_selection.clone();
+        app.handle_key(key(KeyCode::Tab));
+        for (c, index, path) in [
+            (']', 1, "y.txt"),
+            (']', 2, "z.txt"),
+            ('[', 1, "y.txt"),
+            ('[', 0, "x.txt"),
+        ] {
+            app.diff_scroll = 7;
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT));
+            assert_eq!(app.file_selected, index);
+            assert_eq!(app.focus, Focus::Diff);
+            app.sync_diff(80);
+            assert_eq!(app.diff_scroll, 0);
+            assert_eq!(app.shown_diff.as_ref().unwrap().1.as_deref(), Some(path));
+            assert!(app.diff.to_string().contains(path));
+            assert_eq!(app.file_selection, selection);
+            assert_eq!(
+                app.file_targets(),
+                (0..3).filter(|&i| i <= index || i == 2).collect::<Vec<_>>()
+            );
+            assert_eq!(app.action_file_targets(), vec![index]);
+        }
+        // A blocked move must not reset the reading position on the next draw.
+        for (index, c) in [(0, '['), (2, ']')] {
+            app.file_selected = index;
+            app.sync_diff(80);
+            app.diff_scroll = 7;
+            app.handle_key(key(KeyCode::Char(c)));
+            app.sync_diff(80);
+            assert_eq!(app.file_selected, index);
+            assert_eq!(app.diff_scroll, 7);
+            assert_eq!(app.focus, Focus::Diff);
+        }
+        app.files.clear();
+        app.file_selected = 0;
+        for c in ['[', ']'] {
+            app.handle_key(key(KeyCode::Char(c)));
+            assert_eq!(app.file_selected, 0);
+            assert_eq!(app.focus, Focus::Diff);
+        }
+    }
+
+    #[test]
+    fn diff_file_navigation_is_inactive_in_other_panes_and_prompts() {
+        let Some((_tmp, mut app)) = app_with_wc_files() else {
+            report_skip();
+            return;
+        };
+        app.file_selected = 1;
+        let selected = app.selected;
+        for focus in [Focus::Files, Focus::Log] {
+            app.focus = focus;
+            for c in ['[', ']'] {
+                app.handle_key(key(KeyCode::Char(c)));
+                assert_eq!(app.file_selected, 1);
+                assert_eq!(app.selected, selected);
+                assert_eq!(app.focus, focus);
+            }
+        }
+        app.focus = Focus::Diff;
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in ['[', ']'] {
+            app.handle_key(key(KeyCode::Char(c)));
+            assert_eq!(app.file_selected, 1);
+        }
+        let Mode::Input(input) = &app.mode else {
+            panic!("expected input mode");
+        };
+        assert!(input.value.ends_with("[]"));
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('r')));
+        assert!(matches!(app.mode, Mode::Confirm(_)));
+        app.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(app.file_selected, 1);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.status.text, "cancelled");
+    }
+
+    #[test]
     fn space_marks_and_moves_down_and_v_extends_a_range() {
         let Some((_tmp, mut app)) = app_with_wc_files() else {
             report_skip();
@@ -2044,9 +2133,9 @@ mod tests {
                 } else {
                     app.file_selection.toggle(2);
                 }
-                app.file_selected = 1;
-                app.sync_diff(80);
                 app.handle_key(key(KeyCode::Tab));
+                app.handle_key(key(KeyCode::Char(']')));
+                app.sync_diff(80);
                 assert_eq!(app.focus, Focus::Diff);
                 let selection = app.file_selection.clone();
                 assert_eq!(app.action_file_targets(), vec![1]);

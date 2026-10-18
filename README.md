@@ -78,6 +78,7 @@ alone.
 | Key               | Action                                                        |
 | ----------------- | ------------------------------------------------------------- |
 | `j` / `k`         | move (log pane), select a file (files pane), or scroll (diff pane) |
+| `]` / `[`         | next / previous file (diff pane only; keeps focus and stops at the first / last file) |
 | `g` / `G`         | first / last (in whichever pane has focus)                    |
 | `Ctrl-d`/`Ctrl-u` | half-page move                                                |
 | `Tab` / `Shift-Tab` | cycle focus: log → files → diff (`Shift-Tab` reverses)   |
@@ -129,6 +130,9 @@ expanded.
 In the diff pane, `r`, `p`, `i`, and `o` act only on the displayed file, even while marks or a
 visual range remain in the files pane. Opening the editor or cancelling a confirmation preserves
 that selection; mutating actions clear it when executed. These keys are inactive in the log pane.
+
+`[` and `]` navigate to the previous and next file directly from the diff pane.
+Navigation stops at the first or last file without wrapping.
 
 ## AI-generated messages
 
@@ -214,6 +218,7 @@ which is about jj's own *implicit* editor invocation (`ui.editor`), always block
 - **Files pane, one file at a time.** The right column is split into a file list
   (`jj diff --summary`) above the diff. The diff pane only ever shows the file currently selected
   there — like lazygit — instead of the whole change's diff scrolling past all at once.
+  Use `[` / `]` in the diff pane to select the previous / next file.
 
 ## Caching
 
