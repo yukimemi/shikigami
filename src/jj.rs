@@ -99,6 +99,22 @@ impl DiffFile {
     }
 }
 
+fn assemble_rename_path(prefix: &str, middle: &str, suffix: &str) -> String {
+    // 空の側では、圧縮表記の境界に残る余分な区切りだけを取り除く。
+    if middle.is_empty() {
+        if prefix.ends_with('/') && suffix.starts_with('/') {
+            return format!("{}{}", prefix, &suffix[1..]);
+        }
+        if prefix.is_empty() && suffix.starts_with('/') {
+            return suffix[1..].to_owned();
+        }
+        if suffix.is_empty() && prefix.ends_with('/') {
+            return prefix[..prefix.len() - 1].to_owned();
+        }
+    }
+    format!("{prefix}{middle}{suffix}")
+}
+
 /// `jj diff --summary` のリネーム表記 (`prefix{old => new}suffix`) から
 /// 旧パス・新パスのフルパスを組み立てる。
 ///
@@ -117,8 +133,8 @@ fn split_rename(path: &str) -> Option<(String, String)> {
     let prefix = &path[..start];
     let suffix = &path[end + 1..];
     Some((
-        format!("{prefix}{old_mid}{suffix}"),
-        format!("{prefix}{new_mid}{suffix}"),
+        assemble_rename_path(prefix, old_mid, suffix),
+        assemble_rename_path(prefix, new_mid, suffix),
     ))
 }
 
@@ -760,6 +776,14 @@ mod tests {
             ),
             ("{old => new}/file.rs", "old/file.rs", "new/file.rs"),
             ("src/{old => new}.rs", "src/old.rs", "src/new.rs"),
+            ("dir/{sub => }/file.txt", "dir/sub/file.txt", "dir/file.txt"),
+            ("dir/{ => sub}/file.txt", "dir/file.txt", "dir/sub/file.txt"),
+            ("{sub => }/file.txt", "sub/file.txt", "file.txt"),
+            ("{ => sub}/file.txt", "file.txt", "sub/file.txt"),
+            ("dir/{sub => }", "dir/sub", "dir"),
+            ("dir/{ => sub}", "dir", "dir/sub"),
+            ("{old => }file.txt", "oldfile.txt", "file.txt"),
+            ("{ => new}file.txt", "file.txt", "newfile.txt"),
             (
                 "src/{ => nested/}file.rs",
                 "src/file.rs",
