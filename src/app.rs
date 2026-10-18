@@ -2963,7 +2963,7 @@ mod tests {
         let files = app.jj.diff_summary("@").unwrap();
         let selected = files
             .iter()
-            .find(|file| file.target_path() == "nested/settings.base.json")
+            .find(|file| dir.join(file.target_path()) == dir.join("nested/settings.base.json"))
             .unwrap();
         let raw = app.jj.diff("@", &selected.diff_paths()).unwrap();
         assert!(!raw.contains("replacement payload"), "{selected:?}: {raw}");
