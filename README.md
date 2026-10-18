@@ -78,6 +78,7 @@ alone.
 | Key               | Action                                                        |
 | ----------------- | ------------------------------------------------------------- |
 | `j` / `k`         | move (log pane), select a file (files pane), or scroll (diff pane) |
+| `]` / `[`         | next / previous file (diff pane only; keeps focus and stops at the first / last file) |
 | `g` / `G`         | first / last (in whichever pane has focus)                    |
 | `Ctrl-d`/`Ctrl-u` | half-page move                                                |
 | `Tab` / `Shift-Tab` | cycle focus: log → files → diff (`Shift-Tab` reverses)   |

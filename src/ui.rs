@@ -13,6 +13,10 @@ use crate::jj::{DiffFile, Row};
 /// README / vimdoc はここを参照する形にしてある。
 pub const KEYS: &[(&str, &str)] = &[
     ("j / k, ↓ / ↑", "move (log) or scroll (diff)"),
+    (
+        "] / [ (diff pane)",
+        "next / previous file (keeps focus; stops at first / last)",
+    ),
     ("g / G", "first / last"),
     ("Ctrl-d / Ctrl-u", "half-page move"),
     (
