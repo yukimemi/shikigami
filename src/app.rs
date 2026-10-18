@@ -2832,13 +2832,13 @@ mod tests {
             dir,
             &["config", "set", "--repo", "ui.diff-formatter", ":git"],
         );
-        std::fs::create_dir_all(dir.join("nested")).unwrap();
-        std::fs::write(dir.join("nested/settings{brace.json"), "rename payload\n").unwrap();
+        std::fs::create_dir_all(dir.join("nested/old")).unwrap();
+        std::fs::write(dir.join("nested/old/{brace.json"), "rename payload\n").unwrap();
         std::fs::write(dir.join("nested/moved.txt"), "move payload\n").unwrap();
         run(dir, &["new", "-m", "selected diffs"]);
         std::fs::rename(dir.join("nested/moved.txt"), dir.join("moved.txt")).unwrap();
         std::fs::rename(
-            dir.join("nested/settings{brace.json"),
+            dir.join("nested/old/{brace.json"),
             dir.join("nested/settings.base.json"),
         )
         .unwrap();
@@ -2927,7 +2927,7 @@ mod tests {
                     );
                 } else if file.status == 'R' {
                     assert!(
-                        text.contains("rename from nested/settings{brace.json"),
+                        text.contains("rename from nested/old/{brace.json"),
                         "route {route}: {text}"
                     );
                     assert!(
@@ -2959,11 +2959,7 @@ mod tests {
         assert!(whole.contains("payload for"));
 
         // Reusing the old name must not leak its replacement into the new file's diff.
-        std::fs::write(
-            dir.join("nested/settings{brace.json"),
-            "replacement payload\n",
-        )
-        .unwrap();
+        std::fs::write(dir.join("nested/old/{brace.json"), "replacement payload\n").unwrap();
         let files = app.jj.diff_summary("@").unwrap();
         let selected = files
             .iter()

@@ -128,13 +128,27 @@ fn assemble_rename_path(prefix: &str, middle: &str, suffix: &str) -> String {
 /// なる)。
 fn split_rename(path: &str) -> Option<(String, String)> {
     let separator = path.find(" => ")?;
-    // jj の圧縮表記はパス要素の境界から始まる。旧名の途中にある
-    // `{` を選ぶと、共通プレフィックスとして誤って両パスへ混入する。
-    let start = path[..separator]
-        .rmatch_indices('{')
-        .find_map(|(index, _)| {
-            (index == 0 || path[..index].ends_with(std::path::is_separator)).then_some(index)
-        })?;
+    // 共通プレフィックスの閉じた `{...}` を除き、残る一番外側の
+    // 開き括弧を使う。旧名の要素先頭の `{` も内側なので選ばない。
+    let mut openings = Vec::new();
+    for (index, ch) in path[..separator].char_indices() {
+        match ch {
+            '{' => openings.push(index),
+            '}' => {
+                openings.pop();
+            }
+            _ => {}
+        }
+    }
+    let at_boundary =
+        |index: &usize| *index == 0 || path[..*index].ends_with(std::path::is_separator);
+    let start = openings.into_iter().find(at_boundary).or_else(|| {
+        // 旧名内の単独の `}` で外側まで閉じた場合は、従来の境界探索を使う。
+        path[..separator]
+            .rmatch_indices('{')
+            .map(|(index, _)| index)
+            .find(at_boundary)
+    })?;
     let end = separator + path[separator..].find('}')?;
     let (old_mid, new_mid) = path[start + 1..end].split_once(" => ")?;
     let prefix = &path[..start];
@@ -808,6 +822,20 @@ mod tests {
             ),
             ("{a => b}", "a", "b"),
             ("{old{brace.txt => new.txt}", "old{brace.txt", "new.txt"),
+            ("{old/{brace.txt => new.txt}", "old/{brace.txt", "new.txt"),
+            ("{old}brace.txt => new.txt}", "old}brace.txt", "new.txt"),
+            (
+                "{literal}/src/{old}brace.txt => new.txt}",
+                "{literal}/src/old}brace.txt",
+                "{literal}/src/new.txt",
+            ),
+            ("{old{brace}.txt => new.txt}", "old{brace}.txt", "new.txt"),
+            ("{{brace.txt => new.txt}", "{brace.txt", "new.txt"),
+            (
+                "{literal}/src/{old/{brace.txt => new.txt}",
+                "{literal}/src/old/{brace.txt",
+                "{literal}/src/new.txt",
+            ),
             (
                 "nested/{old{brace.txt => new.txt}",
                 "nested/old{brace.txt",
@@ -844,6 +872,12 @@ mod tests {
     fn windows_rename_paths_remove_only_redundant_separators() {
         for (display, old, new) in [
             (r"{sub => }\file.txt", r"sub\file.txt", "file.txt"),
+            (r"{old\{brace.txt => new.txt}", r"old\{brace.txt", "new.txt"),
+            (
+                r"{literal}\src\{old\{brace.txt => new.txt}",
+                r"{literal}\src\old\{brace.txt",
+                r"{literal}\src\new.txt",
+            ),
             (r"{ => sub}\file.txt", "file.txt", r"sub\file.txt"),
             (
                 r"dir\{sub => }\file.txt",
