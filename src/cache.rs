@@ -31,11 +31,11 @@ const CAP: usize = 300;
 /// 1 commit 分の `jj` 生出力。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitCache {
-    /// `jj diff --summary` の結果。
+    /// jj のファイル情報 (表示文字列と実パス)。
     pub files: Vec<DiffFile>,
     /// `jj show --no-patch --color always` の生出力 (ANSI 込み)。
     pub header_raw: String,
-    /// 選択ファイルパス (`None` は change 全体) ごとの `jj diff --color
+    /// 選択ファイルの実パス (`None` は change 全体) ごとの `jj diff --color
     /// always` 生出力。
     ///
     /// JSON のオブジェクトキーは文字列でなければならず、serde_json は
@@ -146,6 +146,8 @@ impl DiffStore {
         let Ok(bytes) = std::fs::read(&path) else {
             return store;
         };
+        // 実パスを持たない旧形式も拒否する。表示から推測した差分の
+        // キャッシュを使うと、曖昧なリネームの誤表示が残ってしまう。
         let Ok(entries) = serde_json::from_slice::<Vec<(String, CommitCache)>>(&bytes) else {
             return store;
         };
@@ -221,6 +223,29 @@ mod tests {
     }
 
     #[test]
+    fn legacy_display_only_cache_is_rejected_and_structured_paths_round_trip() {
+        let legacy = r#"[["commit",{"files":[{"status":"R","path":"{literal => dir}/{a => b}"}],"header_raw":"","diffs_raw":[]}]]"#;
+        assert!(serde_json::from_str::<Vec<(String, CommitCache)>>(legacy).is_err());
+
+        let entry = CommitCache::new(
+            vec![DiffFile {
+                status: 'R',
+                path: "{literal => dir}/{a => b}".to_owned(),
+                source_path: "{literal => dir}/a".to_owned(),
+                destination_path: "{literal => dir}/b".to_owned(),
+            }],
+            String::new(),
+        );
+        let bytes = serde_json::to_vec(&entry).unwrap();
+        let restored: CommitCache = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.files, entry.files);
+        assert_eq!(
+            restored.files[0].diff_paths(),
+            ["{literal => dir}/a", "{literal => dir}/b"]
+        );
+    }
+
+    #[test]
     fn save_then_load_round_trips_entries_and_lru_order() {
         let tmp = tempfile::tempdir().unwrap();
         // SHIKIGAMI_CACHE_DIR で dirs::cache_dir() を経由せず temp dir を
@@ -241,6 +266,8 @@ mod tests {
             vec![DiffFile {
                 status: 'M',
                 path: "a.txt".to_string(),
+                source_path: "a.txt".to_string(),
+                destination_path: "a.txt".to_string(),
             }],
             "header\n".to_string(),
         );

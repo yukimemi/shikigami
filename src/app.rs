@@ -489,7 +489,7 @@ impl App {
                     // 上限を超えた分は今までどおり遅延取得 (`sync_diff`)。
                     for file in files.iter().take(DIFF_PREFETCH_FILES_PER_COMMIT) {
                         if let Ok(diff_raw) = jj.diff(&rev, &file.diff_paths()) {
-                            entry.diffs_raw.insert(Some(file.path.clone()), diff_raw);
+                            entry.diffs_raw.insert(Some(file.target_path()), diff_raw);
                         }
                     }
                 }
@@ -817,7 +817,8 @@ impl App {
             self.shown_commit = Some(commit_id.clone());
         }
 
-        let path = self.selected_file().map(|f| f.path.clone());
+        // 同じ表示になるリネームも、実パスでキャッシュと選択を区別する。
+        let path = self.selected_file().map(DiffFile::target_path);
         let key = (commit_id.clone(), path.clone());
         let selection_changed = self.shown_diff.as_ref() != Some(&key);
         // フィルタ設定時は選択が同じでも、リサイズで幅が変わったら
@@ -2838,6 +2839,19 @@ mod tests {
         #[cfg(unix)]
         {
             std::fs::create_dir_all(dir.join("literal => dir")).unwrap();
+            std::fs::create_dir_all(dir.join("{literal => dir}")).unwrap();
+            std::fs::create_dir_all(dir.join("literal")).unwrap();
+            std::fs::create_dir_all(dir.join("dir")).unwrap();
+            std::fs::write(
+                dir.join("{literal => dir}/a.txt"),
+                "braced directory rename\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("literal/{a.txt => b.txt}"),
+                "braced filename rename\n",
+            )
+            .unwrap();
             std::fs::write(
                 dir.join("literal => dir/a.txt"),
                 "arrow directory payload\n",
@@ -2851,6 +2865,19 @@ mod tests {
             dir.join("literal => dir/b.txt"),
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::rename(
+                dir.join("{literal => dir}/a.txt"),
+                dir.join("{literal => dir}/b.txt"),
+            )
+            .unwrap();
+            std::fs::rename(
+                dir.join("literal/{a.txt => b.txt}"),
+                dir.join("dir/{a.txt => b.txt}"),
+            )
+            .unwrap();
+        }
         std::fs::rename(dir.join("nested/moved.txt"), dir.join("moved.txt")).unwrap();
         std::fs::rename(
             dir.join("nested/old/{brace.json"),
@@ -2886,6 +2913,22 @@ mod tests {
         let commit_id = app.selected_change().unwrap().commit_id.clone();
         let files = app.jj.diff_summary("@").unwrap();
         assert!(files.iter().any(|file| file.status == 'R'), "{files:?}");
+        #[cfg(unix)]
+        {
+            let ambiguous: Vec<_> = files
+                .iter()
+                .filter(|file| file.path == "{literal => dir}/{a.txt => b.txt}")
+                .collect();
+            assert_eq!(ambiguous.len(), 2, "{files:?}");
+            assert!(
+                ambiguous.iter().any(|file| file.diff_paths()
+                    == ["{literal => dir}/a.txt", "{literal => dir}/b.txt"])
+            );
+            assert!(
+                ambiguous.iter().any(|file| file.diff_paths()
+                    == ["literal/{a.txt => b.txt}", "dir/{a.txt => b.txt}"])
+            );
+        }
         let targets: Vec<_> = files
             .iter()
             .filter(|file| file.path != "unrelated.txt")
@@ -2908,7 +2951,7 @@ mod tests {
                 let entry = app.diff_cache.get(&commit_id).unwrap();
                 for file in &targets {
                     assert!(
-                        entry.diffs_raw.contains_key(&Some(file.path.clone())),
+                        entry.diffs_raw.contains_key(&Some(file.target_path())),
                         "prefetch missed {}",
                         file.path
                     );
@@ -2947,6 +2990,32 @@ mod tests {
                     );
                     assert!(
                         text.contains("rename to literal => dir/b.txt"),
+                        "route {route}: {text}"
+                    );
+                } else if file.status == 'R' && file.target_path() == "{literal => dir}/b.txt" {
+                    assert!(
+                        text.contains("rename from {literal => dir}/a.txt"),
+                        "route {route}: {text}"
+                    );
+                    assert!(
+                        text.contains("rename to {literal => dir}/b.txt"),
+                        "route {route}: {text}"
+                    );
+                    assert!(
+                        !text.contains("rename from literal/{a.txt => b.txt}"),
+                        "route {route}: {text}"
+                    );
+                } else if file.status == 'R' && file.target_path() == "dir/{a.txt => b.txt}" {
+                    assert!(
+                        text.contains("rename from literal/{a.txt => b.txt}"),
+                        "route {route}: {text}"
+                    );
+                    assert!(
+                        text.contains("rename to dir/{a.txt => b.txt}"),
+                        "route {route}: {text}"
+                    );
+                    assert!(
+                        !text.contains("rename from {literal => dir}/a.txt"),
                         "route {route}: {text}"
                     );
                 } else if file.status == 'R' {

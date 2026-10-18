@@ -212,6 +212,17 @@ mod tests {
         DiffFile {
             status,
             path: path.to_string(),
+            source_path: path.to_string(),
+            destination_path: path.to_string(),
+        }
+    }
+
+    fn renamed_file(status: char, source: &str, destination: &str) -> DiffFile {
+        DiffFile {
+            status,
+            path: format!("{{{source} => {destination}}}"),
+            source_path: source.to_owned(),
+            destination_path: destination.to_owned(),
         }
     }
 
@@ -280,7 +291,7 @@ mod tests {
 
     #[test]
     fn restore_plan_expands_renames_and_dedups() {
-        let files = [file('M', "a.rs"), file('R', "{x.rs => y.rs}")];
+        let files = [file('M', "a.rs"), renamed_file('R', "x.rs", "y.rs")];
         let plan = plan_restore(&files, &[0, 1, 0]);
         assert_eq!(plan.paths, vec!["a.rs", "x.rs", "y.rs"]);
         assert_eq!((plan.count, plan.skipped), (3, 0));
@@ -291,7 +302,7 @@ mod tests {
         let files = [
             file('M', "a.rs"),
             file('D', "gone.rs"),
-            file('R', "{x.rs => y.rs}"),
+            renamed_file('R', "x.rs", "y.rs"),
         ];
         let plan = plan_untrack(&files, &[0, 1, 2, 0]);
         assert_eq!(plan.paths, vec!["a.rs", "y.rs"]);
@@ -302,8 +313,8 @@ mod tests {
     fn absorb_plan_skips_renames_and_copies() {
         let files = [
             file('M', "a.rs"),
-            file('R', "{x.rs => y.rs}"),
-            file('C', "{p.rs => q.rs}"),
+            renamed_file('R', "x.rs", "y.rs"),
+            renamed_file('C', "p.rs", "q.rs"),
             file('A', "b.rs"),
         ];
         let plan = plan_absorb(&files, &[0, 1, 2, 3]);
@@ -320,7 +331,7 @@ mod tests {
         let files = [
             file('M', "a.rs"),
             file('D', "gone.rs"),
-            file('R', "{x => y}"),
+            renamed_file('R', "x", "y"),
         ];
         let multi = plan_open(&files, &[0, 1, 2]);
         assert_eq!(multi.paths, vec!["a.rs", "y"]);

@@ -51,137 +51,45 @@ pub enum Row {
     Connector(String),
 }
 
-/// `jj diff --summary` の 1 行。files pane (lazygit のファイル一覧相当) の
-/// 1 項目に対応する。
+/// files pane の表示文字列と、jj から取得した曖昧でない実パス。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiffFile {
     /// jj のステータス文字 (`M`/`A`/`D`/`R`/`C`)。
     pub status: char,
-    /// リネームは `old => new` の形のままここに入る。
+    /// 表示専用。異なるリネームが同じ圧縮表記になる場合もある。
     pub path: String,
+    /// リポジトリルート相対の実パス。旧キャッシュからの推測復元はしない。
+    pub source_path: String,
+    pub destination_path: String,
 }
 
 impl DiffFile {
-    /// jj のファイルセット引数として渡せるパス。
-    ///
-    /// リネーム/コピーは現在その change に存在する新パス側を返す。
     pub fn target_path(&self) -> String {
-        match self.rename_paths() {
-            Some((_old, new)) => new,
-            None => self.path.clone(),
-        }
-    }
-
-    fn rename_paths(&self) -> Option<(String, String)> {
-        if matches!(self.status, 'R' | 'C') {
-            split_rename(&self.path)
-        } else {
-            None
-        }
+        self.destination_path.clone()
     }
 
     /// diff の対象となる実パス。削除側も含めてリネームを表示する。
     pub fn diff_paths(&self) -> Vec<String> {
-        self.restore_paths()
+        if matches!(self.status, 'R' | 'C') {
+            vec![self.source_path.clone(), self.destination_path.clone()]
+        } else {
+            vec![self.destination_path.clone()]
+        }
     }
 
-    /// `jj restore --changes-in` に渡すファイルセット。
-    ///
-    /// リネームで新パス側だけを渡すと、jj は新パス側の中身を消すだけで
-    /// 旧パス側を復元しないため、ファイルの内容ごと失われる (`jj status`
-    /// は旧パスの `D` を表示する)。旧/新パス両方を渡せば `jj restore` が
-    /// リネームごと元に戻す。
+    /// 新パスだけでは旧パスが復元されないため、リネームの両側を渡す。
     pub fn restore_paths(&self) -> Vec<String> {
-        match self.rename_paths() {
-            Some((old, new)) => vec![old, new],
-            None => vec![self.path.clone()],
-        }
+        self.diff_paths()
     }
 }
 
-fn assemble_rename_path(prefix: &str, middle: &str, suffix: &str) -> String {
-    // 空の側では、圧縮表記の境界に残る余分な区切りだけを取り除く。
-    if middle.is_empty() {
-        if prefix.ends_with(std::path::is_separator) && suffix.starts_with(std::path::is_separator)
-        {
-            return format!("{}{}", prefix, &suffix[1..]);
-        }
-        if prefix.is_empty() && suffix.starts_with(std::path::is_separator) {
-            return suffix[1..].to_owned();
-        }
-        if suffix.is_empty() && prefix.ends_with(std::path::is_separator) {
-            return prefix[..prefix.len() - 1].to_owned();
-        }
-    }
-    format!("{prefix}{middle}{suffix}")
-}
-
-/// `jj diff --summary` のリネーム表記 (`prefix{old => new}suffix`) から
-/// 旧パス・新パスのフルパスを組み立てる。
-///
-/// jj は git の diffstat と同じく、共通の prefix/suffix を `{}` の外に
-/// 出して差分部分だけを `old => new` で囲む — 共通部分が無い場合も
-/// `{old => new}` のように必ず `{}` で囲まれる (`" => "` を素の文字列と
-/// して直接 split すると、共通 prefix/suffix を持つリネームで壊れた
-/// パスになる: 例 `sub\{a.rs => b.rs}` を `" => "` で割ると
-/// `"sub\{a.rs"` / `"b.rs}"` になってしまい、どちらも実在しないパスに
-/// なる)。
-fn split_rename(path: &str) -> Option<(String, String)> {
-    // 共通ディレクトリ名にも矢印を書けるため、括弧内として解析できる
-    // 区切りを探す。先頭の矢印がリネームの区切りとは限らない。
-    path.match_indices(" => ")
-        .find_map(|(separator, _)| split_rename_at_separator(path, separator))
-}
-
-fn split_rename_at_separator(path: &str, separator: usize) -> Option<(String, String)> {
-    // 共通プレフィックスの閉じた `{...}` を除き、残る一番外側の
-    // 開き括弧を使う。旧名の要素先頭の `{` も内側なので選ばない。
-    let mut openings = Vec::new();
-    for (index, ch) in path[..separator].char_indices() {
-        match ch {
-            '{' => openings.push(index),
-            '}' => {
-                openings.pop();
-            }
-            _ => {}
-        }
-    }
-    let at_boundary =
-        |index: &usize| *index == 0 || path[..*index].ends_with(std::path::is_separator);
-    let start = openings.into_iter().find(at_boundary).or_else(|| {
-        // 旧名内の単独の `}` で外側まで閉じた場合は、従来の境界探索を使う。
-        path[..separator]
-            .rmatch_indices('{')
-            .map(|(index, _)| index)
-            .find(at_boundary)
-    })?;
-    // 移動先も後ろから同じ規則で読む。接尾辞の閉じた `{...}` と、
-    // 新名内の `}` を外側のリネーム記号として切り取らない。
-    let mut closings = Vec::new();
-    for (offset, ch) in path[separator..].char_indices().rev() {
-        match ch {
-            '}' => closings.push(separator + offset),
-            '{' => {
-                closings.pop();
-            }
-            _ => {}
-        }
-    }
-    let end = closings
-        .into_iter()
-        .find(|&index| {
-            index + 1 == path.len() || path[index + 1..].starts_with(std::path::is_separator)
-        })
-        .or_else(|| path[separator..].find('}').map(|offset| separator + offset))?;
-    let old_mid = &path[start + 1..separator];
-    let new_mid = &path[separator + " => ".len()..end];
-    let prefix = &path[..start];
-    let suffix = &path[end + 1..];
-    Some((
-        assemble_rename_path(prefix, old_mid, suffix),
-        assemble_rename_path(prefix, new_mid, suffix),
-    ))
-}
+// RepoPath の JSON は OS によらず `/` 区切りのリポジトリ相対パス。
+// 表示文字列には手を加えず、引用符・改行等も JSON で安全に区切る。
+const DIFF_SUMMARY_TEMPLATE: &str = concat!(
+    r#"'{"status":' ++ json(status_char) ++ ',"path":' ++ json(display_diff_path)"#,
+    r#" ++ ',"source_path":' ++ json(source.path())"#,
+    r#" ++ ',"destination_path":' ++ json(target.path()) ++ "}\n""#,
+);
 
 /// リポジトリ相対パスを fileset のリテラルとして渡す。
 fn literal_fileset(path: &str) -> String {
@@ -396,11 +304,11 @@ impl Jj {
         self.read(&["diff", "-r", rev, "--git"])
     }
 
-    /// 選択中 change で変更されたファイルの一覧 (`jj diff --summary`)。
+    /// 選択中 change で変更されたファイルの表示名と実パスの一覧。
     /// lazygit のようにファイル単位で diff を選べるようにするための入口。
     pub fn diff_summary(&self, rev: &str) -> Result<Vec<DiffFile>> {
-        let out = self.read(&["diff", "-r", rev, "--summary"])?;
-        Ok(parse_diff_summary(&out))
+        let out = self.read(&["diff", "-r", rev, "--template", DIFF_SUMMARY_TEMPLATE])?;
+        parse_diff_summary(&out)
     }
 
     /// diff pane のヘッダに出す `jj show --no-patch` 相当。
@@ -578,25 +486,11 @@ pub fn parse_log(out: &str) -> Vec<Row> {
     rows
 }
 
-/// `jj diff --summary` の出力を [`DiffFile`] へ分解する。
-///
-/// 各行は `<status><space><path>` (例: `M src/app.rs`, `R old => new`)。
-/// `parse_log` と同じ理由で、jj を起動せずにパーサだけテストできるよう
-/// 独立関数にしてある。
-pub fn parse_diff_summary(out: &str) -> Vec<DiffFile> {
+/// 1 行 1 JSON オブジェクトのファイル情報を読む。
+/// 実パスの欠けた古い形式や壊れた出力は、表示から推測せずエラーにする。
+pub fn parse_diff_summary(out: &str) -> Result<Vec<DiffFile>> {
     out.lines()
-        .filter_map(|line| {
-            let mut chars = line.chars();
-            let status = chars.next()?;
-            let path = chars.as_str().trim();
-            if path.is_empty() {
-                return None;
-            }
-            Some(DiffFile {
-                status,
-                path: path.to_string(),
-            })
-        })
+        .map(|line| serde_json::from_str(line).context("cannot parse jj diff file entry"))
         .collect()
 }
 
@@ -719,29 +613,28 @@ mod tests {
     }
 
     #[test]
-    fn diff_summary_parses_status_and_path_including_renames() {
-        let files = parse_diff_summary("M src/app.rs\nA new.rs\nD old.rs\nR from.rs => to.rs\n");
+    fn diff_summary_reads_structured_paths_and_rejects_legacy_entries() {
+        let files = parse_diff_summary(concat!(
+            r#"{"status":"R","path":"{literal => dir}/{a.txt => b.txt}","source_path":"{literal => dir}/a.txt","destination_path":"{literal => dir}/b.txt"}"#, "\n",
+            r#"{"status":"R","path":"{literal => dir}/{a.txt => b.txt}","source_path":"literal/{a.txt => b.txt}","destination_path":"dir/{a.txt => b.txt}"}"#, "\n",
+        )).unwrap();
+        assert_eq!(files[0].path, files[1].path);
         assert_eq!(
-            files,
-            vec![
-                DiffFile {
-                    status: 'M',
-                    path: "src/app.rs".to_string()
-                },
-                DiffFile {
-                    status: 'A',
-                    path: "new.rs".to_string()
-                },
-                DiffFile {
-                    status: 'D',
-                    path: "old.rs".to_string()
-                },
-                DiffFile {
-                    status: 'R',
-                    path: "from.rs => to.rs".to_string()
-                },
-            ]
+            files[0].diff_paths(),
+            ["{literal => dir}/a.txt", "{literal => dir}/b.txt"]
         );
+        assert_eq!(
+            files[1].diff_paths(),
+            ["literal/{a.txt => b.txt}", "dir/{a.txt => b.txt}"]
+        );
+        assert_eq!(files[0].target_path(), "{literal => dir}/b.txt");
+        assert_eq!(
+            files[1].restore_paths(),
+            ["literal/{a.txt => b.txt}", "dir/{a.txt => b.txt}"]
+        );
+        assert!(parse_diff_summary(r#"{"status":"R","path":"{a => b}"}"#).is_err());
+        assert!(parse_diff_summary("R {a => b}\n").is_err());
+        assert!(parse_diff_summary("").unwrap().is_empty());
     }
 
     #[test]
@@ -750,6 +643,8 @@ mod tests {
             DiffFile {
                 status: 'M',
                 path: "src/app.rs".to_string(),
+                source_path: "src/app.rs".to_string(),
+                destination_path: "src/app.rs".to_string()
             }
             .target_path(),
             "src/app.rs"
@@ -760,6 +655,8 @@ mod tests {
             DiffFile {
                 status: 'R',
                 path: "{from.rs => to.rs}".to_string(),
+                source_path: "from.rs".to_string(),
+                destination_path: "to.rs".to_string()
             }
             .target_path(),
             "to.rs"
@@ -769,6 +666,8 @@ mod tests {
             DiffFile {
                 status: 'R',
                 path: "sub/{a.rs => b.rs}".to_string(),
+                source_path: "sub/a.rs".to_string(),
+                destination_path: "sub/b.rs".to_string()
             }
             .target_path(),
             "sub/b.rs"
@@ -777,6 +676,8 @@ mod tests {
             DiffFile {
                 status: 'R',
                 path: "{old => new}/file.rs".to_string(),
+                source_path: "old/file.rs".to_string(),
+                destination_path: "new/file.rs".to_string()
             }
             .target_path(),
             "new/file.rs"
@@ -789,6 +690,8 @@ mod tests {
             DiffFile {
                 status: 'M',
                 path: "src/app.rs".to_string(),
+                source_path: "src/app.rs".to_string(),
+                destination_path: "src/app.rs".to_string()
             }
             .restore_paths(),
             vec!["src/app.rs"]
@@ -797,6 +700,8 @@ mod tests {
             DiffFile {
                 status: 'R',
                 path: "{from.rs => to.rs}".to_string(),
+                source_path: "from.rs".to_string(),
+                destination_path: "to.rs".to_string()
             }
             .restore_paths(),
             vec!["from.rs", "to.rs"]
@@ -805,6 +710,8 @@ mod tests {
             DiffFile {
                 status: 'R',
                 path: "sub/{a.rs => b.rs}".to_string(),
+                source_path: "sub/a.rs".to_string(),
+                destination_path: "sub/b.rs".to_string()
             }
             .restore_paths(),
             vec!["sub/a.rs", "sub/b.rs"]
@@ -812,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_paths_expand_compressed_renames_and_copies() {
+    fn structured_paths_ignore_compressed_rename_and_copy_display() {
         for (display, old, new) in [
             (
                 "home/.gemini/antigravity-cli/{settings.json => settings.base.json}",
@@ -899,6 +806,8 @@ mod tests {
                 let file = DiffFile {
                     status,
                     path: display.to_owned(),
+                    source_path: old.to_owned(),
+                    destination_path: new.to_owned(),
                 };
                 assert_eq!(file.diff_paths(), [old, new], "{display}");
                 assert_eq!(file.target_path(), new, "{display}");
@@ -909,6 +818,8 @@ mod tests {
             let file = DiffFile {
                 status,
                 path: path.to_owned(),
+                source_path: path.to_owned(),
+                destination_path: path.to_owned(),
             };
             assert_eq!(file.diff_paths(), [path]);
             assert_eq!(file.target_path(), path);
@@ -917,7 +828,7 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn windows_rename_paths_remove_only_redundant_separators() {
+    fn windows_display_uses_canonical_structured_paths() {
         for (display, old, new) in [
             (r"{sub => }\file.txt", r"sub\file.txt", "file.txt"),
             (
@@ -953,9 +864,15 @@ mod tests {
             let file = DiffFile {
                 status: 'R',
                 path: display.to_owned(),
+                source_path: old.replace('\\', "/"),
+                destination_path: new.replace('\\', "/"),
             };
-            assert_eq!(file.diff_paths(), [old, new], "{display}");
-            assert_eq!(file.target_path(), new, "{display}");
+            assert_eq!(
+                file.diff_paths(),
+                [old.replace('\\', "/"), new.replace('\\', "/")],
+                "{display}"
+            );
+            assert_eq!(file.target_path(), new.replace('\\', "/"), "{display}");
             assert_eq!(
                 literal_fileset(&file.target_path()),
                 format!("root:\"{}\"", new.replace('\\', "/"))
@@ -964,14 +881,15 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn empty_rename_components_preserve_literal_backslashes_on_unix() {
-        assert_eq!(assemble_rename_path("", "", r"\file.txt"), r"\file.txt");
+    fn structured_paths_preserve_escaped_filenames() {
+        let files = parse_diff_summary(
+            r#"{"status":"R","path":"display only","source_path":"quote\"and\\slash\t\n.txt ","destination_path":"new\\name.txt "}"#,
+        ).unwrap();
         assert_eq!(
-            assemble_rename_path(r"dir\", "", "/file.txt"),
-            r"dir\/file.txt"
+            files[0].diff_paths(),
+            ["quote\"and\\slash\t\n.txt ", "new\\name.txt "]
         );
-        assert_eq!(assemble_rename_path(r"dir\", "", ""), r"dir\");
+        assert_eq!(files[0].target_path(), "new\\name.txt ");
     }
 
     #[test]
