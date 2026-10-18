@@ -2833,10 +2833,12 @@ mod tests {
             &["config", "set", "--repo", "ui.diff-formatter", ":git"],
         );
         std::fs::create_dir_all(dir.join("nested")).unwrap();
-        std::fs::write(dir.join("nested/settings.json"), "rename payload\n").unwrap();
+        std::fs::write(dir.join("nested/settings{brace.json"), "rename payload\n").unwrap();
+        std::fs::write(dir.join("nested/moved.txt"), "move payload\n").unwrap();
         run(dir, &["new", "-m", "selected diffs"]);
+        std::fs::rename(dir.join("nested/moved.txt"), dir.join("moved.txt")).unwrap();
         std::fs::rename(
-            dir.join("nested/settings.json"),
+            dir.join("nested/settings{brace.json"),
             dir.join("nested/settings.base.json"),
         )
         .unwrap();
@@ -2914,9 +2916,18 @@ mod tests {
                 );
                 assert!(!text.contains("unrelated payload"), "route {route}: {text}");
                 assert!(!text.contains("unrelated.txt"), "route {route}: {text}");
-                if file.status == 'R' {
+                if file.status == 'R' && file.target_path() == "moved.txt" {
                     assert!(
-                        text.contains("rename from nested/settings.json"),
+                        text.contains("rename from nested/moved.txt"),
+                        "route {route}: {text}"
+                    );
+                    assert!(
+                        text.contains("rename to moved.txt"),
+                        "route {route}: {text}"
+                    );
+                } else if file.status == 'R' {
+                    assert!(
+                        text.contains("rename from nested/settings{brace.json"),
                         "route {route}: {text}"
                     );
                     assert!(
@@ -2948,7 +2959,11 @@ mod tests {
         assert!(whole.contains("payload for"));
 
         // Reusing the old name must not leak its replacement into the new file's diff.
-        std::fs::write(dir.join("nested/settings.json"), "replacement payload\n").unwrap();
+        std::fs::write(
+            dir.join("nested/settings{brace.json"),
+            "replacement payload\n",
+        )
+        .unwrap();
         let files = app.jj.diff_summary("@").unwrap();
         let selected = files
             .iter()

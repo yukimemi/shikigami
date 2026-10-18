@@ -102,13 +102,14 @@ impl DiffFile {
 fn assemble_rename_path(prefix: &str, middle: &str, suffix: &str) -> String {
     // 空の側では、圧縮表記の境界に残る余分な区切りだけを取り除く。
     if middle.is_empty() {
-        if prefix.ends_with('/') && suffix.starts_with('/') {
+        if prefix.ends_with(std::path::is_separator) && suffix.starts_with(std::path::is_separator)
+        {
             return format!("{}{}", prefix, &suffix[1..]);
         }
-        if prefix.is_empty() && suffix.starts_with('/') {
+        if prefix.is_empty() && suffix.starts_with(std::path::is_separator) {
             return suffix[1..].to_owned();
         }
-        if suffix.is_empty() && prefix.ends_with('/') {
+        if suffix.is_empty() && prefix.ends_with(std::path::is_separator) {
             return prefix[..prefix.len() - 1].to_owned();
         }
     }
@@ -127,7 +128,13 @@ fn assemble_rename_path(prefix: &str, middle: &str, suffix: &str) -> String {
 /// なる)。
 fn split_rename(path: &str) -> Option<(String, String)> {
     let separator = path.find(" => ")?;
-    let start = path[..separator].rfind('{')?;
+    // jj の圧縮表記はパス要素の境界から始まる。旧名の途中にある
+    // `{` を選ぶと、共通プレフィックスとして誤って両パスへ混入する。
+    let start = path[..separator]
+        .rmatch_indices('{')
+        .find_map(|(index, _)| {
+            (index == 0 || path[..index].ends_with(std::path::is_separator)).then_some(index)
+        })?;
     let end = separator + path[separator..].find('}')?;
     let (old_mid, new_mid) = path[start + 1..end].split_once(" => ")?;
     let prefix = &path[..start];
@@ -800,6 +807,17 @@ mod tests {
                 "{literal}/src/b.rs",
             ),
             ("{a => b}", "a", "b"),
+            ("{old{brace.txt => new.txt}", "old{brace.txt", "new.txt"),
+            (
+                "nested/{old{brace.txt => new.txt}",
+                "nested/old{brace.txt",
+                "nested/new.txt",
+            ),
+            (
+                "{literal}/src/{old{brace.txt => new.txt}",
+                "{literal}/src/old{brace.txt",
+                "{literal}/src/new.txt",
+            ),
         ] {
             for status in ['R', 'C'] {
                 let file = DiffFile {
@@ -819,6 +837,54 @@ mod tests {
             assert_eq!(file.diff_paths(), [path]);
             assert_eq!(file.target_path(), path);
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_rename_paths_remove_only_redundant_separators() {
+        for (display, old, new) in [
+            (r"{sub => }\file.txt", r"sub\file.txt", "file.txt"),
+            (r"{ => sub}\file.txt", "file.txt", r"sub\file.txt"),
+            (
+                r"dir\{sub => }\file.txt",
+                r"dir\sub\file.txt",
+                r"dir\file.txt",
+            ),
+            (
+                r"dir\{ => sub}\file.txt",
+                r"dir\file.txt",
+                r"dir\sub\file.txt",
+            ),
+            (r"dir\{sub => }", r"dir\sub", "dir"),
+            (r"dir\{ => sub}", "dir", r"dir\sub"),
+            (
+                r"nested\{old{brace.txt => new.txt}",
+                r"nested\old{brace.txt",
+                r"nested\new.txt",
+            ),
+        ] {
+            let file = DiffFile {
+                status: 'R',
+                path: display.to_owned(),
+            };
+            assert_eq!(file.diff_paths(), [old, new], "{display}");
+            assert_eq!(file.target_path(), new, "{display}");
+            assert_eq!(
+                literal_fileset(&file.target_path()),
+                format!("root:\"{}\"", new.replace('\\', "/"))
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn empty_rename_components_preserve_literal_backslashes_on_unix() {
+        assert_eq!(assemble_rename_path("", "", r"\file.txt"), r"\file.txt");
+        assert_eq!(
+            assemble_rename_path(r"dir\", "", "/file.txt"),
+            r"dir\/file.txt"
+        );
+        assert_eq!(assemble_rename_path(r"dir\", "", ""), r"dir\");
     }
 
     #[test]
