@@ -127,7 +127,13 @@ fn assemble_rename_path(prefix: &str, middle: &str, suffix: &str) -> String {
 /// `"sub\{a.rs"` / `"b.rs}"` になってしまい、どちらも実在しないパスに
 /// なる)。
 fn split_rename(path: &str) -> Option<(String, String)> {
-    let separator = path.find(" => ")?;
+    // 共通ディレクトリ名にも矢印を書けるため、括弧内として解析できる
+    // 区切りを探す。先頭の矢印がリネームの区切りとは限らない。
+    path.match_indices(" => ")
+        .find_map(|(separator, _)| split_rename_at_separator(path, separator))
+}
+
+fn split_rename_at_separator(path: &str, separator: usize) -> Option<(String, String)> {
     // 共通プレフィックスの閉じた `{...}` を除き、残る一番外側の
     // 開き括弧を使う。旧名の要素先頭の `{` も内側なので選ばない。
     let mut openings = Vec::new();
@@ -167,7 +173,8 @@ fn split_rename(path: &str) -> Option<(String, String)> {
             index + 1 == path.len() || path[index + 1..].starts_with(std::path::is_separator)
         })
         .or_else(|| path[separator..].find('}').map(|offset| separator + offset))?;
-    let (old_mid, new_mid) = path[start + 1..end].split_once(" => ")?;
+    let old_mid = &path[start + 1..separator];
+    let new_mid = &path[separator + " => ".len()..end];
     let prefix = &path[..start];
     let suffix = &path[end + 1..];
     Some((
@@ -838,6 +845,21 @@ mod tests {
                 "{literal}/src/b.rs",
             ),
             ("{a => b}", "a", "b"),
+            (
+                "literal => dir/{a.txt => b.txt}",
+                "literal => dir/a.txt",
+                "literal => dir/b.txt",
+            ),
+            (
+                "one => two/three => four/{a.txt => b.txt}",
+                "one => two/three => four/a.txt",
+                "one => two/three => four/b.txt",
+            ),
+            (
+                "literal => dir/{old => new}/suffix => dir/file.txt",
+                "literal => dir/old/suffix => dir/file.txt",
+                "literal => dir/new/suffix => dir/file.txt",
+            ),
             ("{old.txt => new}name.txt}", "old.txt", "new}name.txt"),
             ("{old.txt => new/name}.txt}", "old.txt", "new/name}.txt"),
             (

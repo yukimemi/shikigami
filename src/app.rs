@@ -2835,7 +2835,22 @@ mod tests {
         std::fs::create_dir_all(dir.join("nested/old")).unwrap();
         std::fs::write(dir.join("nested/old/{brace.json"), "rename payload\n").unwrap();
         std::fs::write(dir.join("nested/moved.txt"), "move payload\n").unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(dir.join("literal => dir")).unwrap();
+            std::fs::write(
+                dir.join("literal => dir/a.txt"),
+                "arrow directory payload\n",
+            )
+            .unwrap();
+        }
         run(dir, &["new", "-m", "selected diffs"]);
+        #[cfg(unix)]
+        std::fs::rename(
+            dir.join("literal => dir/a.txt"),
+            dir.join("literal => dir/b.txt"),
+        )
+        .unwrap();
         std::fs::rename(dir.join("nested/moved.txt"), dir.join("moved.txt")).unwrap();
         std::fs::rename(
             dir.join("nested/old/{brace.json"),
@@ -2923,6 +2938,15 @@ mod tests {
                     );
                     assert!(
                         text.contains("rename to moved.txt"),
+                        "route {route}: {text}"
+                    );
+                } else if file.status == 'R' && file.target_path() == "literal => dir/b.txt" {
+                    assert!(
+                        text.contains("rename from literal => dir/a.txt"),
+                        "route {route}: {text}"
+                    );
+                    assert!(
+                        text.contains("rename to literal => dir/b.txt"),
                         "route {route}: {text}"
                     );
                 } else if file.status == 'R' {
