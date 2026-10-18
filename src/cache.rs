@@ -197,7 +197,9 @@ fn cache_path(jj: &Jj) -> Option<PathBuf> {
         .unwrap_or_else(|_| jj.root().to_path_buf());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     root.hash(&mut hasher);
-    Some(dir.join(format!("{:016x}.json", hasher.finish())))
+    // v2: 選択差分は完全一致。旧 root: の配下一致で取得した差分は
+    // 同じコミットでも無関係な内容を含み得るため再利用しない。
+    Some(dir.join(format!("{:016x}-v2.json", hasher.finish())))
 }
 
 #[cfg(test)]
@@ -282,6 +284,16 @@ mod tests {
             .diffs_raw
             .insert(None, "whole change diff\n".to_string());
         store.insert("abc123".to_string(), entry);
+        // 以前の名前に有効な構造化キャッシュがあっても、root: で取得した
+        // 差分なので読み込まない。新しい完全一致の差分を再取得させる。
+        let mut legacy_hasher = std::collections::hash_map::DefaultHasher::new();
+        jj.root().canonicalize().unwrap().hash(&mut legacy_hasher);
+        let legacy_path = tmp
+            .path()
+            .join(format!("{:016x}.json", legacy_hasher.finish()));
+        let legacy_entries = [("abc123", store.get("abc123").unwrap())];
+        std::fs::write(legacy_path, serde_json::to_vec(&legacy_entries).unwrap()).unwrap();
+        assert!(!DiffStore::load(&jj).contains("abc123"));
         store.save(&jj);
 
         let loaded = DiffStore::load(&jj);

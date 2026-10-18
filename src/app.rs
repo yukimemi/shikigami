@@ -2836,6 +2836,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("nested/old")).unwrap();
         std::fs::write(dir.join("nested/old/{brace.json"), "rename payload\n").unwrap();
         std::fs::write(dir.join("nested/moved.txt"), "move payload\n").unwrap();
+        std::fs::write(dir.join("config"), "config rename payload\n").unwrap();
         #[cfg(unix)]
         {
             std::fs::create_dir_all(dir.join("literal => dir")).unwrap();
@@ -2859,6 +2860,13 @@ mod tests {
             .unwrap();
         }
         run(dir, &["new", "-m", "selected diffs"]);
+        std::fs::rename(dir.join("config"), dir.join("config.old")).unwrap();
+        std::fs::create_dir(dir.join("config")).unwrap();
+        std::fs::write(
+            dir.join("config/unrelated.txt"),
+            "directory reuse unrelated payload\n",
+        )
+        .unwrap();
         #[cfg(unix)]
         std::fs::rename(
             dir.join("literal => dir/a.txt"),
@@ -2931,7 +2939,9 @@ mod tests {
         }
         let targets: Vec<_> = files
             .iter()
-            .filter(|file| file.path != "unrelated.txt")
+            .filter(|file| {
+                file.path != "unrelated.txt" && file.destination_path != "config/unrelated.txt"
+            })
             .cloned()
             .collect();
 
@@ -3018,6 +3028,12 @@ mod tests {
                         !text.contains("rename from {literal => dir}/a.txt"),
                         "route {route}: {text}"
                     );
+                } else if file.status == 'R' && file.target_path() == "config.old" {
+                    assert!(text.contains("rename from config"), "route {route}: {text}");
+                    assert!(
+                        text.contains("rename to config.old"),
+                        "route {route}: {text}"
+                    );
                 } else if file.status == 'R' {
                     assert!(
                         text.contains("rename from nested/old/{brace.json"),
@@ -3033,6 +3049,13 @@ mod tests {
                 }
             }
         }
+        let reused_directory_diff = app
+            .jj
+            .diff("@", &["config/unrelated.txt".to_owned()])
+            .unwrap();
+        assert!(reused_directory_diff.contains("directory reuse unrelated payload"));
+        assert!(!reused_directory_diff.contains("rename from config"));
+
         // Changing the configured formatter also applies to a fresh selected diff.
         run(
             dir,

@@ -92,7 +92,7 @@ const DIFF_SUMMARY_TEMPLATE: &str = concat!(
 );
 
 /// リポジトリ相対パスを fileset のリテラルとして渡す。
-fn literal_fileset(path: &str) -> String {
+fn literal_fileset(path: &str, kind: &str) -> String {
     // Windows の jj だけが `\` を区切りとして出す。Unix では
     // ファイル名の一部なので、fileset 文字列内でエスケープする。
     let path = if cfg!(windows) {
@@ -101,7 +101,7 @@ fn literal_fileset(path: &str) -> String {
         path.to_owned()
     };
     format!(
-        "root:\"{}\"",
+        "{kind}:\"{}\"",
         path.replace('\\', "\\\\").replace('"', "\\\"")
     )
 }
@@ -292,7 +292,10 @@ impl Jj {
     /// README の設計方針を、diff-formatter を自前で選んだ場合にも保つ。
     /// `paths` の実パスだけに絞る。空なら change 全体を表示する。
     pub fn diff(&self, rev: &str, paths: &[String]) -> Result<String> {
-        let filesets: Vec<String> = paths.iter().map(|path| literal_fileset(path)).collect();
+        let filesets: Vec<String> = paths
+            .iter()
+            .map(|path| literal_fileset(path, "root-file"))
+            .collect();
         let mut args = vec!["diff", "-r", rev, "--"];
         args.extend(filesets.iter().map(String::as_str));
         self.exec(&["--no-pager", "--color", "always"], &args)
@@ -407,7 +410,10 @@ impl Jj {
     /// 空白や括弧を含むパスで fileset のパースが壊れないよう、他の
     /// restore/absorb と違い `root:"…"` のリテラル指定に包む。
     pub fn file_untrack(&self, paths: &[String]) -> Result<String> {
-        let filesets: Vec<String> = paths.iter().map(|path| literal_fileset(path)).collect();
+        let filesets: Vec<String> = paths
+            .iter()
+            .map(|path| literal_fileset(path, "root"))
+            .collect();
         let mut args = vec!["file", "untrack"];
         args.extend(filesets.iter().map(String::as_str));
         self.write(&args)
@@ -874,8 +880,8 @@ mod tests {
             );
             assert_eq!(file.target_path(), new.replace('\\', "/"), "{display}");
             assert_eq!(
-                literal_fileset(&file.target_path()),
-                format!("root:\"{}\"", new.replace('\\', "/"))
+                literal_fileset(&file.target_path(), "root-file"),
+                format!("root-file:\"{}\"", new.replace('\\', "/"))
             );
         }
     }
@@ -894,14 +900,22 @@ mod tests {
 
     #[test]
     fn literal_filesets_quote_operators_and_escape_strings() {
-        for path in ["a b", "(a|b)&~c", "glob:*.rs", "{a => b}", "-option"] {
-            assert_eq!(literal_fileset(path), format!("root:\"{path}\""));
-        }
-        assert_eq!(literal_fileset("a\"b"), r#"root:"a\"b""#);
-        if cfg!(windows) {
-            assert_eq!(literal_fileset(r"dir\file"), r#"root:"dir/file""#);
-        } else {
-            assert_eq!(literal_fileset(r"dir\file"), r#"root:"dir\\file""#);
+        for kind in ["root-file", "root"] {
+            for path in ["a b", "(a|b)&~c", "glob:*.rs", "{a => b}", "-option"] {
+                assert_eq!(literal_fileset(path, kind), format!("{kind}:\"{path}\""));
+            }
+            assert_eq!(literal_fileset("a\"b", kind), format!(r#"{kind}:"a\"b""#));
+            if cfg!(windows) {
+                assert_eq!(
+                    literal_fileset(r"dir\file", kind),
+                    format!(r#"{kind}:"dir/file""#)
+                );
+            } else {
+                assert_eq!(
+                    literal_fileset(r"dir\file", kind),
+                    format!(r#"{kind}:"dir\\file""#)
+                );
+            }
         }
     }
 
