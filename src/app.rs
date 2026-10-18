@@ -2413,6 +2413,49 @@ mod tests {
     }
 
     #[test]
+    fn restore_file_handles_fileset_special_characters_in_the_name() {
+        // `jj restore <path>` は path を fileset として解釈する。素のまま渡すと
+        // `token%3Adefault@x.com` のような名前が構文エラーになる。
+        if !jj_available() {
+            report_skip();
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[user]\nname = \"test\"\nemail = \"test@example.com\"\n",
+        )
+        .unwrap();
+        run(dir, &["git", "init"]);
+        run(dir, &["config", "set", "--repo", "user.name", "test"]);
+        run(
+            dir,
+            &["config", "set", "--repo", "user.email", "test@example.com"],
+        );
+        let name = "token%3Adefault%3Ayukimemi@gmail.com";
+        run(dir, &["describe", "-m", "base"]);
+        run(dir, &["new", "-m", "add token"]);
+        std::fs::write(dir.join(name), "secret\n").unwrap();
+
+        let jj = Jj::discover(dir).unwrap();
+        let mut app = App::new(jj, Some("all()".to_string())).unwrap();
+        app.wait_for_startup();
+        while app.selected_change().unwrap().description != "add token" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.sync_diff(80);
+        assert_eq!(app.files.len(), 1, "{:?}", app.files);
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('r')));
+        assert!(matches!(app.mode, Mode::Confirm(_)), "{:?}", app.mode);
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+        assert!(!dir.join(name).exists());
+    }
+
+    #[test]
     fn absorb_file_moves_the_change_into_its_mutable_ancestor() {
         assert_absorb_targets(Focus::Files);
     }
