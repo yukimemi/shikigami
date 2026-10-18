@@ -131,6 +131,9 @@ In the diff pane, `r`, `p`, `i`, and `o` act only on the displayed file, even wh
 visual range remain in the files pane. Opening the editor or cancelling a confirmation preserves
 that selection; mutating actions clear it when executed. These keys are inactive in the log pane.
 
+`[` and `]` navigate to the previous and next file directly from the diff pane.
+Navigation stops at the first or last file without wrapping.
+
 ## AI-generated messages
 
 Inside the `n` (`jj new`), `e` (`jj describe`), and `c` (`jj commit`) description prompt, `Ctrl-g` fills the input
@@ -215,6 +218,7 @@ which is about jj's own *implicit* editor invocation (`ui.editor`), always block
 - **Files pane, one file at a time.** The right column is split into a file list
   (`jj diff --summary`) above the diff. The diff pane only ever shows the file currently selected
   there — like lazygit — instead of the whole change's diff scrolling past all at once.
+  Use `[` / `]` in the diff pane to select the previous / next file.
 
 ## Caching
 

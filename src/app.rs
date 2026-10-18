@@ -2044,6 +2044,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char(']')));
         assert_eq!(app.file_selected, 1);
         assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.status.text, "cancelled");
     }
 
     #[test]
