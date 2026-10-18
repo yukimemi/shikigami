@@ -51,61 +51,59 @@ pub enum Row {
     Connector(String),
 }
 
-/// `jj diff --summary` の 1 行。files pane (lazygit のファイル一覧相当) の
-/// 1 項目に対応する。
+/// files pane の表示文字列と、jj から取得した曖昧でない実パス。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiffFile {
     /// jj のステータス文字 (`M`/`A`/`D`/`R`/`C`)。
     pub status: char,
-    /// リネームは `old => new` の形のままここに入る。
+    /// 表示専用。異なるリネームが同じ圧縮表記になる場合もある。
     pub path: String,
+    /// リポジトリルート相対の実パス。旧キャッシュからの推測復元はしない。
+    pub source_path: String,
+    pub destination_path: String,
 }
 
 impl DiffFile {
-    /// jj のファイルセット引数として渡せるパス。
-    ///
-    /// リネーム/コピーは現在その change に存在する新パス側を返す。
     pub fn target_path(&self) -> String {
-        match split_rename(&self.path) {
-            Some((_old, new)) => new,
-            None => self.path.clone(),
+        self.destination_path.clone()
+    }
+
+    /// diff の対象となる実パス。削除側も含めてリネームを表示する。
+    pub fn diff_paths(&self) -> Vec<String> {
+        if matches!(self.status, 'R' | 'C') {
+            vec![self.source_path.clone(), self.destination_path.clone()]
+        } else {
+            vec![self.destination_path.clone()]
         }
     }
 
-    /// `jj restore --changes-in` に渡すファイルセット。
-    ///
-    /// リネームで新パス側だけを渡すと、jj は新パス側の中身を消すだけで
-    /// 旧パス側を復元しないため、ファイルの内容ごと失われる (`jj status`
-    /// は旧パスの `D` を表示する)。旧/新パス両方を渡せば `jj restore` が
-    /// リネームごと元に戻す。
+    /// 新パスだけでは旧パスが復元されないため、リネームの両側を渡す。
     pub fn restore_paths(&self) -> Vec<String> {
-        match split_rename(&self.path) {
-            Some((old, new)) => vec![old, new],
-            None => vec![self.path.clone()],
-        }
+        self.diff_paths()
     }
 }
 
-/// `jj diff --summary` のリネーム表記 (`prefix{old => new}suffix`) から
-/// 旧パス・新パスのフルパスを組み立てる。
-///
-/// jj は git の diffstat と同じく、共通の prefix/suffix を `{}` の外に
-/// 出して差分部分だけを `old => new` で囲む — 共通部分が無い場合も
-/// `{old => new}` のように必ず `{}` で囲まれる (`" => "` を素の文字列と
-/// して直接 split すると、共通 prefix/suffix を持つリネームで壊れた
-/// パスになる: 例 `sub\{a.rs => b.rs}` を `" => "` で割ると
-/// `"sub\{a.rs"` / `"b.rs}"` になってしまい、どちらも実在しないパスに
-/// なる)。
-fn split_rename(path: &str) -> Option<(String, String)> {
-    let start = path.find('{')?;
-    let end = start + path[start..].find('}')?;
-    let (old_mid, new_mid) = path[start + 1..end].split_once(" => ")?;
-    let prefix = &path[..start];
-    let suffix = &path[end + 1..];
-    Some((
-        format!("{prefix}{old_mid}{suffix}"),
-        format!("{prefix}{new_mid}{suffix}"),
-    ))
+// RepoPath の JSON は OS によらず `/` 区切りのリポジトリ相対パス。
+// 表示文字列には手を加えず、引用符・改行等も JSON で安全に区切る。
+const DIFF_SUMMARY_TEMPLATE: &str = concat!(
+    r#"'{"status":' ++ json(status_char) ++ ',"path":' ++ json(display_diff_path)"#,
+    r#" ++ ',"source_path":' ++ json(source.path())"#,
+    r#" ++ ',"destination_path":' ++ json(target.path()) ++ "}\n""#,
+);
+
+/// リポジトリ相対パスを fileset のリテラルとして渡す。
+fn literal_fileset(path: &str, kind: &str) -> String {
+    // Windows の jj だけが `\` を区切りとして出す。Unix では
+    // ファイル名の一部なので、fileset 文字列内でエスケープする。
+    let path = if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path.to_owned()
+    };
+    format!(
+        "{kind}:\"{}\"",
+        path.replace('\\', "\\\\").replace('"', "\\\"")
+    )
 }
 
 /// log に出てくる 1 change。
@@ -292,13 +290,14 @@ impl Jj {
     /// `:color-words` / difftastic のような外部ツール) にそのまま従う。
     /// これにより shikigami は「シェルで見えるのと同じ見た目」という
     /// README の設計方針を、diff-formatter を自前で選んだ場合にも保つ。
-    /// `path` を渡すと、その 1 ファイル分だけに絞った diff になる
-    /// (jj のファイルセット引数をそのまま流す)。
-    pub fn diff(&self, rev: &str, path: Option<&str>) -> Result<String> {
-        let mut args = vec!["diff", "-r", rev];
-        if let Some(path) = path {
-            args.push(path);
-        }
+    /// `paths` の実パスだけに絞る。空なら change 全体を表示する。
+    pub fn diff(&self, rev: &str, paths: &[String]) -> Result<String> {
+        let filesets: Vec<String> = paths
+            .iter()
+            .map(|path| literal_fileset(path, "root-file"))
+            .collect();
+        let mut args = vec!["diff", "-r", rev, "--"];
+        args.extend(filesets.iter().map(String::as_str));
         self.exec(&["--no-pager", "--color", "always"], &args)
     }
 
@@ -308,11 +307,11 @@ impl Jj {
         self.read(&["diff", "-r", rev, "--git"])
     }
 
-    /// 選択中 change で変更されたファイルの一覧 (`jj diff --summary`)。
+    /// 選択中 change で変更されたファイルの表示名と実パスの一覧。
     /// lazygit のようにファイル単位で diff を選べるようにするための入口。
     pub fn diff_summary(&self, rev: &str) -> Result<Vec<DiffFile>> {
-        let out = self.read(&["diff", "-r", rev, "--summary"])?;
-        Ok(parse_diff_summary(&out))
+        let out = self.read(&["diff", "-r", rev, "--template", DIFF_SUMMARY_TEMPLATE])?;
+        parse_diff_summary(&out)
     }
 
     /// diff pane のヘッダに出す `jj show --no-patch` 相当。
@@ -413,16 +412,7 @@ impl Jj {
     pub fn file_untrack(&self, paths: &[String]) -> Result<String> {
         let filesets: Vec<String> = paths
             .iter()
-            .map(|p| {
-                // Windows の jj だけが `\` を区切りとして出す。Unix では
-                // ファイル名の一部なので、fileset 文字列内でエスケープする。
-                let p = if cfg!(windows) {
-                    p.replace('\\', "/")
-                } else {
-                    p.clone()
-                };
-                format!("root:\"{}\"", p.replace('\\', "\\\\").replace('"', "\\\""))
-            })
+            .map(|path| literal_fileset(path, "root"))
             .collect();
         let mut args = vec!["file", "untrack"];
         args.extend(filesets.iter().map(String::as_str));
@@ -502,25 +492,11 @@ pub fn parse_log(out: &str) -> Vec<Row> {
     rows
 }
 
-/// `jj diff --summary` の出力を [`DiffFile`] へ分解する。
-///
-/// 各行は `<status><space><path>` (例: `M src/app.rs`, `R old => new`)。
-/// `parse_log` と同じ理由で、jj を起動せずにパーサだけテストできるよう
-/// 独立関数にしてある。
-pub fn parse_diff_summary(out: &str) -> Vec<DiffFile> {
+/// 1 行 1 JSON オブジェクトのファイル情報を読む。
+/// 実パスの欠けた古い形式や壊れた出力は、表示から推測せずエラーにする。
+pub fn parse_diff_summary(out: &str) -> Result<Vec<DiffFile>> {
     out.lines()
-        .filter_map(|line| {
-            let mut chars = line.chars();
-            let status = chars.next()?;
-            let path = chars.as_str().trim();
-            if path.is_empty() {
-                return None;
-            }
-            Some(DiffFile {
-                status,
-                path: path.to_string(),
-            })
-        })
+        .map(|line| serde_json::from_str(line).context("cannot parse jj diff file entry"))
         .collect()
 }
 
@@ -643,29 +619,28 @@ mod tests {
     }
 
     #[test]
-    fn diff_summary_parses_status_and_path_including_renames() {
-        let files = parse_diff_summary("M src/app.rs\nA new.rs\nD old.rs\nR from.rs => to.rs\n");
+    fn diff_summary_reads_structured_paths_and_rejects_legacy_entries() {
+        let files = parse_diff_summary(concat!(
+            r#"{"status":"R","path":"{literal => dir}/{a.txt => b.txt}","source_path":"{literal => dir}/a.txt","destination_path":"{literal => dir}/b.txt"}"#, "\n",
+            r#"{"status":"R","path":"{literal => dir}/{a.txt => b.txt}","source_path":"literal/{a.txt => b.txt}","destination_path":"dir/{a.txt => b.txt}"}"#, "\n",
+        )).unwrap();
+        assert_eq!(files[0].path, files[1].path);
         assert_eq!(
-            files,
-            vec![
-                DiffFile {
-                    status: 'M',
-                    path: "src/app.rs".to_string()
-                },
-                DiffFile {
-                    status: 'A',
-                    path: "new.rs".to_string()
-                },
-                DiffFile {
-                    status: 'D',
-                    path: "old.rs".to_string()
-                },
-                DiffFile {
-                    status: 'R',
-                    path: "from.rs => to.rs".to_string()
-                },
-            ]
+            files[0].diff_paths(),
+            ["{literal => dir}/a.txt", "{literal => dir}/b.txt"]
         );
+        assert_eq!(
+            files[1].diff_paths(),
+            ["literal/{a.txt => b.txt}", "dir/{a.txt => b.txt}"]
+        );
+        assert_eq!(files[0].target_path(), "{literal => dir}/b.txt");
+        assert_eq!(
+            files[1].restore_paths(),
+            ["literal/{a.txt => b.txt}", "dir/{a.txt => b.txt}"]
+        );
+        assert!(parse_diff_summary(r#"{"status":"R","path":"{a => b}"}"#).is_err());
+        assert!(parse_diff_summary("R {a => b}\n").is_err());
+        assert!(parse_diff_summary("").unwrap().is_empty());
     }
 
     #[test]
@@ -674,6 +649,8 @@ mod tests {
             DiffFile {
                 status: 'M',
                 path: "src/app.rs".to_string(),
+                source_path: "src/app.rs".to_string(),
+                destination_path: "src/app.rs".to_string()
             }
             .target_path(),
             "src/app.rs"
@@ -684,6 +661,8 @@ mod tests {
             DiffFile {
                 status: 'R',
                 path: "{from.rs => to.rs}".to_string(),
+                source_path: "from.rs".to_string(),
+                destination_path: "to.rs".to_string()
             }
             .target_path(),
             "to.rs"
@@ -693,6 +672,8 @@ mod tests {
             DiffFile {
                 status: 'R',
                 path: "sub/{a.rs => b.rs}".to_string(),
+                source_path: "sub/a.rs".to_string(),
+                destination_path: "sub/b.rs".to_string()
             }
             .target_path(),
             "sub/b.rs"
@@ -701,6 +682,8 @@ mod tests {
             DiffFile {
                 status: 'R',
                 path: "{old => new}/file.rs".to_string(),
+                source_path: "old/file.rs".to_string(),
+                destination_path: "new/file.rs".to_string()
             }
             .target_path(),
             "new/file.rs"
@@ -713,6 +696,8 @@ mod tests {
             DiffFile {
                 status: 'M',
                 path: "src/app.rs".to_string(),
+                source_path: "src/app.rs".to_string(),
+                destination_path: "src/app.rs".to_string()
             }
             .restore_paths(),
             vec!["src/app.rs"]
@@ -721,6 +706,8 @@ mod tests {
             DiffFile {
                 status: 'R',
                 path: "{from.rs => to.rs}".to_string(),
+                source_path: "from.rs".to_string(),
+                destination_path: "to.rs".to_string()
             }
             .restore_paths(),
             vec!["from.rs", "to.rs"]
@@ -729,10 +716,207 @@ mod tests {
             DiffFile {
                 status: 'R',
                 path: "sub/{a.rs => b.rs}".to_string(),
+                source_path: "sub/a.rs".to_string(),
+                destination_path: "sub/b.rs".to_string()
             }
             .restore_paths(),
             vec!["sub/a.rs", "sub/b.rs"]
         );
+    }
+
+    #[test]
+    fn structured_paths_ignore_compressed_rename_and_copy_display() {
+        for (display, old, new) in [
+            (
+                "home/.gemini/antigravity-cli/{settings.json => settings.base.json}",
+                "home/.gemini/antigravity-cli/settings.json",
+                "home/.gemini/antigravity-cli/settings.base.json",
+            ),
+            ("{old => new}/file.rs", "old/file.rs", "new/file.rs"),
+            ("src/{old => new}.rs", "src/old.rs", "src/new.rs"),
+            ("dir/{sub => }/file.txt", "dir/sub/file.txt", "dir/file.txt"),
+            ("dir/{ => sub}/file.txt", "dir/file.txt", "dir/sub/file.txt"),
+            ("{sub => }/file.txt", "sub/file.txt", "file.txt"),
+            ("{ => sub}/file.txt", "file.txt", "sub/file.txt"),
+            ("dir/{sub => }", "dir/sub", "dir"),
+            ("dir/{ => sub}", "dir", "dir/sub"),
+            ("{old => }file.txt", "oldfile.txt", "file.txt"),
+            ("{ => new}file.txt", "file.txt", "newfile.txt"),
+            (
+                "src/{ => nested/}file.rs",
+                "src/file.rs",
+                "src/nested/file.rs",
+            ),
+            (
+                "src/{nested/ => }file.rs",
+                "src/nested/file.rs",
+                "src/file.rs",
+            ),
+            (
+                "{literal}/src/{a => b}.rs",
+                "{literal}/src/a.rs",
+                "{literal}/src/b.rs",
+            ),
+            ("{a => b}", "a", "b"),
+            (
+                "literal => dir/{a.txt => b.txt}",
+                "literal => dir/a.txt",
+                "literal => dir/b.txt",
+            ),
+            (
+                "one => two/three => four/{a.txt => b.txt}",
+                "one => two/three => four/a.txt",
+                "one => two/three => four/b.txt",
+            ),
+            (
+                "literal => dir/{old => new}/suffix => dir/file.txt",
+                "literal => dir/old/suffix => dir/file.txt",
+                "literal => dir/new/suffix => dir/file.txt",
+            ),
+            ("{old.txt => new}name.txt}", "old.txt", "new}name.txt"),
+            ("{old.txt => new/name}.txt}", "old.txt", "new/name}.txt"),
+            (
+                "src/{old.txt => new}name.txt}/tail/{literal}.txt",
+                "src/old.txt/tail/{literal}.txt",
+                "src/new}name.txt/tail/{literal}.txt",
+            ),
+            ("{old.txt => new{brace.txt}", "old.txt", "new{brace.txt"),
+            ("{old.txt => new{brace}.txt}", "old.txt", "new{brace}.txt"),
+            ("{old{brace.txt => new.txt}", "old{brace.txt", "new.txt"),
+            ("{old/{brace.txt => new.txt}", "old/{brace.txt", "new.txt"),
+            ("{old}brace.txt => new.txt}", "old}brace.txt", "new.txt"),
+            (
+                "{literal}/src/{old}brace.txt => new.txt}",
+                "{literal}/src/old}brace.txt",
+                "{literal}/src/new.txt",
+            ),
+            ("{old{brace}.txt => new.txt}", "old{brace}.txt", "new.txt"),
+            ("{{brace.txt => new.txt}", "{brace.txt", "new.txt"),
+            (
+                "{literal}/src/{old/{brace.txt => new.txt}",
+                "{literal}/src/old/{brace.txt",
+                "{literal}/src/new.txt",
+            ),
+            (
+                "nested/{old{brace.txt => new.txt}",
+                "nested/old{brace.txt",
+                "nested/new.txt",
+            ),
+            (
+                "{literal}/src/{old{brace.txt => new.txt}",
+                "{literal}/src/old{brace.txt",
+                "{literal}/src/new.txt",
+            ),
+        ] {
+            for status in ['R', 'C'] {
+                let file = DiffFile {
+                    status,
+                    path: display.to_owned(),
+                    source_path: old.to_owned(),
+                    destination_path: new.to_owned(),
+                };
+                assert_eq!(file.diff_paths(), [old, new], "{display}");
+                assert_eq!(file.target_path(), new, "{display}");
+            }
+        }
+        for status in ['M', 'A', 'D'] {
+            let path = "literal/{old => new}.rs";
+            let file = DiffFile {
+                status,
+                path: path.to_owned(),
+                source_path: path.to_owned(),
+                destination_path: path.to_owned(),
+            };
+            assert_eq!(file.diff_paths(), [path]);
+            assert_eq!(file.target_path(), path);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_display_uses_canonical_structured_paths() {
+        for (display, old, new) in [
+            (r"{sub => }\file.txt", r"sub\file.txt", "file.txt"),
+            (
+                r"src\{old.txt => new}name.txt}\tail\{literal}.txt",
+                r"src\old.txt\tail\{literal}.txt",
+                r"src\new}name.txt\tail\{literal}.txt",
+            ),
+            (r"{old\{brace.txt => new.txt}", r"old\{brace.txt", "new.txt"),
+            (
+                r"{literal}\src\{old\{brace.txt => new.txt}",
+                r"{literal}\src\old\{brace.txt",
+                r"{literal}\src\new.txt",
+            ),
+            (r"{ => sub}\file.txt", "file.txt", r"sub\file.txt"),
+            (
+                r"dir\{sub => }\file.txt",
+                r"dir\sub\file.txt",
+                r"dir\file.txt",
+            ),
+            (
+                r"dir\{ => sub}\file.txt",
+                r"dir\file.txt",
+                r"dir\sub\file.txt",
+            ),
+            (r"dir\{sub => }", r"dir\sub", "dir"),
+            (r"dir\{ => sub}", "dir", r"dir\sub"),
+            (
+                r"nested\{old{brace.txt => new.txt}",
+                r"nested\old{brace.txt",
+                r"nested\new.txt",
+            ),
+        ] {
+            let file = DiffFile {
+                status: 'R',
+                path: display.to_owned(),
+                source_path: old.replace('\\', "/"),
+                destination_path: new.replace('\\', "/"),
+            };
+            assert_eq!(
+                file.diff_paths(),
+                [old.replace('\\', "/"), new.replace('\\', "/")],
+                "{display}"
+            );
+            assert_eq!(file.target_path(), new.replace('\\', "/"), "{display}");
+            assert_eq!(
+                literal_fileset(&file.target_path(), "root-file"),
+                format!("root-file:\"{}\"", new.replace('\\', "/"))
+            );
+        }
+    }
+
+    #[test]
+    fn structured_paths_preserve_escaped_filenames() {
+        let files = parse_diff_summary(
+            r#"{"status":"R","path":"display only","source_path":"quote\"and\\slash\t\n.txt ","destination_path":"new\\name.txt "}"#,
+        ).unwrap();
+        assert_eq!(
+            files[0].diff_paths(),
+            ["quote\"and\\slash\t\n.txt ", "new\\name.txt "]
+        );
+        assert_eq!(files[0].target_path(), "new\\name.txt ");
+    }
+
+    #[test]
+    fn literal_filesets_quote_operators_and_escape_strings() {
+        for kind in ["root-file", "root"] {
+            for path in ["a b", "(a|b)&~c", "glob:*.rs", "{a => b}", "-option"] {
+                assert_eq!(literal_fileset(path, kind), format!("{kind}:\"{path}\""));
+            }
+            assert_eq!(literal_fileset("a\"b", kind), format!(r#"{kind}:"a\"b""#));
+            if cfg!(windows) {
+                assert_eq!(
+                    literal_fileset(r"dir\file", kind),
+                    format!(r#"{kind}:"dir/file""#)
+                );
+            } else {
+                assert_eq!(
+                    literal_fileset(r"dir\file", kind),
+                    format!(r#"{kind}:"dir\\file""#)
+                );
+            }
+        }
     }
 
     #[test]

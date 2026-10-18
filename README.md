@@ -50,7 +50,10 @@ unchanged, and `jj op log` / `jj undo` still see everything shikigami did.
 cargo install shikigami
 ```
 
-Requires the `jj` binary on `PATH` (shikigami drives the CLI; it does not link `jj-lib`).
+Requires **jj 0.45.1 or newer** on `PATH` (shikigami drives the CLI; it does not link `jj-lib`).
+File listing uses structured `jj diff --template` output with `json()`,
+`display_diff_path`, `status_char`, and source/target paths; older jj versions
+are not supported. The jj test workflow exercises these templates on Linux and Windows.
 
 Editor integration: [shikigami.nvim](https://github.com/yukimemi/shikigami.nvim) opens shikigami in
 a Neovim terminal and reloads buffers that jj rewrote underneath you.
