@@ -2839,7 +2839,7 @@ mod tests {
         std::fs::rename(dir.join("nested/moved.txt"), dir.join("moved.txt")).unwrap();
         std::fs::rename(
             dir.join("nested/old/{brace.json"),
-            dir.join("nested/settings.base.json"),
+            dir.join("nested/settings}base.json"),
         )
         .unwrap();
         let literal_paths = [
@@ -2931,7 +2931,7 @@ mod tests {
                         "route {route}: {text}"
                     );
                     assert!(
-                        text.contains("rename to nested/settings.base.json"),
+                        text.contains("rename to nested/settings}base.json"),
                         "route {route}: {text}"
                     );
                 } else {
@@ -2963,7 +2963,7 @@ mod tests {
         let files = app.jj.diff_summary("@").unwrap();
         let selected = files
             .iter()
-            .find(|file| dir.join(file.target_path()) == dir.join("nested/settings.base.json"))
+            .find(|file| dir.join(file.target_path()) == dir.join("nested/settings}base.json"))
             .unwrap();
         let raw = app.jj.diff("@", &selected.diff_paths()).unwrap();
         assert!(!raw.contains("replacement payload"), "{selected:?}: {raw}");

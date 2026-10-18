@@ -149,7 +149,24 @@ fn split_rename(path: &str) -> Option<(String, String)> {
             .map(|(index, _)| index)
             .find(at_boundary)
     })?;
-    let end = separator + path[separator..].find('}')?;
+    // 移動先も後ろから同じ規則で読む。接尾辞の閉じた `{...}` と、
+    // 新名内の `}` を外側のリネーム記号として切り取らない。
+    let mut closings = Vec::new();
+    for (offset, ch) in path[separator..].char_indices().rev() {
+        match ch {
+            '}' => closings.push(separator + offset),
+            '{' => {
+                closings.pop();
+            }
+            _ => {}
+        }
+    }
+    let end = closings
+        .into_iter()
+        .find(|&index| {
+            index + 1 == path.len() || path[index + 1..].starts_with(std::path::is_separator)
+        })
+        .or_else(|| path[separator..].find('}').map(|offset| separator + offset))?;
     let (old_mid, new_mid) = path[start + 1..end].split_once(" => ")?;
     let prefix = &path[..start];
     let suffix = &path[end + 1..];
@@ -821,6 +838,15 @@ mod tests {
                 "{literal}/src/b.rs",
             ),
             ("{a => b}", "a", "b"),
+            ("{old.txt => new}name.txt}", "old.txt", "new}name.txt"),
+            ("{old.txt => new/name}.txt}", "old.txt", "new/name}.txt"),
+            (
+                "src/{old.txt => new}name.txt}/tail/{literal}.txt",
+                "src/old.txt/tail/{literal}.txt",
+                "src/new}name.txt/tail/{literal}.txt",
+            ),
+            ("{old.txt => new{brace.txt}", "old.txt", "new{brace.txt"),
+            ("{old.txt => new{brace}.txt}", "old.txt", "new{brace}.txt"),
             ("{old{brace.txt => new.txt}", "old{brace.txt", "new.txt"),
             ("{old/{brace.txt => new.txt}", "old/{brace.txt", "new.txt"),
             ("{old}brace.txt => new.txt}", "old}brace.txt", "new.txt"),
@@ -872,6 +898,11 @@ mod tests {
     fn windows_rename_paths_remove_only_redundant_separators() {
         for (display, old, new) in [
             (r"{sub => }\file.txt", r"sub\file.txt", "file.txt"),
+            (
+                r"src\{old.txt => new}name.txt}\tail\{literal}.txt",
+                r"src\old.txt\tail\{literal}.txt",
+                r"src\new}name.txt\tail\{literal}.txt",
+            ),
             (r"{old\{brace.txt => new.txt}", r"old\{brace.txt", "new.txt"),
             (
                 r"{literal}\src\{old\{brace.txt => new.txt}",
