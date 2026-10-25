@@ -634,6 +634,12 @@ impl App {
             .map(|job| (job.action.label(), job.started.elapsed()))
     }
 
+    pub fn remote_quit_requested(&self) -> bool {
+        self.remote_job
+            .as_ref()
+            .is_some_and(|job| job.quit_requested)
+    }
+
     fn begin_remote(&mut self, action: RemoteAction) {
         // A startup snapshot must never overwrite the post-operation log.
         self.startup_rx = None;
@@ -1169,6 +1175,8 @@ impl App {
                 || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
             {
                 job.quit_requested = true;
+                self.status = Status::info("waiting for the remote operation to finish, then quit");
+                self.status_fresh = true;
             }
             return;
         }
@@ -1983,6 +1991,20 @@ mod tests {
         assert!(app.remote_progress().is_some());
         app.poll_remote();
         assert!(app.remote_progress().is_some());
+        assert!(app.remote_quit_requested());
+        assert!(app.status.text.contains("then quit"));
+        terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            screen.contains("push: running… (0s); will quit when finished"),
+            "{screen}"
+        );
         tx.send((
             Err(anyhow::anyhow!("original jj error\nHint: keep this")),
             Err(anyhow::anyhow!("refresh error")),

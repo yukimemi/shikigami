@@ -345,7 +345,12 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         Some((label, elapsed)) => {
             let spinner =
                 SPINNER[(elapsed.as_millis() / SPINNER_FRAME_MS) as usize % SPINNER.len()];
-            format!("{spinner} {label}: running… ({}s)", elapsed.as_secs())
+            let quit = if app.remote_quit_requested() {
+                "; will quit when finished"
+            } else {
+                ""
+            };
+            format!("{spinner} {label}: running… ({}s){quit}", elapsed.as_secs())
         }
         None => app.status.text.clone(),
     };
@@ -674,6 +679,8 @@ mod tests {
         // 画面を十分大きくして全行出す。KEYS が増えたとき help の箱が
         // 足りなくなるのをここで検知する。
         let joined = render(&mut app, 120, KEYS.len() as u16 + 4).join("\n");
+        assert!(joined.contains("f / P"), "{joined}");
+        assert!(joined.contains("jj git fetch / jj git push"), "{joined}");
         assert!(
             joined.contains("files: selection; diff: displayed file; log: inactive"),
             "file action scope is clipped: {joined}"

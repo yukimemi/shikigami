@@ -249,6 +249,8 @@ impl Jj {
         cmd.current_dir(&self.root);
         cmd.args(globals);
         cmd.args(args);
+        // 認証プロンプトが TUI の入力を奪わないよう、標準入力を閉じる。
+        cmd.stdin(std::process::Stdio::null());
         let out = cmd
             .output()
             .with_context(|| format!("failed to run `jj {}`", args.join(" ")))?;
