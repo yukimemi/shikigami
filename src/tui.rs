@@ -81,6 +81,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         // Ctrl-g の AI 生成も背景スレッド (`App::fill_with_ai`)。同じく
         // ノンブロッキングで結果を拾う。
         app.poll_ai();
+        app.poll_remote();
         // 起動直後の diff 先読み (`App::begin_diff_prefetch`) の結果も
         // 同じくノンブロッキングで拾う。
         app.poll_diff_prefetch();
@@ -100,7 +101,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         // キー入力を無駄に待ってから終了することになる。
         let poll_timeout = if app.is_loading() || app.is_diff_prefetching() {
             STARTUP_POLL
-        } else if app.ai_elapsed().is_some() {
+        } else if app.ai_elapsed().is_some() || app.remote_progress().is_some() {
             ANIM_POLL
         } else {
             POLL

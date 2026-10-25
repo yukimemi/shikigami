@@ -241,6 +241,10 @@ impl Jj {
     }
 
     fn exec(&self, globals: &[&str], args: &[&str]) -> Result<String> {
+        self.exec_output(globals, args, false)
+    }
+
+    fn exec_output(&self, globals: &[&str], args: &[&str], include_stderr: bool) -> Result<String> {
         let mut cmd = Command::new("jj");
         cmd.current_dir(&self.root);
         cmd.args(globals);
@@ -258,7 +262,24 @@ impl Jj {
             }
             bail!("{msg}");
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        if include_stderr && !out.stderr.is_empty() {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+        }
+        Ok(text)
+    }
+
+    /// Remote summaries and warnings are written to stderr even on success.
+    pub fn git_fetch(&self) -> Result<String> {
+        self.exec_output(&["--no-pager", "--color", "never"], &["git", "fetch"], true)
+    }
+
+    /// Deliberately leave bookmark selection and creation policy to jj.
+    pub fn git_push(&self) -> Result<String> {
+        self.exec_output(&["--no-pager", "--color", "never"], &["git", "push"], true)
     }
 
     /// 起動時の環境チェック用。`jj --version` の 1 行目。

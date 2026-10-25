@@ -69,6 +69,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("u / U", "jj undo / jj redo"),
     ("/", "set the log revset"),
     ("A", "toggle revset all()"),
+    ("f / P", "jj git fetch / jj git push"),
     ("Ctrl-r", "reload"),
     ("? ", "toggle this help"),
     ("Esc", "clear file selection (if any), else quit"),
@@ -340,7 +341,15 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         StatusKind::Info => Style::default().fg(Color::Black).bg(Color::Cyan),
         StatusKind::Error => Style::default().fg(Color::White).bg(Color::Red),
     };
-    let left = Span::styled(format!(" {} ", app.status.text), style);
+    let message = match app.remote_progress() {
+        Some((label, elapsed)) => {
+            let spinner =
+                SPINNER[(elapsed.as_millis() / SPINNER_FRAME_MS) as usize % SPINNER.len()];
+            format!("{spinner} {label}: running… ({}s)", elapsed.as_secs())
+        }
+        None => app.status.text.clone(),
+    };
+    let left = Span::styled(format!(" {message} "), style);
     let selected = app.file_selection.count(app.file_selected, app.files.len());
     let sel = if selected > 0 {
         format!("sel:{selected}  ")

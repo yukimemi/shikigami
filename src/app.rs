@@ -48,6 +48,36 @@ struct AiJob {
     started: Instant,
 }
 
+#[derive(Clone, Copy)]
+enum RemoteAction {
+    Fetch,
+    Push,
+}
+
+impl RemoteAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::Push => "push",
+        }
+    }
+}
+
+struct RemoteJob {
+    action: RemoteAction,
+    started: Instant,
+    rx: mpsc::Receiver<(Result<String>, ReloadResult)>,
+    quit_requested: bool,
+}
+
+fn status_detail(raw: &str) -> String {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 /// [`App::begin_diff_prefetch`] が背景スレッドから返す、1 commit 分の
 /// 先読み結果。
 type DiffPrefetchResult = (String, CommitCache);
@@ -291,6 +321,7 @@ pub struct App {
     /// 実行中の AI メッセージ生成 (Ctrl-g)。`Some` の間は入力 prompt に
     /// スピナーを出し、Esc (生成の中止) 以外のキーを受け付けない。
     ai_job: Option<AiJob>,
+    remote_job: Option<RemoteJob>,
     /// 起動直後に背景スレッドで先読みした diff (`begin_diff_prefetch`)
     /// の結果を受け取るチャネル。`startup_rx` と同じパターン。
     diff_prefetch_rx: Option<mpsc::Receiver<DiffPrefetchResult>>,
@@ -349,6 +380,7 @@ impl App {
             startup_rx: None,
             startup_error: None,
             ai_job: None,
+            remote_job: None,
             diff_prefetch_rx: None,
             diff_scroll: 0,
             working_copy: String::new(),
@@ -596,6 +628,81 @@ impl App {
         self.status_fresh = true;
     }
 
+    pub fn remote_progress(&self) -> Option<(&'static str, Duration)> {
+        self.remote_job
+            .as_ref()
+            .map(|job| (job.action.label(), job.started.elapsed()))
+    }
+
+    fn begin_remote(&mut self, action: RemoteAction) {
+        // A startup snapshot must never overwrite the post-operation log.
+        self.startup_rx = None;
+        self.diff_prefetch_rx = None;
+        let jj = self.jj.clone();
+        let revset = self.revset.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = match action {
+                RemoteAction::Fetch => jj.git_fetch(),
+                RemoteAction::Push => jj.git_push(),
+            };
+            // Refresh even on failure: a remote operation may partially succeed.
+            let rows = jj.log(revset.as_deref());
+            let status = jj.status_line();
+            let reload = rows.and_then(|rows| status.map(|status| (rows, status)));
+            let _ = tx.send((result, reload));
+        });
+        self.remote_job = Some(RemoteJob {
+            action,
+            started: Instant::now(),
+            rx,
+            quit_requested: false,
+        });
+        self.status = Status::info(format!("{}: running…", action.label()));
+    }
+
+    pub fn poll_remote(&mut self) {
+        let Some(job) = &self.remote_job else {
+            return;
+        };
+        let (result, reload) = match job.rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => (
+                Err(anyhow::anyhow!("remote worker thread died")),
+                Err(anyhow::anyhow!("remote refresh unavailable")),
+            ),
+        };
+        let job = self.remote_job.take().unwrap();
+        let label = job.action.label();
+        self.status = match result {
+            Ok(output) => {
+                let detail = status_detail(&output);
+                Status::info(if detail.is_empty() {
+                    format!("{label}: done")
+                } else {
+                    format!("{label}: {detail}")
+                })
+            }
+            Err(err) => Status::error(format!(
+                "{label} failed: {}",
+                status_detail(&err.to_string())
+            )),
+        };
+        match reload {
+            Ok((rows, status)) => self.apply_rows(rows, status),
+            Err(err) => {
+                self.status = Status::error(format!(
+                    "{} | reload failed: {}",
+                    self.status.text,
+                    status_detail(&err.to_string())
+                ));
+            }
+        }
+        self.status_fresh = true;
+        self.should_quit |= job.quit_requested;
+    }
+
     /// テスト用: AI 生成が終わるまで待って結果を反映する。
     #[cfg(test)]
     pub fn wait_for_ai(&mut self) {
@@ -766,6 +873,9 @@ impl App {
     /// (`diff_raw` 自体は commit/path キーのキャッシュを使い回すので、
     /// jj を呼び直すわけではない)。
     pub fn sync_diff(&mut self, diff_width: u16) {
+        if self.remote_job.is_some() {
+            return;
+        }
         // 直前の `handle_key` が status を書き換えていたら、その 1 回だけ
         // diff-filter 失敗による上書きを控える (`status_fresh` 参照)。
         let status_just_reported = std::mem::take(&mut self.status_fresh);
@@ -924,13 +1034,7 @@ impl App {
             Err(err) => {
                 // jj のエラーは複数行 (Error/Caused by/Hint)。status bar は
                 // 1 行なので、改行を ` | ` に畳んで全文を残す。
-                let text = err
-                    .to_string()
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" | ");
+                let text = status_detail(&err.to_string());
                 self.status = Status::error(format!("{label} failed: {text}"));
             }
         }
@@ -1058,6 +1162,14 @@ impl App {
         // Windows の ConPTY は Press と Release の両方を投げてくる。
         // Release を無視しないと 1 打鍵で 2 回動く。
         if key.kind != KeyEventKind::Press {
+            return;
+        }
+        if let Some(job) = &mut self.remote_job {
+            if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                job.quit_requested = true;
+            }
             return;
         }
         let status_before = self.status.clone();
@@ -1239,6 +1351,8 @@ impl App {
                 self.status = Status::info(format!("layout: {}", self.layout.label()));
             }
             KeyCode::Enter => self.edit_selected(),
+            KeyCode::Char('f') => self.begin_remote(RemoteAction::Fetch),
+            KeyCode::Char('P') => self.begin_remote(RemoteAction::Push),
             KeyCode::Char('n') => self.prompt_new(),
             KeyCode::Char('e') => self.prompt_describe(),
             KeyCode::Char('c') => self.prompt_commit(),
@@ -1682,6 +1796,209 @@ mod tests {
                 Row::Connector(_) => None,
             })
             .collect()
+    }
+
+    fn wait_remote(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.remote_progress().is_some() {
+            assert!(Instant::now() < deadline, "remote job timed out");
+            app.poll_remote();
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn bare_remote(dir: &Path) -> tempfile::TempDir {
+        let remote = tempfile::tempdir().unwrap();
+        let output = Command::new("git")
+            .args(["init", "--bare"])
+            .arg(remote.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        run(
+            dir,
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                remote.path().to_str().unwrap(),
+            ],
+        );
+        remote
+    }
+
+    fn remote_refs(remote: &Path) -> Vec<u8> {
+        let output = Command::new("git")
+            .arg("--git-dir")
+            .arg(remote)
+            .args(["for-each-ref", "--format=%(refname) %(objectname)"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        output.stdout
+    }
+
+    #[test]
+    fn remote_fetch_refreshes_log_from_every_pane() {
+        let (tmp, mut app) = repo_or_skip!();
+        let (peer, _peer_app) = repo_or_skip!();
+        let remote = bare_remote(tmp.path());
+        run(
+            peer.path(),
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                remote.path().to_str().unwrap(),
+            ],
+        );
+        for (index, focus) in [Focus::Log, Focus::Files, Focus::Diff]
+            .into_iter()
+            .enumerate()
+        {
+            let description = format!("remote change {index}");
+            run(peer.path(), &["describe", "-r", "@-", "-m", &description]);
+            run(peer.path(), &["bookmark", "set", "shared", "-r", "@-"]);
+            run(peer.path(), &["git", "push", "--allow-new", "-b", "shared"]);
+            app.focus = focus;
+            app.handle_key(key(KeyCode::Char('f')));
+            assert!(app.remote_progress().is_some());
+            wait_remote(&mut app);
+            assert_eq!(app.status.kind, StatusKind::Info, "{}", app.status.text);
+            assert!(descriptions(&app).contains(&description));
+            assert!(!app.working_copy.is_empty());
+            assert!(app.status_fresh);
+        }
+    }
+
+    #[test]
+    fn remote_push_updates_tracked_bookmark_from_every_pane() {
+        let (tmp, mut app) = repo_or_skip!();
+        let remote = bare_remote(tmp.path());
+        run(tmp.path(), &["bookmark", "set", "shared", "-r", "@-"]);
+        run(tmp.path(), &["git", "push", "--allow-new", "-b", "shared"]);
+        for (index, focus) in [Focus::Log, Focus::Files, Focus::Diff]
+            .into_iter()
+            .enumerate()
+        {
+            let before = remote_refs(remote.path());
+            run(
+                tmp.path(),
+                &["describe", "-m", &format!("pushed change {index}")],
+            );
+            run(tmp.path(), &["bookmark", "set", "shared", "-r", "@"]);
+            run(tmp.path(), &["new", "-m", "next change"]);
+            app.focus = focus;
+            app.handle_key(key(KeyCode::Char('P')));
+            wait_remote(&mut app);
+            assert_eq!(app.status.kind, StatusKind::Info, "{}", app.status.text);
+            assert_ne!(before, remote_refs(remote.path()));
+            assert!(descriptions(&app).contains(&format!("pushed change {index}")));
+            assert!(app.status.text.contains("shared"), "{}", app.status.text);
+        }
+    }
+
+    #[test]
+    fn remote_push_leaves_new_bookmarks_unpublished_and_preserves_jj_result() {
+        let (tmp, mut app) = repo_or_skip!();
+        let remote = bare_remote(tmp.path());
+        run(
+            tmp.path(),
+            &["config", "set", "--repo", "git.push-new-bookmarks", "false"],
+        );
+        for new_bookmark in [false, true] {
+            if new_bookmark {
+                run(tmp.path(), &["bookmark", "set", "untracked", "-r", "@-"]);
+            }
+            let expected = crate::testutil::jj_cmd(tmp.path())
+                .args(["--no-pager", "--color", "never", "git", "push"])
+                .output()
+                .unwrap();
+            let before = remote_refs(remote.path());
+            app.handle_key(key(KeyCode::Char('P')));
+            wait_remote(&mut app);
+            assert_eq!(
+                app.status.kind == StatusKind::Info,
+                expected.status.success()
+            );
+            let stderr = status_detail(&String::from_utf8_lossy(&expected.stderr));
+            assert!(app.status.text.contains(&stderr), "{}", app.status.text);
+            assert_eq!(before, remote_refs(remote.path()));
+            assert!(before.is_empty());
+        }
+    }
+
+    #[test]
+    fn remote_failure_refreshes_log_and_discards_startup_snapshot() {
+        let (tmp, mut app) = repo_or_skip!();
+        run(
+            tmp.path(),
+            &["git", "remote", "add", "origin", "missing-remote"],
+        );
+        run(tmp.path(), &["describe", "-m", "changed before failure"]);
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok((Vec::new(), "stale status".into()))).unwrap();
+        app.startup_rx = Some(rx);
+        app.handle_key(key(KeyCode::Char('f')));
+        app.poll_startup();
+        wait_remote(&mut app);
+        assert_eq!(app.status.kind, StatusKind::Error);
+        assert!(app.status.text.starts_with("fetch failed:"));
+        assert!(descriptions(&app).contains(&"changed before failure".into()));
+        assert_ne!(app.working_copy, "stale status");
+        assert!(app.status_fresh);
+    }
+
+    #[test]
+    fn remote_job_blocks_actions_defers_quit_and_preserves_errors() {
+        let (_tmp, mut app) = repo_or_skip!();
+        let (tx, rx) = mpsc::channel();
+        app.remote_job = Some(RemoteJob {
+            action: RemoteAction::Push,
+            started: Instant::now(),
+            rx,
+            quit_requested: false,
+        });
+        let backend = ratatui::backend::TestBackend::new(180, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("push: running… (0s)"), "{screen}");
+        assert!(screen.chars().any(|c| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(c)));
+        let selected = app.selected;
+        for code in ['j', 'n', 'f', 'P', 'u', '?', 'q'] {
+            app.handle_key(key(KeyCode::Char(code)));
+        }
+        assert_eq!(app.selected, selected);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(!app.should_quit);
+        assert!(app.remote_progress().is_some());
+        app.poll_remote();
+        assert!(app.remote_progress().is_some());
+        tx.send((
+            Err(anyhow::anyhow!("original jj error\nHint: keep this")),
+            Err(anyhow::anyhow!("refresh error")),
+        ))
+        .unwrap();
+        app.poll_remote();
+        assert!(app.should_quit);
+        assert!(app.remote_progress().is_none());
+        assert_eq!(app.status.kind, StatusKind::Error);
+        assert!(
+            app.status
+                .text
+                .contains("original jj error | Hint: keep this")
+        );
+        assert!(app.status.text.contains("reload failed: refresh error"));
+        assert!(app.status_fresh);
     }
 
     #[test]
