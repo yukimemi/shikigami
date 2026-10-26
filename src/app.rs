@@ -2094,7 +2094,7 @@ mod tests {
     }
 
     #[test]
-    fn done_failure_refreshes_log_without_creating_or_forcing_a_bookmark() {
+    fn done_noop_or_failure_refreshes_log_without_creating_or_forcing_a_bookmark() {
         for existing in [false, true] {
             let (tmp, mut app) = repo_or_skip!();
             if existing {
@@ -2121,9 +2121,16 @@ mod tests {
             app.handle_key(key(KeyCode::Char('d')));
             app.poll_startup();
             wait_remote(&mut app);
-            assert_eq!(app.status.kind, StatusKind::Error, "{}", app.status.text);
-            assert!(app.status.text.starts_with("done failed:"));
-            assert!(app.status.text.contains("bookmark move main --to @-"));
+            if existing {
+                assert_eq!(app.status.kind, StatusKind::Error, "{}", app.status.text);
+                assert!(app.status.text.starts_with("done failed:"));
+                assert!(app.status.text.contains("bookmark move main --to @-"));
+            } else {
+                assert_eq!(app.status.kind, StatusKind::Info, "{}", app.status.text);
+                assert!(app.status.text.starts_with("done: main -> @-:"));
+                assert!(app.status.text.contains("No matching bookmarks"));
+                assert!(app.status.text.contains("No bookmarks to update"));
+            }
             assert!(descriptions(&app).contains(&"changed before done failure".into()));
             assert_ne!(app.working_copy, "stale status");
             assert_eq!(app.jj.bookmarks().unwrap(), before);
