@@ -107,6 +107,7 @@ alone.
 | `/`               | set the log revset                                            |
 | `A`               | toggle the revset `all()`                                     |
 | `f` / `P`         | `jj git fetch` / `jj git push` (all panes, runs immediately)    |
+| `d`               | `jj bookmark move <trunk> --to @-` (jj alias `done`; all panes, runs immediately) |
 | `Ctrl-r`          | reload                                                        |
 | `?`               | toggle help                                                   |
 | `Esc`             | clear the file selection if there is one, otherwise quit      |
@@ -114,6 +115,10 @@ alone.
 
 Everything that rewrites history asks first (`y` / `Enter` confirms; **any** other key cancels), and
 the status bar always shows the working copy, the marked target, and the current rebase mode.
+
+`d` moves the trunk bookmark (the single local bookmark on `trunk()`, else `main`) to the working
+copy's parent `@-`, regardless of the selected row; jj refuses backwards moves and the refusal is shown.
+Push afterwards with `P`. It reuses the same background job as fetch / push.
 
 Remote actions run in the background with a spinner and refresh the log on success or failure.
 The status bar shows jj's output, including warnings and errors. `P` runs plain `jj git push`:

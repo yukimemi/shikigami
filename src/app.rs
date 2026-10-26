@@ -52,6 +52,7 @@ struct AiJob {
 enum RemoteAction {
     Fetch,
     Push,
+    Done,
 }
 
 impl RemoteAction {
@@ -59,6 +60,7 @@ impl RemoteAction {
         match self {
             Self::Fetch => "fetch",
             Self::Push => "push",
+            Self::Done => "done",
         }
     }
 }
@@ -651,6 +653,7 @@ impl App {
             let result = match action {
                 RemoteAction::Fetch => jj.git_fetch(),
                 RemoteAction::Push => jj.git_push(),
+                RemoteAction::Done => jj.bookmark_done(),
             };
             // Refresh even on failure: a remote operation may partially succeed.
             let rows = jj.log(revset.as_deref());
@@ -1361,6 +1364,7 @@ impl App {
             KeyCode::Enter => self.edit_selected(),
             KeyCode::Char('f') => self.begin_remote(RemoteAction::Fetch),
             KeyCode::Char('P') => self.begin_remote(RemoteAction::Push),
+            KeyCode::Char('d') => self.begin_remote(RemoteAction::Done),
             KeyCode::Char('n') => self.prompt_new(),
             KeyCode::Char('e') => self.prompt_describe(),
             KeyCode::Char('c') => self.prompt_commit(),
@@ -1836,6 +1840,12 @@ mod tests {
         remote
     }
 
+    fn jj_stdout(dir: &Path, args: &[&str]) -> String {
+        let out = crate::testutil::jj_cmd(dir).args(args).output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
     fn remote_refs(remote: &Path) -> Vec<u8> {
         let output = Command::new("git")
             .arg("--git-dir")
@@ -1979,6 +1989,232 @@ mod tests {
         assert!(app.status_fresh);
     }
 
+    fn revision_id(dir: &Path, rev: &str) -> Vec<u8> {
+        let output = crate::testutil::jj_cmd(dir)
+            .args(["log", "--no-graph", "-r", rev, "-T", "commit_id"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        output.stdout
+    }
+
+    #[test]
+    fn done_moves_trunk_to_wc_parent_from_every_pane_regardless_of_selection() {
+        let (tmp, mut app) = repo_or_skip!();
+        run(tmp.path(), &["bookmark", "set", "develop", "-r", "@--"]);
+        run(
+            tmp.path(),
+            &[
+                "config",
+                "set",
+                "--repo",
+                "revset-aliases.'trunk()'",
+                "develop",
+            ],
+        );
+        run(tmp.path(), &["bookmark", "set", "other", "-r", "@---"]);
+        let other_before = revision_id(tmp.path(), "other");
+        for focus in [Focus::Log, Focus::Files, Focus::Diff] {
+            run(tmp.path(), &["new", "-m", "next change"]);
+            app.focus = focus;
+            app.selected = app.rows.len() - 1;
+            app.handle_key(key(KeyCode::Char('d')));
+            assert_eq!(app.remote_progress().unwrap().0, "done");
+            wait_remote(&mut app);
+            assert_eq!(app.status.kind, StatusKind::Info, "{}", app.status.text);
+            assert!(app.status.text.contains("develop -> @-"));
+            assert_eq!(
+                revision_id(tmp.path(), "develop"),
+                revision_id(tmp.path(), "@-")
+            );
+            assert_eq!(revision_id(tmp.path(), "other"), other_before);
+            assert!(descriptions(&app).contains(&"next change".into()));
+        }
+    }
+
+    #[test]
+    fn done_keeps_remote_trunk_name_when_local_bookmark_is_ahead() {
+        let (tmp, mut app) = repo_or_skip!();
+        let _remote = bare_remote(tmp.path());
+        run(tmp.path(), &["bookmark", "set", "main", "-r", "@---"]);
+        run(tmp.path(), &["bookmark", "set", "master", "-r", "@--"]);
+        run(
+            tmp.path(),
+            &[
+                "--config",
+                "git.push-new-bookmarks=true",
+                "git",
+                "push",
+                "-b",
+                "master",
+            ],
+        );
+        let remote_before = revision_id(tmp.path(), "master@origin");
+        let main_before = revision_id(tmp.path(), "main");
+        assert_eq!(revision_id(tmp.path(), "trunk()"), remote_before);
+        for _ in 0..2 {
+            assert_eq!(app.jj.trunk_bookmark(), "master");
+            app.handle_key(key(KeyCode::Char('d')));
+            wait_remote(&mut app);
+            assert_eq!(app.status.kind, StatusKind::Info, "{}", app.status.text);
+            assert!(app.status.text.contains("master -> @-"));
+            assert_eq!(
+                revision_id(tmp.path(), "master"),
+                revision_id(tmp.path(), "@-")
+            );
+            assert_eq!(revision_id(tmp.path(), "master@origin"), remote_before);
+            assert_eq!(revision_id(tmp.path(), "main"), main_before);
+            run(tmp.path(), &["new", "-m", "next change before push"]);
+        }
+    }
+
+    #[test]
+    fn done_falls_back_to_main_for_missing_ambiguous_or_failed_trunk_lookup() {
+        for trunk in ["root()", "@--", "missing_trunk"] {
+            let (tmp, mut app) = repo_or_skip!();
+            run(tmp.path(), &["bookmark", "set", "main", "-r", "@--"]);
+            run(tmp.path(), &["bookmark", "set", "other", "-r", "@--"]);
+            run(
+                tmp.path(),
+                &["config", "set", "--repo", "revset-aliases.'trunk()'", trunk],
+            );
+            app.handle_key(key(KeyCode::Char('d')));
+            wait_remote(&mut app);
+            assert_eq!(app.status.kind, StatusKind::Info, "{}", app.status.text);
+            assert!(app.status.text.contains("main -> @-"));
+            assert_eq!(
+                revision_id(tmp.path(), "main"),
+                revision_id(tmp.path(), "@-")
+            );
+            assert_eq!(
+                revision_id(tmp.path(), "other"),
+                revision_id(tmp.path(), "@--")
+            );
+        }
+    }
+
+    #[test]
+    fn done_noop_or_failure_refreshes_log_without_creating_or_forcing_a_bookmark() {
+        for existing in [false, true] {
+            let (tmp, mut app) = repo_or_skip!();
+            if existing {
+                run(tmp.path(), &["bookmark", "set", "main", "-r", "@"]);
+            }
+            run(
+                tmp.path(),
+                &[
+                    "config",
+                    "set",
+                    "--repo",
+                    "revset-aliases.'trunk()'",
+                    "root()",
+                ],
+            );
+            run(
+                tmp.path(),
+                &["describe", "-m", "changed before done failure"],
+            );
+            let before = app.jj.bookmarks().unwrap();
+            let (tx, rx) = mpsc::channel();
+            tx.send(Ok((Vec::new(), "stale status".into()))).unwrap();
+            app.startup_rx = Some(rx);
+            app.handle_key(key(KeyCode::Char('d')));
+            app.poll_startup();
+            wait_remote(&mut app);
+            if existing {
+                assert_eq!(app.status.kind, StatusKind::Error, "{}", app.status.text);
+                assert!(app.status.text.starts_with("done failed:"));
+                assert!(app.status.text.contains("bookmark move main --to @-"));
+            } else {
+                assert_eq!(app.status.kind, StatusKind::Info, "{}", app.status.text);
+                assert!(app.status.text.starts_with("done: main -> @-:"));
+                assert!(app.status.text.contains("No matching bookmarks"));
+                assert!(app.status.text.contains("No bookmarks to update"));
+            }
+            assert!(descriptions(&app).contains(&"changed before done failure".into()));
+            assert_ne!(app.working_copy, "stale status");
+            assert_eq!(app.jj.bookmarks().unwrap(), before);
+            if existing {
+                assert_eq!(
+                    revision_id(tmp.path(), "main"),
+                    revision_id(tmp.path(), "@")
+                );
+            }
+            assert!(app.status_fresh);
+        }
+    }
+
+    #[test]
+    fn done_key_preserves_ctrl_d_half_page_navigation() {
+        let (_tmp, mut app) = repo_or_skip!();
+        app.handle_key(ctrl('d'));
+        assert!(app.remote_progress().is_none());
+        assert_eq!(app.selected, PAGE.min(app.rows.len() - 1));
+    }
+
+    #[test]
+    fn done_moves_main_to_parent_from_any_selection_and_reloads() {
+        let (tmp, mut app) = repo_or_skip!();
+        run(tmp.path(), &["bookmark", "create", "main", "-r", "@---"]);
+        app.reload().unwrap();
+        app.focus = Focus::Diff;
+        app.handle_key(key(KeyCode::Char('G')));
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(app.remote_progress().is_some());
+        wait_remote(&mut app);
+        assert_eq!(app.status.kind, StatusKind::Info, "{}", app.status.text);
+        assert!(
+            app.status.text.starts_with("done: main"),
+            "{}",
+            app.status.text
+        );
+        let at = jj_stdout(
+            tmp.path(),
+            &["log", "-r", "main", "--no-graph", "-T", "description"],
+        );
+        assert_eq!(at.trim(), "second change");
+        assert!(app.status_fresh);
+    }
+
+    #[test]
+    fn done_refuses_backwards_move_and_still_refreshes() {
+        let (tmp, mut app) = repo_or_skip!();
+        run(tmp.path(), &["bookmark", "create", "main", "-r", "@"]);
+        run(tmp.path(), &["describe", "-m", "changed before done"]);
+        app.handle_key(key(KeyCode::Char('d')));
+        wait_remote(&mut app);
+        assert_eq!(app.status.kind, StatusKind::Error);
+        assert!(
+            app.status.text.starts_with("done failed:"),
+            "{}",
+            app.status.text
+        );
+        assert!(descriptions(&app).contains(&"changed before done".into()));
+    }
+
+    #[test]
+    fn trunk_bookmark_follows_alias_and_falls_back_to_main() {
+        let (tmp, app) = repo_or_skip!();
+        assert_eq!(app.jj.trunk_bookmark(), "main");
+        run(tmp.path(), &["bookmark", "create", "develop", "-r", "@-"]);
+        run(
+            tmp.path(),
+            &[
+                "config",
+                "set",
+                "--repo",
+                "revset-aliases.'trunk()'",
+                "develop",
+            ],
+        );
+        assert_eq!(app.jj.trunk_bookmark(), "develop");
+        run(
+            tmp.path(),
+            &["bookmark", "create", "other", "-r", "develop"],
+        );
+        assert_eq!(app.jj.trunk_bookmark(), "main");
+    }
+
     #[test]
     fn remote_job_blocks_actions_defers_quit_and_preserves_errors() {
         let (_tmp, mut app) = repo_or_skip!();
@@ -2002,7 +2238,7 @@ mod tests {
         assert!(screen.contains("push: running… (0s)"), "{screen}");
         assert!(screen.chars().any(|c| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(c)));
         let selected = app.selected;
-        for code in ['j', 'n', 'f', 'P', 'u', '?', 'q'] {
+        for code in ['j', 'n', 'f', 'P', 'd', 'u', '?', 'q'] {
             app.handle_key(key(KeyCode::Char(code)));
         }
         assert_eq!(app.selected, selected);

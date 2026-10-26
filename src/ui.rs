@@ -70,6 +70,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("/", "set the log revset"),
     ("A", "toggle revset all()"),
     ("f / P", "jj git fetch / jj git push"),
+    ("d", "jj bookmark move trunk/main --to @-; then P to push"),
     ("Ctrl-r", "reload"),
     ("? ", "toggle this help"),
     ("Esc", "clear file selection (if any), else quit"),
@@ -681,6 +682,10 @@ mod tests {
         let joined = render(&mut app, 120, KEYS.len() as u16 + 4).join("\n");
         assert!(joined.contains("f / P"), "{joined}");
         assert!(joined.contains("jj git fetch / jj git push"), "{joined}");
+        assert!(
+            joined.contains("jj bookmark move trunk/main --to @-; then P to push"),
+            "{joined}"
+        );
         assert!(
             joined.contains("files: selection; diff: displayed file; log: inactive"),
             "file action scope is clipped: {joined}"
