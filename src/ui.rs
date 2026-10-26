@@ -686,6 +686,11 @@ mod tests {
         assert!(joined.contains("f / P"), "{joined}");
         assert!(joined.contains("jj git fetch / jj git push"), "{joined}");
         assert!(
+            joined.contains("jj bookmark move trunk (else main) --to @-"),
+            "{joined}"
+        );
+        assert!(joined.contains("then P to push"), "{joined}");
+        assert!(
             joined.contains("files: selection; diff: displayed file; log: inactive"),
             "file action scope is clipped: {joined}"
         );

@@ -275,17 +275,18 @@ impl Jj {
         self.exec_output(&["--no-pager", "--color", "never"], &["git", "push"], true)
     }
 
-    /// trunk bookmark 名。`trunk()` の指す change に付いたローカル
-    /// bookmark がちょうど 1 つならその名前、照会失敗・なし・複数なら
+    /// trunk bookmark 名。`trunk()` の指す change に付いた `@git` 以外の
+    /// bookmark 名がちょうど 1 つならその名前、照会失敗・なし・複数なら
     /// 意図しない bookmark を動かさないよう `main` に倒す。
     pub fn trunk_bookmark(&self) -> String {
         let out = self.read(&[
             "bookmark",
             "list",
+            "--all",
             "-r",
             "trunk()",
             "--template",
-            r#"if(remote, "", name ++ "\n")"#,
+            r#"if(remote != "git", name ++ "\n")"#,
         ]);
         let names: BTreeSet<String> = out
             .unwrap_or_default()
@@ -305,11 +306,13 @@ impl Jj {
     /// 選択行ではなく常に作業コピーの親。後退は jj の拒否に任せる。
     pub fn bookmark_done(&self) -> Result<String> {
         let name = self.trunk_bookmark();
-        let out = self.exec_output(
-            WRITE_GLOBALS,
-            &["bookmark", "move", &name, "--to", "@-"],
-            true,
-        )?;
+        let out = self
+            .exec_output(
+                WRITE_GLOBALS,
+                &["bookmark", "move", &name, "--to", "@-"],
+                true,
+            )
+            .map_err(|err| anyhow::anyhow!("jj bookmark move {name} --to @-: {err}"))?;
         let detail = out.trim();
         Ok(if detail.is_empty() {
             format!("moved {name} to @-")
