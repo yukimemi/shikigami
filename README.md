@@ -106,6 +106,7 @@ alone.
 | `u` / `U`         | `jj undo` / `jj redo`                                         |
 | `/`               | set the log revset                                            |
 | `A`               | toggle the revset `all()`                                     |
+| `f` / `P`         | `jj git fetch` / `jj git push` (all panes, runs immediately)    |
 | `Ctrl-r`          | reload                                                        |
 | `?`               | toggle help                                                   |
 | `Esc`             | clear the file selection if there is one, otherwise quit      |
@@ -113,6 +114,12 @@ alone.
 
 Everything that rewrites history asks first (`y` / `Enter` confirms; **any** other key cancels), and
 the status bar always shows the working copy, the marked target, and the current rebase mode.
+
+Remote actions run in the background with a spinner and refresh the log on success or failure.
+The status bar shows jj's output, including warnings and errors. `P` runs plain `jj git push`:
+it does not create, move, or track bookmarks or allow new bookmarks automatically.
+While syncing, other actions are ignored and quit requests wait for completion. Configure
+noninteractive remote authentication beforehand; an authentication prompt may leave the operation waiting.
 
 ### Multi-selecting files
 

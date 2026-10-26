@@ -69,6 +69,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("u / U", "jj undo / jj redo"),
     ("/", "set the log revset"),
     ("A", "toggle revset all()"),
+    ("f / P", "jj git fetch / jj git push"),
     ("Ctrl-r", "reload"),
     ("? ", "toggle this help"),
     ("Esc", "clear file selection (if any), else quit"),
@@ -340,7 +341,20 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         StatusKind::Info => Style::default().fg(Color::Black).bg(Color::Cyan),
         StatusKind::Error => Style::default().fg(Color::White).bg(Color::Red),
     };
-    let left = Span::styled(format!(" {} ", app.status.text), style);
+    let message = match app.remote_progress() {
+        Some((label, elapsed)) => {
+            let spinner =
+                SPINNER[(elapsed.as_millis() / SPINNER_FRAME_MS) as usize % SPINNER.len()];
+            let quit = if app.remote_quit_requested() {
+                "; will quit when finished"
+            } else {
+                ""
+            };
+            format!("{spinner} {label}: running… ({}s){quit}", elapsed.as_secs())
+        }
+        None => app.status.text.clone(),
+    };
+    let left = Span::styled(format!(" {message} "), style);
     let selected = app.file_selection.count(app.file_selected, app.files.len());
     let sel = if selected > 0 {
         format!("sel:{selected}  ")
@@ -665,6 +679,8 @@ mod tests {
         // 画面を十分大きくして全行出す。KEYS が増えたとき help の箱が
         // 足りなくなるのをここで検知する。
         let joined = render(&mut app, 120, KEYS.len() as u16 + 4).join("\n");
+        assert!(joined.contains("f / P"), "{joined}");
+        assert!(joined.contains("jj git fetch / jj git push"), "{joined}");
         assert!(
             joined.contains("files: selection; diff: displayed file; log: inactive"),
             "file action scope is clipped: {joined}"
