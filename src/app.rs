@@ -1869,7 +1869,17 @@ mod tests {
             let description = format!("remote change {index}");
             run(peer.path(), &["describe", "-r", "@-", "-m", &description]);
             run(peer.path(), &["bookmark", "set", "shared", "-r", "@-"]);
-            run(peer.path(), &["git", "push", "--allow-new", "-b", "shared"]);
+            run(
+                peer.path(),
+                &[
+                    "--config",
+                    "git.push-new-bookmarks=true",
+                    "git",
+                    "push",
+                    "-b",
+                    "shared",
+                ],
+            );
             app.focus = focus;
             app.handle_key(key(KeyCode::Char('f')));
             assert!(app.remote_progress().is_some());
@@ -1886,7 +1896,17 @@ mod tests {
         let (tmp, mut app) = repo_or_skip!();
         let remote = bare_remote(tmp.path());
         run(tmp.path(), &["bookmark", "set", "shared", "-r", "@-"]);
-        run(tmp.path(), &["git", "push", "--allow-new", "-b", "shared"]);
+        run(
+            tmp.path(),
+            &[
+                "--config",
+                "git.push-new-bookmarks=true",
+                "git",
+                "push",
+                "-b",
+                "shared",
+            ],
+        );
         for (index, focus) in [Focus::Log, Focus::Files, Focus::Diff]
             .into_iter()
             .enumerate()
