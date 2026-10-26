@@ -2008,7 +2008,7 @@ mod tests {
                 "config",
                 "set",
                 "--repo",
-                "revset-aliases.trunk()",
+                "revset-aliases.'trunk()'",
                 "develop",
             ],
         );
@@ -2033,6 +2033,42 @@ mod tests {
     }
 
     #[test]
+    fn done_keeps_remote_trunk_name_when_local_bookmark_is_ahead() {
+        let (tmp, mut app) = repo_or_skip!();
+        let _remote = bare_remote(tmp.path());
+        run(tmp.path(), &["bookmark", "set", "main", "-r", "@---"]);
+        run(tmp.path(), &["bookmark", "set", "master", "-r", "@--"]);
+        run(
+            tmp.path(),
+            &[
+                "--config",
+                "git.push-new-bookmarks=true",
+                "git",
+                "push",
+                "-b",
+                "master",
+            ],
+        );
+        let remote_before = revision_id(tmp.path(), "master@origin");
+        let main_before = revision_id(tmp.path(), "main");
+        assert_eq!(revision_id(tmp.path(), "trunk()"), remote_before);
+        for _ in 0..2 {
+            assert_eq!(app.jj.trunk_bookmark(), "master");
+            app.handle_key(key(KeyCode::Char('d')));
+            wait_remote(&mut app);
+            assert_eq!(app.status.kind, StatusKind::Info, "{}", app.status.text);
+            assert!(app.status.text.contains("master -> @-"));
+            assert_eq!(
+                revision_id(tmp.path(), "master"),
+                revision_id(tmp.path(), "@-")
+            );
+            assert_eq!(revision_id(tmp.path(), "master@origin"), remote_before);
+            assert_eq!(revision_id(tmp.path(), "main"), main_before);
+            run(tmp.path(), &["new", "-m", "next change before push"]);
+        }
+    }
+
+    #[test]
     fn done_falls_back_to_main_for_missing_ambiguous_or_failed_trunk_lookup() {
         for trunk in ["root()", "@--", "missing_trunk"] {
             let (tmp, mut app) = repo_or_skip!();
@@ -2040,7 +2076,7 @@ mod tests {
             run(tmp.path(), &["bookmark", "set", "other", "-r", "@--"]);
             run(
                 tmp.path(),
-                &["config", "set", "--repo", "revset-aliases.trunk()", trunk],
+                &["config", "set", "--repo", "revset-aliases.'trunk()'", trunk],
             );
             app.handle_key(key(KeyCode::Char('d')));
             wait_remote(&mut app);
@@ -2070,7 +2106,7 @@ mod tests {
                     "config",
                     "set",
                     "--repo",
-                    "revset-aliases.trunk()",
+                    "revset-aliases.'trunk()'",
                     "root()",
                 ],
             );

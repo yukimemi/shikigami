@@ -275,18 +275,20 @@ impl Jj {
         self.exec_output(&["--no-pager", "--color", "never"], &["git", "push"], true)
     }
 
-    /// trunk bookmark 名。`trunk()` の指す change に付いた `@git` 以外の
-    /// bookmark 名がちょうど 1 つならその名前、照会失敗・なし・複数なら
+    /// trunk bookmark 名。`trunk()` の指す change に付いたローカルと
+    /// `@git` 以外のリモート bookmark 名がちょうど 1 つならその名前、照会失敗・なし・複数なら
     /// 意図しない bookmark を動かさないよう `main` に倒す。
     pub fn trunk_bookmark(&self) -> String {
         let out = self.read(&[
-            "bookmark",
-            "list",
-            "--all",
+            "log",
+            "--no-graph",
             "-r",
             "trunk()",
             "--template",
-            r#"if(remote != "git", name ++ "\n")"#,
+            concat!(
+                r#"local_bookmarks.map(|b| b.name() ++ "\n").join("") ++ "#,
+                r#"remote_bookmarks.map(|b| if(b.remote() != "git", b.name() ++ "\n")).join("")"#,
+            ),
         ]);
         let names: BTreeSet<String> = out
             .unwrap_or_default()
