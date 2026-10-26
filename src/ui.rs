@@ -72,7 +72,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("f / P", "jj git fetch / jj git push"),
     (
         "d",
-        "jj bookmark move trunk (else main) --to @- — then P to push",
+        "jj bookmark move trunk/main --to @-; then P to push",
     ),
     ("Ctrl-r", "reload"),
     ("? ", "toggle this help"),
@@ -686,10 +686,9 @@ mod tests {
         assert!(joined.contains("f / P"), "{joined}");
         assert!(joined.contains("jj git fetch / jj git push"), "{joined}");
         assert!(
-            joined.contains("jj bookmark move trunk (else main) --to @-"),
+            joined.contains("jj bookmark move trunk/main --to @-; then P to push"),
             "{joined}"
         );
-        assert!(joined.contains("then P to push"), "{joined}");
         assert!(
             joined.contains("files: selection; diff: displayed file; log: inactive"),
             "file action scope is clipped: {joined}"
