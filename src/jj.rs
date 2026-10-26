@@ -228,16 +228,7 @@ impl Jj {
     /// shikigami は description を要する操作では必ず `-m` / `-u` を渡す
     /// ので、この guard が発火するのは想定外のケースだけ。
     fn write(&self, args: &[&str]) -> Result<String> {
-        self.exec(
-            &[
-                "--no-pager",
-                "--color",
-                "never",
-                "--config",
-                "ui.editor=shikigami-refuses-to-open-an-editor",
-            ],
-            args,
-        )
+        self.exec_output(WRITE_GLOBALS, args, false)
     }
 
     fn exec(&self, globals: &[&str], args: &[&str]) -> Result<String> {
@@ -282,6 +273,49 @@ impl Jj {
     /// Deliberately leave bookmark selection and creation policy to jj.
     pub fn git_push(&self) -> Result<String> {
         self.exec_output(&["--no-pager", "--color", "never"], &["git", "push"], true)
+    }
+
+    /// trunk bookmark 名。`trunk()` の指す change に付いたローカル
+    /// bookmark がちょうど 1 つならその名前、照会失敗・なし・複数なら
+    /// 意図しない bookmark を動かさないよう `main` に倒す。
+    pub fn trunk_bookmark(&self) -> String {
+        let out = self.read(&[
+            "bookmark",
+            "list",
+            "-r",
+            "trunk()",
+            "--template",
+            r#"if(remote, "", name ++ "\n")"#,
+        ]);
+        let names: BTreeSet<String> = out
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .collect();
+        let mut it = names.into_iter();
+        match (it.next(), it.next()) {
+            (Some(name), None) => name,
+            _ => "main".to_string(),
+        }
+    }
+
+    /// `jj bookmark move <trunk> --to @-` (alias `done`)。移動先は
+    /// 選択行ではなく常に作業コピーの親。後退は jj の拒否に任せる。
+    pub fn bookmark_done(&self) -> Result<String> {
+        let name = self.trunk_bookmark();
+        let out = self.exec_output(
+            WRITE_GLOBALS,
+            &["bookmark", "move", &name, "--to", "@-"],
+            true,
+        )?;
+        let detail = out.trim();
+        Ok(if detail.is_empty() {
+            format!("moved {name} to @-")
+        } else {
+            format!("{name} -> @-: {detail}")
+        })
     }
 
     /// 起動時の環境チェック用。`jj --version` の 1 行目。
@@ -482,6 +516,14 @@ impl Jj {
         Ok(names.into_iter().collect())
     }
 }
+
+const WRITE_GLOBALS: &[&str] = &[
+    "--no-pager",
+    "--color",
+    "never",
+    "--config",
+    "ui.editor=shikigami-refuses-to-open-an-editor",
+];
 
 /// `jj log` の出力を行単位で [`Row`] に分解する。
 ///

@@ -70,6 +70,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("/", "set the log revset"),
     ("A", "toggle revset all()"),
     ("f / P", "jj git fetch / jj git push"),
+    (
+        "d",
+        "jj bookmark move trunk (else main) --to @- — then P to push",
+    ),
     ("Ctrl-r", "reload"),
     ("? ", "toggle this help"),
     ("Esc", "clear file selection (if any), else quit"),

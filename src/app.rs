@@ -52,6 +52,7 @@ struct AiJob {
 enum RemoteAction {
     Fetch,
     Push,
+    Done,
 }
 
 impl RemoteAction {
@@ -59,6 +60,7 @@ impl RemoteAction {
         match self {
             Self::Fetch => "fetch",
             Self::Push => "push",
+            Self::Done => "done",
         }
     }
 }
@@ -651,6 +653,7 @@ impl App {
             let result = match action {
                 RemoteAction::Fetch => jj.git_fetch(),
                 RemoteAction::Push => jj.git_push(),
+                RemoteAction::Done => jj.bookmark_done(),
             };
             // Refresh even on failure: a remote operation may partially succeed.
             let rows = jj.log(revset.as_deref());
@@ -1361,6 +1364,7 @@ impl App {
             KeyCode::Enter => self.edit_selected(),
             KeyCode::Char('f') => self.begin_remote(RemoteAction::Fetch),
             KeyCode::Char('P') => self.begin_remote(RemoteAction::Push),
+            KeyCode::Char('d') => self.begin_remote(RemoteAction::Done),
             KeyCode::Char('n') => self.prompt_new(),
             KeyCode::Char('e') => self.prompt_describe(),
             KeyCode::Char('c') => self.prompt_commit(),
@@ -1836,6 +1840,12 @@ mod tests {
         remote
     }
 
+    fn jj_stdout(dir: &Path, args: &[&str]) -> String {
+        let out = crate::testutil::jj_cmd(dir).args(args).output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
     fn remote_refs(remote: &Path) -> Vec<u8> {
         let output = Command::new("git")
             .arg("--git-dir")
@@ -1980,6 +1990,69 @@ mod tests {
     }
 
     #[test]
+    fn done_moves_main_to_parent_from_any_selection_and_reloads() {
+        let (tmp, mut app) = repo_or_skip!();
+        run(tmp.path(), &["bookmark", "create", "main", "-r", "@---"]);
+        app.reload().unwrap();
+        app.focus = Focus::Diff;
+        app.handle_key(key(KeyCode::Char('G')));
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(app.remote_progress().is_some());
+        wait_remote(&mut app);
+        assert_eq!(app.status.kind, StatusKind::Info, "{}", app.status.text);
+        assert!(
+            app.status.text.starts_with("done: main"),
+            "{}",
+            app.status.text
+        );
+        let at = jj_stdout(
+            tmp.path(),
+            &["log", "-r", "main", "--no-graph", "-T", "description"],
+        );
+        assert_eq!(at.trim(), "second change");
+        assert!(app.status_fresh);
+    }
+
+    #[test]
+    fn done_refuses_backwards_move_and_still_refreshes() {
+        let (tmp, mut app) = repo_or_skip!();
+        run(tmp.path(), &["bookmark", "create", "main", "-r", "@"]);
+        run(tmp.path(), &["describe", "-m", "changed before done"]);
+        app.handle_key(key(KeyCode::Char('d')));
+        wait_remote(&mut app);
+        assert_eq!(app.status.kind, StatusKind::Error);
+        assert!(
+            app.status.text.starts_with("done failed:"),
+            "{}",
+            app.status.text
+        );
+        assert!(descriptions(&app).contains(&"changed before done".into()));
+    }
+
+    #[test]
+    fn trunk_bookmark_follows_alias_and_falls_back_to_main() {
+        let (tmp, app) = repo_or_skip!();
+        assert_eq!(app.jj.trunk_bookmark(), "main");
+        run(tmp.path(), &["bookmark", "create", "develop", "-r", "@-"]);
+        run(
+            tmp.path(),
+            &[
+                "config",
+                "set",
+                "--repo",
+                "revset-aliases.'trunk()'",
+                "develop",
+            ],
+        );
+        assert_eq!(app.jj.trunk_bookmark(), "develop");
+        run(
+            tmp.path(),
+            &["bookmark", "create", "other", "-r", "develop"],
+        );
+        assert_eq!(app.jj.trunk_bookmark(), "main");
+    }
+
+    #[test]
     fn remote_job_blocks_actions_defers_quit_and_preserves_errors() {
         let (_tmp, mut app) = repo_or_skip!();
         let (tx, rx) = mpsc::channel();
@@ -2002,7 +2075,7 @@ mod tests {
         assert!(screen.contains("push: running… (0s)"), "{screen}");
         assert!(screen.chars().any(|c| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(c)));
         let selected = app.selected;
-        for code in ['j', 'n', 'f', 'P', 'u', '?', 'q'] {
+        for code in ['j', 'n', 'f', 'P', 'd', 'u', '?', 'q'] {
             app.handle_key(key(KeyCode::Char(code)));
         }
         assert_eq!(app.selected, selected);
