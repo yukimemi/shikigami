@@ -1133,21 +1133,38 @@ impl App {
                 self.report_batch("restore", count, 0, result);
             }
             ConfirmAction::UntrackFile {
-                ignore,
+                ignore: false,
                 paths,
                 count,
                 skipped,
             } => {
                 self.file_selection.clear();
-                // `i` は先に ignore する。`I` はルールを変更せず jj の判定に任せる。
-                // ignore の書き込みに失敗したら jj は呼ばない。
-                if ignore && let Err(err) = crate::gitignore::ignore_paths(self.jj.root(), &paths) {
+                // `I`: `.gitignore` には一切触らず、ignore 済みでないパスは
+                // jj の拒否をそのまま報告する (全部か無しか)。
+                let result = self.jj.file_untrack(&paths);
+                let refused = result.is_err();
+                self.report_batch("untrack", count, skipped, result);
+                if refused {
+                    self.status
+                        .text
+                        .push_str(" (.gitignore unchanged; use i to ignore + untrack)");
+                }
+            }
+            ConfirmAction::UntrackFile {
+                ignore: true,
+                paths,
+                count,
+                skipped,
+            } => {
+                self.file_selection.clear();
+                // `i`: jj は ignore 済みでないパスの untrack を拒否するので
+                // `.gitignore` が先。書き込みに失敗したら jj は呼ばない。
+                if let Err(err) = crate::gitignore::ignore_paths(self.jj.root(), &paths) {
                     self.status = Status::error(format!("untrack failed: .gitignore: {err}"));
                     return;
                 }
                 let result = self.jj.file_untrack(&paths);
-                let refused = result.is_err();
-                if ignore && refused {
+                if result.is_err() {
                     // 追記は巻き戻さない (再実行は dedupe で冪等)。
                     self.report_batch(
                         "untrack (.gitignore updated, untrack failed)",
@@ -1157,11 +1174,6 @@ impl App {
                     );
                 } else {
                     self.report_batch("untrack", count, skipped, result);
-                    if refused {
-                        self.status
-                            .text
-                            .push_str(" (.gitignore unchanged; use i to ignore + untrack)");
-                    }
                 }
             }
             ConfirmAction::Undo => {
