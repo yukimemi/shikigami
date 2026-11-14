@@ -468,8 +468,9 @@ impl Jj {
         self.write(&args)
     }
 
-    /// 作業コピーでの追跡を外す (`jj file untrack`)。呼び出し側は先に
-    /// `.gitignore` へ追記しておくこと (jj は ignore 済みでないパスを拒否する)。
+    /// 作業コピーでの追跡を外す (`jj file untrack`)。`i` は先に
+    /// `.gitignore` へ追記し、`I` は変更しない。ignore 済みでも auto-track
+    /// 対象外でもなく、直ちに再追跡されるパスがあると jj はバッチ全体を拒否する。
     pub fn file_untrack(&self, paths: &[String]) -> Result<String> {
         let filesets = root_filesets(paths);
         let mut args = vec!["file", "untrack"];
