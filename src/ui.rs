@@ -43,6 +43,14 @@ pub const KEYS: &[(&str, &str)] = &[
         "i (files/diff)",
         "ignore + untrack (working copy; asks first)",
     ),
+    (
+        "I (files/diff)",
+        "untrack only; keep .gitignore (@ only; asks first)",
+    ),
+    (
+        "I policy",
+        "keep files; jj refuses batch if any path is auto-tracked",
+    ),
     ("o (files/diff)", "open in $EDITOR / $VISUAL"),
     (
         "file targets",
@@ -481,18 +489,15 @@ fn draw_input(
 }
 
 fn draw_confirm(frame: &mut Frame, prompt: &str) {
-    let area = centered(frame, 72, 4);
+    let area = centered(frame, 72, prompt.lines().count() as u16 + 3);
     frame.render_widget(Clear, area);
+    let mut lines: Vec<Line> = prompt.lines().map(Line::from).collect();
+    lines.push(Line::from(Span::styled(
+        "y / Enter: yes    any other key: cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(prompt.to_string()),
-            Line::from(Span::styled(
-                "y / Enter: yes    any other key: cancel",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ])
-        .wrap(Wrap { trim: true })
-        .block(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
                 .title(" confirm ".bold())
@@ -674,6 +679,25 @@ mod tests {
     }
 
     #[test]
+    fn untrack_only_confirmation_shows_preservation_and_refusal_policy() {
+        let (tmp, mut app) = repo_or_skip!();
+        std::fs::write(tmp.path().join("untrack.txt"), "keep me\n").unwrap();
+        app.reload().unwrap();
+        app.sync_diff(80);
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('I')));
+        let joined = render(&mut app, 100, 20).join("\n");
+        for text in [
+            "untrack untrack.txt in the working copy?",
+            "keep files on disk; leave .gitignore unchanged.",
+            "jj may refuse paths that would be auto-tracked again.",
+            "y / Enter: yes",
+        ] {
+            assert!(joined.contains(text), "missing {text}:\n{joined}");
+        }
+    }
+
+    #[test]
     fn help_overlay_lists_every_documented_key() {
         let (_tmp, mut app) = repo_or_skip!();
         app.handle_key(key(KeyCode::Char('?')));
@@ -690,6 +714,12 @@ mod tests {
             joined.contains("files: selection; diff: displayed file; log: inactive"),
             "file action scope is clipped: {joined}"
         );
+        for description in [
+            "untrack only; keep .gitignore (@ only; asks first)",
+            "keep files; jj refuses batch if any path is auto-tracked",
+        ] {
+            assert!(joined.contains(description), "{joined}");
+        }
         for (keys, _) in KEYS {
             assert!(
                 joined.contains(keys.trim()),

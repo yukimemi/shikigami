@@ -193,8 +193,9 @@ pub enum ConfirmAction {
         /// 対象ファイル数 (`paths` はリネームで 2 倍になりうる)。
         count: usize,
     },
-    /// `.gitignore` へ追記してから `jj file untrack` する。
+    /// 必要なら `.gitignore` へ追記してから `jj file untrack` する。
     UntrackFile {
+        ignore: bool,
         paths: Vec<String>,
         count: usize,
         skipped: usize,
@@ -1132,13 +1133,32 @@ impl App {
                 self.report_batch("restore", count, 0, result);
             }
             ConfirmAction::UntrackFile {
+                ignore: false,
                 paths,
                 count,
                 skipped,
             } => {
                 self.file_selection.clear();
-                // jj は ignore 済みでないパスの untrack を拒否するので、
-                // `.gitignore` が先。失敗したら jj は呼ばない。
+                // `I`: `.gitignore` には一切触らず、ignore 済みでないパスは
+                // jj の拒否をそのまま報告する (全部か無しか)。
+                let result = self.jj.file_untrack(&paths);
+                let refused = result.is_err();
+                self.report_batch("untrack", count, skipped, result);
+                if refused {
+                    self.status
+                        .text
+                        .push_str(" (.gitignore unchanged; use i to ignore + untrack)");
+                }
+            }
+            ConfirmAction::UntrackFile {
+                ignore: true,
+                paths,
+                count,
+                skipped,
+            } => {
+                self.file_selection.clear();
+                // `i`: jj は ignore 済みでないパスの untrack を拒否するので
+                // `.gitignore` が先。書き込みに失敗したら jj は呼ばない。
                 if let Err(err) = crate::gitignore::ignore_paths(self.jj.root(), &paths) {
                     self.status = Status::error(format!("untrack failed: .gitignore: {err}"));
                     return;
@@ -1379,7 +1399,10 @@ impl App {
                 self.absorb_file()
             }
             KeyCode::Char('i') if matches!(self.focus, Focus::Files | Focus::Diff) => {
-                self.confirm_untrack_file()
+                self.confirm_untrack_file(true)
+            }
+            KeyCode::Char('I') if matches!(self.focus, Focus::Files | Focus::Diff) => {
+                self.confirm_untrack_file(false)
             }
             KeyCode::Char('o') if matches!(self.focus, Focus::Files | Focus::Diff) => {
                 self.open_selected_file_in_editor()
@@ -1665,7 +1688,7 @@ impl App {
 
     /// files pane の選択、または diff pane の表示中ファイルの追跡を外す
     /// 確認ダイアログを開く。`jj file untrack` は作業コピーにしか効かない。
-    fn confirm_untrack_file(&mut self) {
+    fn confirm_untrack_file(&mut self, ignore: bool) {
         let Some(change) = self.selected_change().cloned() else {
             return;
         };
@@ -1688,10 +1711,17 @@ impl App {
             format!("{} files", plan.count)
         };
         self.mode = Mode::Confirm(Confirm {
-            prompt: format!(
-                "untrack {what} — append to the root .gitignore and stop tracking in the working copy?"
-            ),
+            prompt: if ignore {
+                format!(
+                    "untrack {what} — append to the root .gitignore and stop tracking in the working copy?"
+                )
+            } else {
+                format!(
+                    "untrack {what} in the working copy?\nkeep files on disk; leave .gitignore unchanged.\njj may refuse paths that would be auto-tracked again."
+                )
+            },
             action: ConfirmAction::UntrackFile {
+                ignore,
                 paths: plan.paths,
                 count: plan.count,
                 skipped: plan.skipped,
@@ -2723,11 +2753,14 @@ mod tests {
     #[test]
     fn diff_actions_ignore_marks_and_visual_ranges() {
         for visual in [false, true] {
-            for action in ['o', 'r', 'i'] {
+            for action in ['o', 'r', 'i', 'I'] {
                 let Some((tmp, mut app)) = app_with_wc_files() else {
                     report_skip();
                     return;
                 };
+                if action == 'I' {
+                    std::fs::write(tmp.path().join(".gitignore"), "/y.txt\n").unwrap();
+                }
                 app.editor_cmd = Some("true".into());
                 app.file_selection.toggle(0);
                 if visual {
@@ -2773,7 +2806,7 @@ mod tests {
                 app.handle_key(key(KeyCode::Char('y')));
                 assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
                 assert!(!app.file_selection.is_active());
-                if action == 'i' {
+                if matches!(action, 'i' | 'I') {
                     assert_eq!(
                         std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap(),
                         "/y.txt\n"
@@ -2798,7 +2831,7 @@ mod tests {
         app.file_selection.toggle(0);
         let selection = app.file_selection.clone();
         let status = app.status.clone();
-        for action in ['o', 'i', 'r', 'p'] {
+        for action in ['o', 'i', 'I', 'r', 'p'] {
             app.handle_key(key(KeyCode::Char(action)));
             assert!(matches!(app.mode, Mode::Normal));
             assert!(app.take_pending_editor().is_none());
@@ -2822,19 +2855,23 @@ mod tests {
         assert!(app.status.text.contains("y.txt"));
         assert!(app.file_selection.is_active());
         app.files[1].status = 'D';
-        app.handle_key(key(KeyCode::Char('i')));
-        assert_eq!(app.status.kind, StatusKind::Error);
-        assert!(matches!(app.mode, Mode::Normal));
-        assert!(app.file_selection.is_active());
+        for action in ['i', 'I'] {
+            app.handle_key(key(KeyCode::Char(action)));
+            assert_eq!(app.status.kind, StatusKind::Error);
+            assert!(matches!(app.mode, Mode::Normal));
+            assert!(app.file_selection.is_active());
+        }
         let Row::Change { change, .. } = &mut app.rows[app.selected] else {
             panic!("expected change");
         };
         change.is_working_copy = false;
         app.files[1].status = 'M';
-        app.handle_key(key(KeyCode::Char('i')));
-        assert!(app.status.text.contains("working-copy"));
-        assert!(matches!(app.mode, Mode::Normal));
-        assert!(app.file_selection.is_active());
+        for action in ['i', 'I'] {
+            app.handle_key(key(KeyCode::Char(action)));
+            assert!(app.status.text.contains("working-copy"));
+            assert!(matches!(app.mode, Mode::Normal));
+            assert!(app.file_selection.is_active());
+        }
     }
 
     #[test]
@@ -2850,8 +2887,10 @@ mod tests {
         let selection = app.file_selection.clone();
         assert!(app.action_file_targets().is_empty());
         let status_before = app.status.clone();
-        app.handle_key(key(KeyCode::Char('i')));
-        assert!(matches!(app.mode, Mode::Normal), "{:?}", app.mode);
+        for action in ['i', 'I'] {
+            app.handle_key(key(KeyCode::Char(action)));
+            assert!(matches!(app.mode, Mode::Normal), "{:?}", app.mode);
+        }
         app.handle_key(key(KeyCode::Char('r')));
         assert!(matches!(app.mode, Mode::Normal), "{:?}", app.mode);
         app.handle_key(key(KeyCode::Char('p')));
@@ -2861,6 +2900,99 @@ mod tests {
         assert!(app.take_pending_editor().is_none());
         assert_eq!(app.status, status_before);
         assert_eq!(app.file_selection, selection);
+    }
+
+    #[test]
+    fn untrack_only_refusal_preserves_gitignore_and_the_entire_batch() {
+        // No ignore file, unrelated rules, and a mixed ignored/unignored batch.
+        for ignore_contents in [None, Some("# keep\r\n/unrelated\r\n"), Some("/x.txt\n")] {
+            let Some((tmp, mut app)) = app_with_wc_files() else {
+                report_skip();
+                return;
+            };
+            let dir = tmp.path();
+            run(
+                dir,
+                &["config", "set", "--repo", "snapshot.auto-track", "all()"],
+            );
+            if let Some(contents) = ignore_contents {
+                std::fs::write(dir.join(".gitignore"), contents).unwrap();
+            }
+            if ignore_contents.is_some() {
+                app.file_selection.toggle(0);
+                app.file_selection.toggle(1);
+            }
+            app.handle_key(key(KeyCode::Char('I')));
+            let Mode::Confirm(confirm) = &app.mode else {
+                panic!("expected confirmation: {:?}", app.mode);
+            };
+            let what = if ignore_contents.is_some() {
+                "2 files"
+            } else {
+                "x.txt"
+            };
+            assert!(confirm.prompt.contains(what));
+            assert!(confirm.prompt.contains(".gitignore unchanged"));
+            assert!(confirm.prompt.contains("keep files on disk"));
+            assert!(confirm.prompt.contains("jj may refuse"));
+            app.handle_key(key(KeyCode::Char('y')));
+            assert_eq!(app.status.kind, StatusKind::Error, "{:?}", app.status);
+            assert!(app.status.text.contains(".gitignore unchanged"));
+            assert!(app.status.text.contains("use i"));
+            assert!(!app.file_selection.is_active());
+            assert_eq!(
+                std::fs::read(dir.join(".gitignore")).ok(),
+                ignore_contents.map(|contents| contents.as_bytes().to_vec())
+            );
+            let listed = jj_stdout(dir, &["file", "list"]);
+            for path in ["x.txt", "y.txt", "z.txt"] {
+                assert!(listed.lines().any(|line| line == path), "{listed}");
+                assert!(dir.join(path).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn untrack_only_keeps_existing_ignore_rules_and_untracks_selected_files() {
+        for visual in [false, true] {
+            let Some((tmp, mut app)) = app_with_wc_files() else {
+                report_skip();
+                return;
+            };
+            let dir = tmp.path();
+            let contents = b"# handwritten rules\r\n/x.txt\r\n/y.txt\r\n";
+            // These files were tracked before the rules were written.
+            std::fs::write(dir.join(".gitignore"), contents).unwrap();
+            if visual {
+                app.file_selection.start_visual(0);
+                app.file_selected = 1;
+            } else {
+                app.file_selection.toggle(0);
+                app.file_selection.toggle(1);
+            }
+            let selection = app.file_selection.clone();
+            app.handle_key(key(KeyCode::Char('I')));
+            app.handle_key(key(KeyCode::Char('n')));
+            assert_eq!(app.file_selection, selection);
+            assert!(
+                jj_stdout(dir, &["file", "list"])
+                    .lines()
+                    .any(|line| line == "x.txt")
+            );
+            assert_eq!(std::fs::read(dir.join(".gitignore")).unwrap(), contents);
+            app.handle_key(key(KeyCode::Char('I')));
+            app.file_selected = 2; // Confirmation freezes the original target set.
+            app.handle_key(key(KeyCode::Char('y')));
+            assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+            assert!(!app.file_selection.is_active());
+            assert_eq!(std::fs::read(dir.join(".gitignore")).unwrap(), contents);
+            let listed = jj_stdout(dir, &["file", "list"]);
+            for path in ["x.txt", "y.txt"] {
+                assert!(!listed.lines().any(|line| line == path), "{listed}");
+                assert!(dir.join(path).exists());
+            }
+            assert!(listed.lines().any(|line| line == "z.txt"), "{listed}");
+        }
     }
 
     #[test]
