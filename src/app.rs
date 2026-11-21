@@ -480,8 +480,10 @@ impl App {
 
     /// 非同期 diff ワーカーが進行中、または読み込み待ち状態にあるか。
     pub fn is_diff_loading(&self) -> bool {
-        matches!(self.diff_body, DiffBody::LoadingMeta | DiffBody::LoadingDiff)
-            || self.diff_workers.is_busy()
+        matches!(
+            self.diff_body,
+            DiffBody::LoadingMeta | DiffBody::LoadingDiff
+        ) || self.diff_workers.is_busy()
     }
 
     /// 起動直後のテスト用: バックグラウンドの初回 `jj log` が終わるまで待つ。
@@ -502,7 +504,10 @@ impl App {
         self.sync_diff(diff_width);
         let deadline = Instant::now() + Duration::from_secs(30);
         while self.is_diff_loading() {
-            assert!(Instant::now() < deadline, "timed out waiting for diff worker");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for diff worker"
+            );
             if preserve_fresh {
                 self.status_fresh = true;
             }
@@ -908,8 +913,10 @@ impl App {
                     header_raw,
                     header_text,
                 } => {
-                    self.diff_cache
-                        .insert(resp.commit_id.clone(), CommitCache::new(files.clone(), header_raw));
+                    self.diff_cache.insert(
+                        resp.commit_id.clone(),
+                        CommitCache::new(files.clone(), header_raw),
+                    );
                     self.header_cache
                         .insert(resp.commit_id.clone(), Arc::clone(&header_text));
                     if is_current {
@@ -972,8 +979,8 @@ impl App {
                         && self.shown_commit.as_deref() == Some(resp.commit_id.as_str())
                         && self.last_diff_width == Some(resp.width)
                         && self.diff_filter_cmd.is_none();
-                    let current_file_key = is_current_commit
-                        .then(|| DiffFileKey::from_file(self.selected_file()));
+                    let current_file_key =
+                        is_current_commit.then(|| DiffFileKey::from_file(self.selected_file()));
 
                     for (file_key, text) in entries {
                         if current_file_key.as_ref() == Some(&file_key) {
@@ -4608,7 +4615,9 @@ mod tests {
         (tmp, app)
     }
 
-    fn sample_multi_file_commit() -> (Vec<DiffFile>, String, Vec<(Vec<String>, String)>) {
+    type SampleCommit = (Vec<DiffFile>, String, Vec<(Vec<String>, String)>);
+
+    fn sample_multi_file_commit() -> SampleCommit {
         let files = vec![
             DiffFile {
                 status: 'M',
@@ -4708,20 +4717,25 @@ mod tests {
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.file_selected, 3);
         assert_eq!(
-            app.file_selection.selected(app.file_selected, app.files.len()),
+            app.file_selection
+                .selected(app.file_selected, app.files.len()),
             vec![0, 1, 2, 3]
         );
         app.handle_key(key(KeyCode::Char('k')));
         assert_eq!(app.file_selected, 2);
         assert_eq!(
-            app.file_selection.selected(app.file_selected, app.files.len()),
+            app.file_selection
+                .selected(app.file_selected, app.files.len()),
             vec![0, 1, 2]
         );
         // Non-blocking sync_diff during rapid moves must preserve header,
         // show loading state (not stale file 0 diff), and NOT spawn extra batches.
         app.sync_diff(100);
         let loading_text = app.diff_plain_text();
-        assert!(loading_text.contains("Commit header: multi"), "{loading_text}");
+        assert!(
+            loading_text.contains("Commit header: multi"),
+            "{loading_text}"
+        );
         assert!(loading_text.contains("loading diff…"), "{loading_text}");
         assert!(!loading_text.contains("new_alpha"), "{loading_text}");
         assert_eq!(backend.diff_git_calls.load(Ordering::SeqCst), 1);
@@ -4742,7 +4756,10 @@ mod tests {
         for idx in [0, 1, 3, 2, 0, 3, 1] {
             app.file_selected = idx;
             app.sync_diff(100);
-            assert!(!app.is_diff_loading(), "expected warm cache hit for idx {idx}");
+            assert!(
+                !app.is_diff_loading(),
+                "expected warm cache hit for idx {idx}"
+            );
         }
         assert_eq!(backend.diff_git_calls.load(Ordering::SeqCst), 1);
         assert_eq!(backend.delta_batch_calls.load(Ordering::SeqCst), 1);
@@ -4901,7 +4918,10 @@ mod tests {
         app2.sync_diff_blocking(80);
         let fallback_text = app2.diff_plain_text();
         assert!(fallback_text.contains("RAW_ALPHA"), "{fallback_text}");
-        assert!(!fallback_text.contains("STRAY_OUTSIDE_MARKERS"), "{fallback_text}");
+        assert!(
+            !fallback_text.contains("STRAY_OUTSIDE_MARKERS"),
+            "{fallback_text}"
+        );
         assert_eq!(backend2.delta_batch_calls.load(Ordering::SeqCst), 1);
         // Switching to file 1 stays on fallback for this commit (does not retry broken delta).
         app2.file_selected = 1;
@@ -4930,7 +4950,10 @@ mod tests {
 
         let (tmp, mut app) = repo_or_skip!();
         let dir = tmp.path();
-        run(dir, &["config", "set", "--repo", "ui.diff-formatter", ":git"]);
+        run(
+            dir,
+            &["config", "set", "--repo", "ui.diff-formatter", ":git"],
+        );
         std::fs::write(dir.join("old space.txt"), "hello\n").unwrap();
         std::fs::write(dir.join("mode.sh"), "#!/bin/sh\necho hi\n").unwrap();
         run(dir, &["new", "-m", "batch delta showcase"]);
@@ -4943,9 +4966,13 @@ mod tests {
         app.diff_filter_cmd = None;
         app.diff_batch_config = Some(DeltaBatchConfig::delta_v1());
         app.reload().unwrap();
-        while app.selected_change().unwrap().description != "batch delta showcase" {
-            app.handle_key(key(KeyCode::Char('j')));
+        while !app.selected_change().unwrap().is_working_copy {
+            app.handle_key(key(KeyCode::Char('k')));
         }
+        assert_eq!(
+            app.selected_change().unwrap().description,
+            "batch delta showcase"
+        );
         app.sync_diff_blocking(100);
         assert_eq!(app.files.len(), 5, "{:?}", app.files);
 

@@ -469,6 +469,11 @@ impl RenderedDiffCache {
         self.map.len()
     }
 
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     fn evict_excess(&mut self) {
         while self.total_bytes > self.max_bytes || self.map.len() > self.max_entries {
             let Some(oldest) = self.order.pop_front() else {

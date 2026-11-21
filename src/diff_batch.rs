@@ -808,7 +808,10 @@ pub fn decode_git_path(token: &str) -> Result<String> {
                 out.push(val as u8);
                 i += 3;
             }
-            other => bail!("unsupported escape \\{} in C-quoted git path: {token:?}", other as char),
+            other => bail!(
+                "unsupported escape \\{} in C-quoted git path: {token:?}",
+                other as char
+            ),
         }
     }
     String::from_utf8(out).with_context(|| format!("invalid UTF-8 in C-quoted git path: {token:?}"))
@@ -926,7 +929,9 @@ mod tests {
         // Wrong status ('M' instead of 'A') must not match.
         assert!(parse_and_match_git_patch(patch, &[file('M', "a.txt")]).is_err());
         // Extra file in summary must not match.
-        assert!(parse_and_match_git_patch(patch, &[file('A', "a.txt"), file('A', "b.txt")]).is_err());
+        assert!(
+            parse_and_match_git_patch(patch, &[file('A', "a.txt"), file('A', "b.txt")]).is_err()
+        );
         // Wrong path must not match.
         assert!(parse_and_match_git_patch(patch, &[file('A', "other.txt")]).is_err());
     }
@@ -1008,7 +1013,11 @@ mod tests {
         let sections = extract_and_validate_delta_output(&raw_out, &framed, files.len()).unwrap();
         assert_eq!(sections.len(), 4);
         assert!(sections[0].contains("mode_only.txt"), "{}", sections[0]);
-        assert!(!sections[1].contains("mode_only.txt"), "bleed into rename: {}", sections[1]);
+        assert!(
+            !sections[1].contains("mode_only.txt"),
+            "bleed into rename: {}",
+            sections[1]
+        );
         assert!(sections[1].contains("old space.txt"), "{}", sections[1]);
         assert!(sections[1].contains("new space.txt"), "{}", sections[1]);
         assert!(sections[2].contains("bin.dat"), "{}", sections[2]);

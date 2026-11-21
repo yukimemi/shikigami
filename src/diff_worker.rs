@@ -542,6 +542,7 @@ fn body_worker_loop(
     }
 }
 
+type BatchDeltaOutput = (Arc<String>, Vec<(DiffFileKey, Arc<Text<'static>>)>);
 fn execute_batch_delta(
     backend: &dyn DiffBackend,
     config: &DeltaBatchConfig,
@@ -549,7 +550,7 @@ fn execute_batch_delta(
     files: &[DiffFile],
     width: u16,
     cached_raw_patch: Option<&Arc<String>>,
-) -> Result<(Arc<String>, Vec<(DiffFileKey, Arc<Text<'static>>)>)> {
+) -> Result<BatchDeltaOutput> {
     let raw_patch = match cached_raw_patch {
         Some(cached) => Arc::clone(cached),
         None => Arc::new(backend.diff_git_full(commit_id)?),
