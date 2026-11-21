@@ -232,6 +232,8 @@ setup carry straight through:
 
   Diff subprocesses reject stdout over 32 MiB and retain at most 256 KiB of stderr. The
   on-disk diff cache ignores files over 64 MiB.
+  Cached change headers are also parsed off the UI thread. `Ctrl-r` clears file marks
+  and visual selection but keeps the file cursor when the commit ID is unchanged.
 
 ## Opening files in your editor
 

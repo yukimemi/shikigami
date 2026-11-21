@@ -21,7 +21,7 @@ use crate::cache::{
 use crate::diff_batch::DeltaBatchConfig;
 use crate::diff_worker::{
     BodyOutcome, BodyRequest, BodyStrategy, DiffBackend, DiffWorkers, MetaOutcome, MetaRequest,
-    RealDiffBackend, SingleBodyPayload, parse_ansi,
+    RealDiffBackend, SingleBodyPayload,
 };
 use crate::jj::{Change, DiffFile, Jj, RebaseMode, Row};
 use crate::selection::{FileSelection, plan_absorb, plan_open, plan_restore, plan_untrack};
@@ -299,7 +299,7 @@ pub struct App {
     /// diff pane の本文 (共有済み ANSI 解決済み Text / 読み込み中状態)。
     pub diff_body: DiffBody,
     /// 選択中 change で変更されたファイル一覧 (lazygit の files pane 相当)。
-    pub files: Vec<DiffFile>,
+    pub files: Arc<Vec<DiffFile>>,
     /// `files` の index。ここで選んだ 1 ファイルだけが `diff` に出る。
     pub file_selected: usize,
     /// files pane の複数選択 (mark + visual 範囲)。`marked` (change の
@@ -390,7 +390,7 @@ impl App {
             rebase_mode: RebaseMode::Revision,
             layout: PaneLayout::Stacked,
             diff_body: DiffBody::Empty,
-            files: Vec::new(),
+            files: Arc::default(),
             file_selected: 0,
             file_selection: FileSelection::default(),
             header: Arc::new(Text::default()),
@@ -765,7 +765,7 @@ impl App {
         self.shown_diff = None;
         let current_commit = self.selected_change().map(|c| c.full_commit_id.as_str());
         if self.shown_commit.as_deref() != current_commit {
-            self.files.clear();
+            self.files = Arc::default();
             self.file_selected = 0;
             self.header = Arc::new(Text::default());
             self.diff_body = DiffBody::Empty;
@@ -879,47 +879,34 @@ impl App {
             if resp.generation != self.generation {
                 continue;
             }
-            let is_current = self
-                .selected_change()
-                .is_some_and(|c| c.full_commit_id == resp.commit_id);
+            let is_current = self.shown_commit.as_deref() != Some(resp.commit_id.as_str())
+                && self
+                    .selected_change()
+                    .is_some_and(|c| c.full_commit_id == resp.commit_id);
             match resp.outcome {
                 MetaOutcome::Ready {
                     files,
                     header_raw,
                     header_text,
                 } => {
-                    self.diff_cache.insert(
-                        resp.commit_id.clone(),
-                        CommitCache::new(files.clone(), header_raw),
-                    );
+                    if let Some(header_raw) = header_raw
+                        && !self.diff_cache.contains(&resp.commit_id)
+                    {
+                        self.diff_cache.insert(
+                            resp.commit_id.clone(),
+                            CommitCache::new(Arc::clone(&files), header_raw),
+                        );
+                    }
                     self.header_cache
                         .insert(resp.commit_id.clone(), Arc::clone(&header_text));
                     if is_current {
-                        self.files = files;
-                        self.header = header_text;
-                        self.file_selected = 0;
-                        self.file_selection.clear();
-                        self.shown_commit = Some(resp.commit_id);
-                        self.loading_meta_commit = None;
-                        self.shown_diff = None;
-                        self.loading_diff_key = None;
-                        self.diff_body = DiffBody::LoadingDiff;
-                        self.diff_scroll = 0;
+                        self.show_diff_meta(resp.commit_id, files, header_text);
                     }
                 }
                 MetaOutcome::Error { files, header_text } => {
                     // 失敗はキャッシュしない。現在選択中の commit だけ表示に反映する。
                     if is_current {
-                        self.files = files;
-                        self.header = header_text;
-                        self.file_selected = 0;
-                        self.file_selection.clear();
-                        self.shown_commit = Some(resp.commit_id);
-                        self.loading_meta_commit = None;
-                        self.loading_diff_key = None;
-                        self.diff_body = DiffBody::LoadingDiff;
-                        self.diff_scroll = 0;
-                        self.shown_diff = None;
+                        self.show_diff_meta(resp.commit_id, files, header_text);
                     }
                 }
             }
@@ -988,6 +975,26 @@ impl App {
                 }
             }
         }
+    }
+
+    fn show_diff_meta(
+        &mut self,
+        commit_id: String,
+        files: Arc<Vec<DiffFile>>,
+        header: Arc<Text<'static>>,
+    ) {
+        self.files = files;
+        self.header = header;
+        self.file_selected = 0;
+        self.file_selection.clear();
+        self.shown_commit = Some(commit_id);
+        self.loading_meta_commit = None;
+        self.shown_diff = None;
+        self.loading_diff_key = None;
+        self.pending_filter_error = None;
+        self.diff_body = DiffBody::LoadingDiff;
+        self.diff_scroll = 0;
+        self.diff_workers.cancel_pending_meta();
     }
 
     fn apply_single_body(
@@ -1066,7 +1073,7 @@ impl App {
         let status_just_reported = std::mem::take(&mut self.status_fresh);
 
         let Some(change) = self.selected_change() else {
-            self.files.clear();
+            self.files = Arc::default();
             self.file_selected = 0;
             self.file_selection.clear();
             self.header = Arc::new(Text::default());
@@ -1083,56 +1090,40 @@ impl App {
 
         // 1. コミットメタデータ (files + header) の同期。
         if self.shown_commit.as_deref() != Some(commit_id.as_str()) {
-            if self.diff_cache.contains(&commit_id) {
-                self.diff_cache.touch(&commit_id);
-                let entry = self
-                    .diff_cache
-                    .get(&commit_id)
-                    .expect("checked contains above");
-                let files = entry.files.clone();
-                let header = match self.header_cache.get(&commit_id) {
-                    Some(h) => h,
-                    None => {
-                        let parsed = parse_ansi(&entry.header_raw);
-                        self.header_cache
-                            .insert(commit_id.clone(), Arc::clone(&parsed));
-                        parsed
-                    }
-                };
-                self.files = files;
-                self.header = header;
+            if self
+                .loading_meta_commit
+                .as_ref()
+                .is_some_and(|(cid, g)| cid == &commit_id && *g == self.generation)
+            {
+                return;
+            }
+
+            self.diff_cache.touch(&commit_id);
+            let cached = self.diff_cache.get(&commit_id);
+            if let Some(entry) = cached
+                && let Some(header) = self.header_cache.get(&commit_id)
+            {
+                self.show_diff_meta(commit_id.clone(), Arc::clone(&entry.files), header);
+            } else {
+                // 生ヘッダのキャッシュヒットも含め、ANSI 変換はワーカーに任せる。
+                let cached =
+                    cached.map(|entry| (Arc::clone(&entry.files), Arc::clone(&entry.header_raw)));
+                self.files = Arc::default();
                 self.file_selected = 0;
                 self.file_selection.clear();
-                self.shown_commit = Some(commit_id.clone());
-                self.loading_meta_commit = None;
+                self.header = Arc::default();
+                self.diff_body = DiffBody::LoadingMeta;
+                self.shown_commit = None;
                 self.shown_diff = None;
                 self.loading_diff_key = None;
                 self.pending_filter_error = None;
                 self.diff_scroll = 0;
-                self.diff_workers.cancel_pending_meta();
-            } else {
-                // 未取得: 旧コミットの files / header / diff を残さず即座に待機表示へ。
-                let already_loading = self
-                    .loading_meta_commit
-                    .as_ref()
-                    .is_some_and(|(cid, g)| cid == &commit_id && *g == self.generation);
-                if !already_loading {
-                    self.files.clear();
-                    self.file_selected = 0;
-                    self.file_selection.clear();
-                    self.header = Arc::new(Text::default());
-                    self.diff_body = DiffBody::LoadingMeta;
-                    self.shown_commit = None;
-                    self.shown_diff = None;
-                    self.loading_diff_key = None;
-                    self.pending_filter_error = None;
-                    self.diff_scroll = 0;
-                    self.loading_meta_commit = Some((commit_id.clone(), self.generation));
-                }
+                self.loading_meta_commit = Some((commit_id.clone(), self.generation));
                 self.diff_workers.cancel_pending_body();
                 self.diff_workers.submit_meta(MetaRequest {
                     commit_id,
                     generation: self.generation,
+                    cached,
                 });
                 return;
             }
@@ -1205,7 +1196,7 @@ impl App {
                     .expect("BatchDelta mode requires diff_batch_config");
                 BodyStrategy::BatchDelta {
                     config,
-                    files: self.files.clone(),
+                    files: Arc::clone(&self.files),
                     selected_file: self.selected_file().cloned(),
                     cached_selected_raw_diff: cached_raw_file_diff,
                 }
@@ -1641,7 +1632,6 @@ impl App {
         self.rendered_cache.clear();
         self.batch_fallback_widths.clear();
         self.batch_disabled_generation = None;
-        self.shown_commit = None;
         self.shown_diff = None;
         self.reload()
     }
@@ -2859,7 +2849,7 @@ mod tests {
             assert_eq!(app.diff_scroll, 7);
             assert_eq!(app.focus, Focus::Diff);
         }
-        app.files.clear();
+        app.files = Arc::default();
         app.file_selected = 0;
         for c in ['[', ']'] {
             app.handle_key(key(KeyCode::Char(c)));
@@ -3052,7 +3042,7 @@ mod tests {
     fn diff_actions_with_no_displayed_file_preserve_selection() {
         let (_tmp, mut app) = repo_or_skip!();
         app.focus = Focus::Diff;
-        app.files.clear();
+        app.files = Arc::default();
         app.file_selection.toggle(0);
         let selection = app.file_selection.clone();
         let status = app.status.clone();
@@ -3074,12 +3064,12 @@ mod tests {
         app.file_selection.toggle(0);
         app.file_selected = 1;
         app.focus = Focus::Diff;
-        app.files[1].status = 'R';
+        Arc::make_mut(&mut app.files)[1].status = 'R';
         app.handle_key(key(KeyCode::Char('p')));
         assert_eq!(app.status.kind, StatusKind::Error);
         assert!(app.status.text.contains("y.txt"));
         assert!(app.file_selection.is_active());
-        app.files[1].status = 'D';
+        Arc::make_mut(&mut app.files)[1].status = 'D';
         for action in ['i', 'I'] {
             app.handle_key(key(KeyCode::Char(action)));
             assert_eq!(app.status.kind, StatusKind::Error);
@@ -3090,7 +3080,7 @@ mod tests {
             panic!("expected change");
         };
         change.is_working_copy = false;
-        app.files[1].status = 'M';
+        Arc::make_mut(&mut app.files)[1].status = 'M';
         for action in ['i', 'I'] {
             app.handle_key(key(KeyCode::Char(action)));
             assert!(app.status.text.contains("working-copy"));
@@ -4659,7 +4649,7 @@ mod tests {
             strategy: BodyStrategy::BatchDelta {
                 config: DeltaBatchConfig::delta_v1(),
                 selected_file: files.first().cloned(),
-                files,
+                files: Arc::new(files),
                 cached_selected_raw_diff: None,
             },
         };
@@ -4983,6 +4973,67 @@ mod tests {
         app2.sync_diff_blocking(80);
         assert_eq!(backend2.diff_git_calls.load(Ordering::SeqCst), 1);
         assert!(app2.diff_plain_text().contains("DELTA[w=80]"));
+    }
+
+    #[test]
+    fn late_metadata_reply_does_not_reset_file_range() {
+        let backend = FakeBackend::new(":git");
+        let (files, patch, per_file) = sample_multi_file_commit();
+        let cid = "7777777777777777777777777777777777777777";
+        backend.add_commit(cid, files, "Header\n", &patch, per_file);
+        let (_tmp, mut app) = fake_app(backend, &[(cid, "duplicate metadata")]);
+        app.sync_diff_blocking(80);
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('V')));
+        app.handle_key(key(KeyCode::Char('j')));
+        app.sync_diff_blocking(80);
+
+        // Deliver a duplicate after the user has started a range.
+        app.diff_workers.submit_meta(MetaRequest {
+            commit_id: cid.into(),
+            generation: app.generation,
+            cached: None,
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.diff_workers.is_busy() {
+            assert!(Instant::now() < deadline, "metadata worker did not settle");
+            thread::sleep(Duration::from_millis(1));
+        }
+        app.poll_diff();
+
+        assert_eq!(app.file_selected, 1);
+        assert!(app.file_selection.is_visual());
+        assert_eq!(app.file_targets(), [0, 1]);
+        assert!(app.diff_plain_text().contains("RAW_RENAME"));
+    }
+
+    #[test]
+    fn raw_cached_header_loads_asynchronously_and_preserves_cached_patch() {
+        use std::sync::atomic::Ordering;
+
+        let backend = FakeBackend::new(":git");
+        let (files, _, _) = sample_multi_file_commit();
+        let cid = "8888888888888888888888888888888888888888";
+        let (_tmp, mut app) = fake_app(Arc::clone(&backend), &[(cid, "cached header")]);
+        let cache = CommitCache::new(files, "\x1b[32mCached header\x1b[0m\n".to_owned());
+        app.diff_cache.insert(cid.into(), cache);
+        app.diff_cache.insert_file_diff(
+            cid,
+            Some("alpha.rs".into()),
+            Arc::new("CACHED_ALPHA_PATCH\n".into()),
+        );
+
+        app.sync_diff(80);
+        assert!(matches!(app.diff_body, DiffBody::LoadingMeta));
+        app.sync_diff_blocking(80);
+
+        assert_eq!(app.files[0].destination_path, "alpha.rs");
+        assert_eq!(app.header.lines[0].spans[0].style.fg, Some(Color::Green));
+        let text = app.diff_plain_text();
+        assert!(text.contains("Cached header"), "{text}");
+        assert!(text.contains("CACHED_ALPHA_PATCH"), "{text}");
+        assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -96,9 +96,9 @@ pub struct RenderedKey {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitCache {
     /// jj のファイル情報 (表示文字列と実パス)。
-    pub files: Vec<DiffFile>,
+    pub files: Arc<Vec<DiffFile>>,
     /// `jj show --no-patch --color always` の生出力 (ANSI 込み)。
-    pub header_raw: String,
+    pub header_raw: Arc<String>,
     /// 選択ファイルの実パス (`None` は change 全体) ごとの `jj diff --color
     /// always` 生出力。
     #[serde(with = "diffs_raw_as_pairs")]
@@ -132,10 +132,10 @@ mod diffs_raw_as_pairs {
 }
 
 impl CommitCache {
-    pub fn new(files: Vec<DiffFile>, header_raw: String) -> Self {
+    pub fn new(files: impl Into<Arc<Vec<DiffFile>>>, header_raw: impl Into<Arc<String>>) -> Self {
         Self {
-            files,
-            header_raw,
+            files: files.into(),
+            header_raw: header_raw.into(),
             diffs_raw: HashMap::new(),
         }
     }
@@ -720,7 +720,7 @@ mod tests {
 
         let loaded = DiffStore::load(&jj);
         let restored = loaded.get("abc123").expect("entry persisted to disk");
-        assert_eq!(restored.header_raw, "header\n");
+        assert_eq!(restored.header_raw.as_str(), "header\n");
         assert_eq!(
             restored
                 .diffs_raw

@@ -92,11 +92,9 @@ impl DiffBackend for RealDiffBackend {
 }
 
 /// ANSI 付き文字列を ratatui の共有 `Text` へ変換する (ワーカー側で実行)。
-pub fn parse_ansi(raw: &str) -> Arc<Text<'static>> {
+fn parse_ansi(raw: &str) -> Arc<Text<'static>> {
     use ansi_to_tui::IntoText;
     let text = raw
-        .as_bytes()
-        .to_vec()
         .into_text()
         .unwrap_or_else(|err| Text::from(format!("{err}")));
     Arc::new(text)
@@ -106,17 +104,19 @@ pub fn parse_ansi(raw: &str) -> Arc<Text<'static>> {
 pub struct MetaRequest {
     pub commit_id: String,
     pub generation: u64,
+    pub cached: Option<(Arc<Vec<DiffFile>>, Arc<String>)>,
 }
 
 #[derive(Debug)]
 pub enum MetaOutcome {
     Ready {
-        files: Vec<DiffFile>,
-        header_raw: String,
+        files: Arc<Vec<DiffFile>>,
+        /// 新規取得時だけ返す。キャッシュヒット時は既存エントリを置き換えない。
+        header_raw: Option<Arc<String>>,
         header_text: Arc<Text<'static>>,
     },
     Error {
-        files: Vec<DiffFile>,
+        files: Arc<Vec<DiffFile>>,
         header_text: Arc<Text<'static>>,
     },
 }
@@ -132,7 +132,7 @@ pub struct MetaResponse {
 pub enum BodyStrategy {
     BatchDelta {
         config: DeltaBatchConfig,
-        files: Vec<DiffFile>,
+        files: Arc<Vec<DiffFile>>,
         selected_file: Option<DiffFile>,
         cached_selected_raw_diff: Option<Arc<String>>,
     },
@@ -399,23 +399,31 @@ fn meta_worker_loop(
             }
         };
 
-        let outcome = match (
-            backend.diff_summary(&req.commit_id),
-            backend.show(&req.commit_id),
-        ) {
-            (Ok(files), Ok(header_raw)) => {
-                let header_text = parse_ansi(&header_raw);
-                MetaOutcome::Ready {
-                    files,
-                    header_raw,
-                    header_text,
-                }
+        let outcome = if let Some((files, header_raw)) = req.cached {
+            MetaOutcome::Ready {
+                files,
+                header_text: parse_ansi(&header_raw),
+                header_raw: None,
             }
-            (files_res, header_res) => {
-                let files = files_res.unwrap_or_default();
-                let header_raw = header_res.unwrap_or_else(|err| format!("{err:#}"));
-                let header_text = parse_ansi(&header_raw);
-                MetaOutcome::Error { files, header_text }
+        } else {
+            match (
+                backend.diff_summary(&req.commit_id),
+                backend.show(&req.commit_id),
+            ) {
+                (Ok(files), Ok(header_raw)) => {
+                    let header_text = parse_ansi(&header_raw);
+                    MetaOutcome::Ready {
+                        files: Arc::new(files),
+                        header_raw: Some(Arc::new(header_raw)),
+                        header_text,
+                    }
+                }
+                (files_res, header_res) => {
+                    let files = Arc::new(files_res.unwrap_or_default());
+                    let header_raw = header_res.unwrap_or_else(|err| format!("{err:#}"));
+                    let header_text = parse_ansi(&header_raw);
+                    MetaOutcome::Error { files, header_text }
+                }
             }
         };
 
