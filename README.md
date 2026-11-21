@@ -207,7 +207,30 @@ setup carry straight through:
   layout (all three panes stacked full-width) for more room —
   see "Keys" above. If the command fails (missing binary, bad flags, non-zero exit), the diff pane
   falls back to jj's raw output and the error shows in the status bar — a broken filter never
-  blanks the diff.
+  blanks the diff. Both `jj diff` and `SHIKIGAMI_DIFF_FILTER` run asynchronously off the UI thread,
+  and successful formatted outputs are cached in memory per commit, file, and pane width.
+- **`SHIKIGAMI_DIFF_BATCH=delta-v1`** (opt-in batched delta path). When set to `delta-v1`,
+  `SHIKIGAMI_DIFF_FILTER` is unset, and jj's `ui.diff-formatter` is `:git`, shikigami fetches the
+  commit's uncolored `jj diff --git` patch once per immutable commit ID, matches every Git diff
+  section against jj's structured file list before formatting, frames each section with synthetic
+  collision-free `commit` boundary lines, and runs `delta` once for the whole commit and pane
+  width:
+
+  ```sh
+  export SHIKIGAMI_DIFF_BATCH=delta-v1
+  # Optional: enable side-by-side via ~/.gitconfig [delta] or DELTA_FEATURES:
+  export DELTA_FEATURES=+side-by-side
+  ```
+
+  shikigami invokes `delta` with `--paging=never`, `--width <pane-width>` (plus `COLUMNS`), and
+  internal `--commit-regex` / `--commit-style=raw` / `--commit-decoration-style=none` flags to
+  preserve file boundaries while leaving all other delta display settings (`side-by-side`, themes,
+  `line-numbers`, etc.) untouched. Once the batch completes, every file in that commit is served
+  from the rendered cache on both first and repeat visits, and terminal resizes reuse the cached
+  raw Git patch without re-running `jj diff`. If `ui.diff-formatter` is not `:git`,
+  `SHIKIGAMI_DIFF_FILTER` is set, or batch parsing/formatting fails or produces ambiguous
+  boundaries, shikigami does not poison caches and falls back asynchronously to the existing
+  per-file path.
 
 ## Opening files in your editor
 
@@ -247,14 +270,17 @@ which is about jj's own *implicit* editor invocation (`ui.editor`), always block
 jj's object store is content-addressed: a `commit_id` is derived from the commit's own content, and
 rewrites (`describe`/`squash`/`rebase`/`abandon`/…) always mint a new id rather than mutating an
 existing one. shikigami relies on that to cache `jj diff`/`jj diff --summary`/`jj show` output per
-`commit_id`, both in memory for the running session and on disk across restarts — revisiting a
-commit you've already looked at (even in a previous run) never re-invokes `jj`. The disk cache lives
-under the OS cache directory (`shikigami/<repo-hash>.json`) and keeps at most the 300
-most-recently-used commits per repo; override the location with `SHIKIGAMI_CACHE_DIR`.
+full `commit_id`, both in memory (with separate byte-bounded LRU caches for raw patches and
+ANSI-parsed rendered diffs) and on disk across restarts — revisiting a commit or file you've
+already looked at never re-invokes `jj`, and resizing reuses the cached raw patch while redoing
+only width-dependent formatting. The disk cache lives under the OS cache directory
+(`shikigami/<repo-hash>-v2.json`) and keeps at most the 300 most-recently-used commits per repo;
+override the location with `SHIKIGAMI_CACHE_DIR`.
 
-Startup itself never blocks on `jj`: the alternate screen opens immediately, and the initial
-`jj log`/`jj status` run on a background thread while the log pane shows "loading…" — this matters
-most on Windows, where spawning a process is noticeably slower than on Unix.
+Startup and diff preparation never block the UI event loop: the alternate screen opens immediately,
+and `jj log`, diff metadata, diff formatting (`delta` / `SHIKIGAMI_DIFF_FILTER`), and ANSI parsing
+all run on background workers with latest-selection coalescing so cursor movement, visual range
+selection, and quit remain responsive even on slow formatters or Windows.
 
 ## Development
 

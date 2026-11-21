@@ -338,10 +338,11 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App) {
         (None, _) => " diff ".to_string(),
     };
     // wrap しない: diff は桁が意味を持つ (`+`/`-` の列、インデント)。
-    // 折り返すと行番号と scroll 位置の対応も崩れる。
-    let paragraph = Paragraph::new(app.diff.clone())
-        .block(pane_block(title, app.focus == Focus::Diff))
-        .scroll((app.diff_scroll, 0));
+    // 折り返し無しなので可視範囲の行だけを共有 `Text` から切り出して渡し、
+    // 毎フレーム巨大な diff 全文を複製しない。
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let visible = app.visible_diff_lines(app.diff_scroll as usize, inner_height);
+    let paragraph = Paragraph::new(visible).block(pane_block(title, app.focus == Focus::Diff));
     frame.render_widget(paragraph, area);
 }
 
@@ -521,7 +522,7 @@ mod tests {
     /// 空白が落ちるため、実際の見た目の検証は TestBackend で行う。
     fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        app.sync_diff(diff_pane_width(width, app.layout));
+        app.sync_diff_blocking(diff_pane_width(width, app.layout));
         terminal.draw(|frame| draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -683,7 +684,7 @@ mod tests {
         let (tmp, mut app) = repo_or_skip!();
         std::fs::write(tmp.path().join("untrack.txt"), "keep me\n").unwrap();
         app.reload().unwrap();
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Char('I')));
         let joined = render(&mut app, 100, 20).join("\n");

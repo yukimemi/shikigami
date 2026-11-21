@@ -30,10 +30,10 @@ const POLL: Duration = Duration::from_millis(500);
 /// この間隔で拾う。生成が終われば `POLL` に戻る。
 const ANIM_POLL: Duration = Duration::from_millis(ui::SPINNER_FRAME_MS as u64);
 
-/// 起動時のバックグラウンド `jj log` が終わっていない間だけ使う短い
-/// poll 間隔。`POLL` のままだと結果が届いてから最大 500ms 表示が
-/// 遅れる — 起動直後だけ詰めて、そこが終わればすぐ `POLL` に戻す。
-const STARTUP_POLL: Duration = Duration::from_millis(30);
+/// 起動時のバックグラウンド `jj log` または非同期 diff 取得が終わっていない間だけ
+/// 使う短い poll 間隔。`POLL` のままだと結果が届いてから最大 500ms 表示が
+/// 遅れる — 待機中だけ詰めて、落ち着けばすぐ `POLL` に戻す。
+const STARTUP_POLL: Duration = Duration::from_millis(20);
 
 struct TerminalGuard;
 
@@ -82,13 +82,11 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         // ノンブロッキングで結果を拾う。
         app.poll_ai();
         app.poll_remote();
-        // 起動直後の diff 先読み (`App::begin_diff_prefetch`) の結果も
-        // 同じくノンブロッキングで拾う。
-        app.poll_diff_prefetch();
-        // 描画の直前に 1 回だけ diff を取る。j/k の連打中に 1 行ごと
-        // `jj diff` を起動しない (app::App::sync_diff 参照)。SIGWINCH
-        // 直後で size 取得自体が失敗することがあるので、その場合は前回
-        // フレームの終端に近い幅として 80 桁にフォールバックする。
+        // バックグラウンド diff ワーカーの完了結果をノンブロッキングで拾う。
+        app.poll_diff();
+        // 描画の直前に 1 回だけ diff 状態を同期する (非同期: キャッシュ未命中でも
+        // サブプロセス待ちや ANSI 変換でイベントループを止めない)。SIGWINCH
+        // 直後で size 取得自体が失敗することがあるので、その場合は 80 桁にフォールバックする。
         let diff_width = terminal
             .size()
             .map(|size| ui::diff_pane_width(size.width, app.layout))
@@ -99,7 +97,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         // 既に立っていたら、次ループの先頭で即座に抜ける。ここで
         // `event::poll` を待つと最大 `POLL`/`STARTUP_POLL` 分、来ない
         // キー入力を無駄に待ってから終了することになる。
-        let poll_timeout = if app.is_loading() || app.is_diff_prefetching() {
+        let poll_timeout = if app.is_loading() || app.is_diff_loading() {
             STARTUP_POLL
         } else if app.ai_elapsed().is_some() || app.remote_progress().is_some() {
             ANIM_POLL

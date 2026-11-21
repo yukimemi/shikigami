@@ -4,34 +4,31 @@
 //! 状態遷移 → jj 呼び出しまでをここで完結させる。おかげで、端末を開かずに
 //! 「このキーで本当にこの jj コマンドが飛ぶか」をテストできる。
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::text::Text;
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span, Text};
 
-use crate::cache::{CommitCache, DiffStore};
+use crate::cache::{
+    CommitCache, DiffFileKey, DiffStore, HeaderCache, RawPatchCache, RenderModeKey,
+    RenderedDiffCache, RenderedKey,
+};
+use crate::diff_batch::DeltaBatchConfig;
+use crate::diff_worker::{
+    BodyOutcome, BodyRequest, BodyStrategy, DiffBackend, DiffWorkers, MetaOutcome, MetaRequest,
+    RealDiffBackend, SingleBodyPayload, parse_ansi,
+};
 use crate::jj::{Change, DiffFile, Jj, RebaseMode, Row};
 use crate::selection::{FileSelection, plan_absorb, plan_open, plan_restore, plan_untrack};
 
 /// 一度に動かす行数 (Ctrl-d / Ctrl-u)。
 const PAGE: usize = 10;
-
-/// 起動直後にバックグラウンドで diff を先読みする commit 数。
-/// 上から (現在の revset での log 順) この件数だけ — 無制限にすると
-/// リポジトリが大きいときに起動直後の `jj` プロセス数/CPU が跳ね上がる。
-/// ちょうど j/k で最初に触るあたりを狙った控えめな値。
-const DIFF_PREFETCH: usize = 10;
-
-/// 先読み対象の 1 commit あたり、files pane 分の diff を先読みする
-/// ファイル数の上限。initial commit のように変更ファイルが極端に
-/// 多い commit 1 件が先読みキューを長時間占有しないための安全弁 —
-/// 超えた分は今までどおり、files pane で実際に選んだときに遅延取得
-/// される (`sync_diff` 参照)。
-const DIFF_PREFETCH_FILES_PER_COMMIT: usize = 20;
 
 /// [`App::begin_reload`] が背景スレッドから返す `jj log`/`jj status` の
 /// 結果。
@@ -80,18 +77,22 @@ fn status_detail(raw: &str) -> String {
         .join(" | ")
 }
 
-/// [`App::begin_diff_prefetch`] が背景スレッドから返す、1 commit 分の
-/// 先読み結果。
-type DiffPrefetchResult = (String, CommitCache);
+/// diff pane の本文状態。共有 [`Text`] で保持し、描画時は可視行だけを切り出す。
+#[derive(Debug, Clone)]
+pub enum DiffBody {
+    Empty,
+    LoadingMeta,
+    LoadingDiff,
+    Ready(Arc<Text<'static>>),
+}
 
-/// `jj` の ANSI 出力を ratatui の `Text` にパースする。パース自体が
-/// 失敗したら (通常は起きない) エラー文をそのまま表示用テキストにする。
-fn parse_ansi(raw: &str) -> Text<'static> {
-    use ansi_to_tui::IntoText;
-    raw.as_bytes()
-        .to_vec()
-        .into_text()
-        .unwrap_or_else(|err| Text::from(format!("{err}")))
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShownDiffKey {
+    commit_id: String,
+    file_key: DiffFileKey,
+    width: u16,
+    mode: RenderModeKey,
+    generation: u64,
 }
 
 /// どちらの pane にキーが効くか。
@@ -283,8 +284,8 @@ pub struct App {
     pub rebase_mode: RebaseMode,
     /// pane 配置。`L` でトグル (`ui::draw` 参照)。
     pub layout: PaneLayout,
-    /// diff pane の中身 (ANSI を解決済みの ratatui Text)。
-    pub diff: Text<'static>,
+    /// diff pane の本文 (共有済み ANSI 解決済み Text / 読み込み中状態)。
+    pub diff_body: DiffBody,
     /// 選択中 change で変更されたファイル一覧 (lazygit の files pane 相当)。
     pub files: Vec<DiffFile>,
     /// `files` の index。ここで選んだ 1 ファイルだけが `diff` に出る。
@@ -292,75 +293,82 @@ pub struct App {
     /// files pane の複数選択 (mark + visual 範囲)。`marked` (change の
     /// squash/rebase 相手) とは別物。
     pub file_selection: FileSelection,
-    /// `jj show -r rev --no-patch` の結果 (ANSI 解決済み)。ファイル切り替え
-    /// だけなら変わらないので、change ごとに 1 回だけ取って使い回す。
-    header: Text<'static>,
-    /// commit ごとの `jj diff --summary` / `jj show` / `jj diff` の
-    /// ディスク永続キャッシュ。`commit_id` が content-addressed な
-    /// おかげで、一度取れば同じ commit を再訪しても (プロセスを
-    /// またいでも) jj を呼び直さない (詳細は [`crate::cache`])。
+    /// `jj show -r rev --no-patch` の結果 (共有済み ANSI 解決済み)。
+    header: Arc<Text<'static>>,
+    /// Tier 1: commit ごとの `jj diff --summary` / `jj show` / ファイル別生 diff
+    /// のディスク永続 + バイト上限付きキャッシュ。キーは完全な `full_commit_id`。
     diff_cache: DiffStore,
-    /// 直近に `files`/`header`/`file_selected` を反映した commit_id。
-    /// これが変わったときだけ files pane の選択を先頭に戻す。
+    /// Tier 1: バッチ整形用の不変コミット全体生 Git パッチ (`Arc<String>`)。
+    raw_patch_cache: RawPatchCache,
+    /// Tier 2: ANSI 変換済みの表示用 `Text` キャッシュ (バッチ / フォールバック共通)。
+    rendered_cache: RenderedDiffCache,
+    /// ANSI 変換済みの change ヘッダキャッシュ。
+    header_cache: HeaderCache,
+    /// メタデータ・本文の 2 レーン非同期 diff ワーカー。
+    diff_workers: DiffWorkers,
+    /// 再読込・変更世代。不一致の非同期結果・エラーはすべて棄却する。
+    generation: u64,
+    /// 直近に `files`/`header`/`file_selected` を反映した完全 commit_id。
     shown_commit: Option<String>,
-    /// 直近に `diff` を反映した (commit_id, path)。
-    /// これが変わったときだけ diff pane の scroll を先頭に戻す。
-    shown_diff: Option<(String, Option<String>)>,
-    /// `shown_diff` を最後に反映したときの `diff_width`。
-    /// `diff_filter_cmd` が設定されているときだけ意味を持つ — フィルタは
-    /// `COLUMNS` として幅を受け取るので、選択が変わらなくてもリサイズで
-    /// 幅が変われば再実行が必要 (`sync_diff` 参照)。
-    shown_diff_width: Option<u16>,
+    /// 現在メタデータ取得中の (完全 commit_id, 世代)。
+    loading_meta_commit: Option<(String, u64)>,
+    /// 直近に `diff_body` を確定反映した対象キー。
+    shown_diff: Option<ShownDiffKey>,
+    /// 現在本文取得中の対象キー。
+    loading_diff_key: Option<ShownDiffKey>,
+    /// 直近の `sync_diff` に渡された diff pane 幅。
+    last_diff_width: Option<u16>,
+    /// `ui.diff-formatter != :git` と判明してバッチを無効化した世代。
+    batch_disabled_generation: Option<u64>,
+    /// この世代でバッチが失敗/曖昧となりファイル単位フォールバックへ切り替えたコミット群。
+    batch_fallback_commits: HashSet<String>,
+    /// `status_fresh` により 1 フレームだけ表示を保留した diff-filter エラー。
+    pending_filter_error: Option<(ShownDiffKey, String)>,
     /// 起動時にバックグラウンドで走らせた `jj log`/`jj status` の
-    /// 結果を受け取るチャネル。終わるまでは `None` のまま Some で残る。
+    /// 結果を受け取るチャネル。終わるまでは `Some` で残る。
     startup_rx: Option<mpsc::Receiver<ReloadResult>>,
-    /// 起動時の `jj log`/`jj status` が失敗したときのエラー。以前は
-    /// `App::new` が同期に呼んでいたので、alternate screen を開く前に
-    /// プロセスごと落ちて分かりやすいエラーで終了できた。非同期化した
-    /// 今も同じ着地にするため、失敗を検知したら `should_quit` を立てて
-    /// ここに退避し、`tui::run` が終了コードに変換する
-    /// ([`Self::take_startup_error`])。
+    /// 起動時の `jj log`/`jj status` が失敗したときのエラー。
     startup_error: Option<anyhow::Error>,
-    /// 実行中の AI メッセージ生成 (Ctrl-g)。`Some` の間は入力 prompt に
-    /// スピナーを出し、Esc (生成の中止) 以外のキーを受け付けない。
+    /// 実行中の AI メッセージ生成 (Ctrl-g)。
     ai_job: Option<AiJob>,
     remote_job: Option<RemoteJob>,
-    /// 起動直後に背景スレッドで先読みした diff (`begin_diff_prefetch`)
-    /// の結果を受け取るチャネル。`startup_rx` と同じパターン。
-    diff_prefetch_rx: Option<mpsc::Receiver<DiffPrefetchResult>>,
     pub diff_scroll: u16,
     pub working_copy: String,
     /// `SHIKIGAMI_AI_CMD` の値。起動時に一度だけ読む (`App::new`)。
-    /// `None` なら AI 生成 (Ctrl-g) は使えない。
     pub ai_cmd: Option<String>,
     /// `SHIKIGAMI_DIFF_FILTER` の値。起動時に一度だけ読む (`App::new`)。
-    /// `None` なら diff pane は jj の生出力をそのまま使う
-    /// (`crate::diff_filter` 参照)。
     pub diff_filter_cmd: Option<String>,
-    /// `EDITOR`/`VISUAL` の値。起動時に一度だけ読む (`App::new`) — `ai_cmd`
-    /// と同じ方針。`None` なら `o` (files pane) は使えない。
+    /// `SHIKIGAMI_DIFF_BATCH=delta-v1` の設定。起動時に一度だけ読む (`App::new`)。
+    pub diff_batch_config: Option<DeltaBatchConfig>,
+    /// `EDITOR`/`VISUAL` の値。起動時に一度だけ読む (`App::new`)。
     pub editor_cmd: Option<String>,
     /// `o` (files pane) が立てた、まだ処理していないエディタ起動要求。
-    /// `tui::event_loop` が `handle_key` の直後に [`Self::take_pending_editor`]
-    /// で取り出して消費する。
     pending_editor: Option<EditorRequest>,
     /// 直前の `handle_key` が `status` を実際に書き換えたか。
-    /// `sync_diff` はこのフラグが立っている次の 1 回だけ、diff-filter
-    /// 失敗による status 上書きを控える — 描画順が `handle_key` の次に
-    /// `sync_diff` → `draw` なので、ここで無条件に上書きすると操作結果
-    /// (例: describe/rebase の成功メッセージ) が画面に一度も出ないまま
-    /// filter のエラーに消される (`sync_diff` 参照)。
     status_fresh: bool,
     pub should_quit: bool,
 }
 
 impl App {
     pub fn new(jj: Jj, revset: Option<String>) -> Result<Self> {
-        // ディスクの永続キャッシュはローカルファイル読み込みだけなので
-        // 同期でも軽い (プロセス起動は無い)。起動を遅くするのは常に
-        // `jj log`/`jj status` の方 — それだけ後段で非同期にする。
-        let diff_cache = DiffStore::load(&jj);
-        let mut app = Self {
+        let backend = Arc::new(RealDiffBackend::new(jj.clone()));
+        let mut app = Self::with_backend(jj, revset, backend, true);
+        app.begin_reload();
+        Ok(app)
+    }
+
+    pub(crate) fn with_backend(
+        jj: Jj,
+        revset: Option<String>,
+        backend: Arc<dyn DiffBackend>,
+        load_disk_cache: bool,
+    ) -> Self {
+        let diff_cache = if load_disk_cache {
+            DiffStore::load(&jj)
+        } else {
+            DiffStore::default()
+        };
+        Self {
             jj,
             rows: Vec::new(),
             selected: 0,
@@ -371,20 +379,29 @@ impl App {
             marked: None,
             rebase_mode: RebaseMode::Revision,
             layout: PaneLayout::Stacked,
-            diff: Text::default(),
+            diff_body: DiffBody::Empty,
             files: Vec::new(),
             file_selected: 0,
             file_selection: FileSelection::default(),
-            header: Text::default(),
+            header: Arc::new(Text::default()),
             diff_cache,
+            raw_patch_cache: RawPatchCache::default(),
+            rendered_cache: RenderedDiffCache::default(),
+            header_cache: HeaderCache::default(),
+            diff_workers: DiffWorkers::new(backend),
+            generation: 0,
             shown_commit: None,
+            loading_meta_commit: None,
             shown_diff: None,
-            shown_diff_width: None,
+            loading_diff_key: None,
+            last_diff_width: None,
+            batch_disabled_generation: None,
+            batch_fallback_commits: HashSet::new(),
+            pending_filter_error: None,
             startup_rx: None,
             startup_error: None,
             ai_job: None,
             remote_job: None,
-            diff_prefetch_rx: None,
             diff_scroll: 0,
             working_copy: String::new(),
             ai_cmd: std::env::var(crate::ai::AI_CMD_ENV)
@@ -393,13 +410,12 @@ impl App {
             diff_filter_cmd: std::env::var(crate::diff_filter::DIFF_FILTER_ENV)
                 .ok()
                 .filter(|cmd| !cmd.trim().is_empty()),
+            diff_batch_config: DeltaBatchConfig::from_env(),
             editor_cmd: crate::editor::resolve(),
             pending_editor: None,
             status_fresh: false,
             should_quit: false,
-        };
-        app.begin_reload();
-        Ok(app)
+        }
     }
 
     /// 起動時の `jj log`/`jj status` を別スレッドで走らせる。
@@ -437,17 +453,9 @@ impl App {
                 if self.status.text == "loading…" {
                     self.status = Status::info("? for help");
                 }
-                // log が届いた直後、上から DIFF_PREFETCH 件ぶんの diff を
-                // 背景で温めておく (詳細は begin_diff_prefetch)。
-                self.begin_diff_prefetch();
             }
             Ok(Err(err)) => {
                 self.status = Status::error(format!("log failed: {err}"));
-                // TUI の中に留まって status bar のエラーを見せるのではなく、
-                // 以前の同期呼び出し (`app.reload()?` in `App::new`) と同じ
-                // 「alternate screen 越しにでも、はっきりしたエラーで
-                // すぐ終了する」形に寄せる。実際の終了は `tui::run` が
-                // `take_startup_error` で拾って行う。
                 self.startup_error = Some(err);
                 self.should_quit = true;
                 self.startup_rx = None;
@@ -470,117 +478,13 @@ impl App {
         self.startup_rx.is_some()
     }
 
-    /// 起動直後、上から [`DIFF_PREFETCH`] 件ぶんの diff を背景スレッドで
-    /// 先読みしてキャッシュを温める。
-    ///
-    /// `sync_diff` は selection が変わるたびに同期で `jj diff` を叩く
-    /// 構造のまま (連打中に 1 回だけ取る設計 — `sync_diff` 参照) だが、
-    /// 起動直後の最初の j/k はほぼ必ずログの上の方に当たるので、そこだけ
-    /// 先に別スレッドで済ませておけば、実際に選択したときは
-    /// `diff_cache` 命中になり `jj` を呼び直さずに済む。commit pane の
-    /// j/k だけでなく files pane の j/k もこの対象 — files pane で選べる
-    /// 各ファイルの diff まで (`DIFF_PREFETCH_FILES_PER_COMMIT` 件を
-    /// 上限に) まとめて温める。結果は [`Self::poll_diff_prefetch`] が
-    /// ノンブロッキングで拾う。
-    fn begin_diff_prefetch(&mut self) {
-        let targets: Vec<String> = self
-            .rows
-            .iter()
-            .filter_map(|row| match row {
-                Row::Change { change, .. } => Some(change),
-                Row::Connector(_) => None,
-            })
-            .filter(|change| !self.diff_cache.contains(&change.commit_id))
-            .take(DIFF_PREFETCH)
-            .map(|change| change.commit_id.clone())
-            .collect();
-        if targets.is_empty() {
-            return;
-        }
-        let jj = self.jj.clone();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            for commit_id in targets {
-                // 可変な change id ではなく不変な commit id で問い合わせる。
-                // 先読み中に describe/rebase されても、キャッシュキーと
-                // 取得内容が食い違わない。
-                let rev = commit_id.clone();
-                // 失敗はキャッシュしない — `sync_diff` と同じ方針
-                // (一時的な失敗を content-addressed キャッシュへ焼き付けて
-                // 表示し続けてしまわないため)。次に選択されたときは
-                // `sync_diff` 側で改めて同期に試される。
-                let (Ok(files), Ok(header_raw)) = (jj.diff_summary(&rev), jj.show(&rev)) else {
-                    continue;
-                };
-                let mut entry = CommitCache::new(files.clone(), header_raw);
-                if files.is_empty() {
-                    // 変更ファイルが無い commit (files pane が空になる
-                    // ケース) は change 全体の diff だけ温めておく。
-                    if let Ok(diff_raw) = jj.diff(&rev, &[]) {
-                        entry.diffs_raw.insert(None, diff_raw);
-                    }
-                } else {
-                    // files pane で選べる各ファイルぶんまとめて先読み。
-                    // 上限を超えた分は今までどおり遅延取得 (`sync_diff`)。
-                    for file in files.iter().take(DIFF_PREFETCH_FILES_PER_COMMIT) {
-                        if let Ok(diff_raw) = jj.diff(&rev, &file.diff_paths()) {
-                            entry.diffs_raw.insert(Some(file.target_path()), diff_raw);
-                        }
-                    }
-                }
-                if tx.send((commit_id, entry)).is_err() {
-                    // 受け手 (App) がもう無い = 終了処理中。続けても無駄。
-                    break;
-                }
-            }
-        });
-        self.diff_prefetch_rx = Some(rx);
+    /// 非同期 diff ワーカーが進行中、または読み込み待ち状態にあるか。
+    pub fn is_diff_loading(&self) -> bool {
+        matches!(self.diff_body, DiffBody::LoadingMeta | DiffBody::LoadingDiff)
+            || self.diff_workers.is_busy()
     }
 
-    /// [`Self::begin_diff_prefetch`] の結果をノンブロッキングで拾う。
-    /// 描画ループから毎フレーム呼ぶ。
-    pub fn poll_diff_prefetch(&mut self) {
-        let Some(rx) = &self.diff_prefetch_rx else {
-            return;
-        };
-        loop {
-            match rx.try_recv() {
-                Ok((commit_id, entry)) => {
-                    // 先読みが届く前に `sync_diff` が (実際の選択で) 同じ
-                    // commit を一部だけ埋めていることがある —
-                    // その場合は既存エントリを消さず、まだ無いファイル分
-                    // だけ merge する (files/header は同じ commit なら
-                    // 内容も同じはずなので、既存のものをそのまま残す)。
-                    if let Some(existing) = self.diff_cache.get_mut(&commit_id) {
-                        for (path, diff_raw) in entry.diffs_raw {
-                            existing.diffs_raw.entry(path).or_insert(diff_raw);
-                        }
-                    } else {
-                        self.diff_cache.insert(commit_id, entry);
-                    }
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.diff_prefetch_rx = None;
-                    break;
-                }
-            }
-        }
-    }
-
-    /// 起動直後の diff 先読みがまだ走っているか。描画ループのポーリング
-    /// 間隔を詰めるのに使う (`is_loading` 参照)。
-    pub fn is_diff_prefetching(&self) -> bool {
-        self.diff_prefetch_rx.is_some()
-    }
-
-    /// 起動直後のテスト用: バックグラウンドの初回 `jj log` と、それに
-    /// 続けて始まる diff 先読み (`begin_diff_prefetch`) の両方が終わる
-    /// まで待つ。TUI 本体はどちらもブロッキングしない (`poll_startup`/
-    /// `poll_diff_prefetch` 参照) が、テストは repo を消す/壊すケースが
-    /// あり、背景スレッドがまだ `jj` を呼んでいる状態で repo を触ると
-    /// 素の I/O エラー (Windows ではファイルロック) になってしまう。
-    /// なので `App::new` 直後のテストは常にこれで揃えてから使う。
+    /// 起動直後のテスト用: バックグラウンドの初回 `jj log` が終わるまで待つ。
     #[cfg(test)]
     pub fn wait_for_startup(&mut self) {
         while self.is_loading() {
@@ -589,12 +493,106 @@ impl App {
                 thread::sleep(std::time::Duration::from_millis(1));
             }
         }
-        while self.is_diff_prefetching() {
-            self.poll_diff_prefetch();
-            if self.is_diff_prefetching() {
-                thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    /// テスト用: 現在の選択に対する非同期 diff 取得・整形が終わるまで待つ。
+    #[cfg(test)]
+    pub fn sync_diff_blocking(&mut self, diff_width: u16) {
+        let preserve_fresh = self.status_fresh;
+        self.sync_diff(diff_width);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.is_diff_loading() {
+            assert!(Instant::now() < deadline, "timed out waiting for diff worker");
+            if preserve_fresh {
+                self.status_fresh = true;
+            }
+            self.poll_diff();
+            self.sync_diff(diff_width);
+            if self.is_diff_loading() {
+                thread::sleep(Duration::from_millis(1));
             }
         }
+        self.status_fresh = false;
+    }
+
+    /// diff pane に表示する総行数 (変更ヘッダ + 本文)。
+    pub fn diff_line_count(&self) -> usize {
+        match &self.diff_body {
+            DiffBody::Empty => self.header.lines.len(),
+            DiffBody::LoadingMeta => 1,
+            DiffBody::LoadingDiff => self.header.lines.len() + 1,
+            DiffBody::Ready(body) => self.header.lines.len() + body.lines.len(),
+        }
+    }
+
+    /// 描画用: `start` 行目から最大 `count` 行だけを共有 `Text` から切り出す。
+    /// 毎フレーム巨大な diff 全文を複製しないための可視範囲スライス。
+    pub fn visible_diff_lines(&self, start: usize, count: usize) -> Vec<Line<'static>> {
+        if count == 0 {
+            return Vec::new();
+        }
+        match &self.diff_body {
+            DiffBody::LoadingMeta => {
+                if start == 0 {
+                    vec![Line::from(Span::styled(
+                        "loading…",
+                        Style::default().fg(Color::DarkGray),
+                    ))]
+                } else {
+                    Vec::new()
+                }
+            }
+            DiffBody::Empty => self
+                .header
+                .lines
+                .iter()
+                .skip(start)
+                .take(count)
+                .cloned()
+                .collect(),
+            DiffBody::LoadingDiff => {
+                let mut out = Vec::with_capacity(count.min(self.header.lines.len() + 1));
+                let header_len = self.header.lines.len();
+                if start < header_len {
+                    out.extend(self.header.lines.iter().skip(start).take(count).cloned());
+                }
+                if out.len() < count && start <= header_len {
+                    out.push(Line::from(Span::styled(
+                        "loading diff…",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                out
+            }
+            DiffBody::Ready(body) => {
+                let mut out = Vec::with_capacity(count);
+                let header_len = self.header.lines.len();
+                if start < header_len {
+                    out.extend(self.header.lines.iter().skip(start).take(count).cloned());
+                }
+                if out.len() < count {
+                    let body_start = start.saturating_sub(header_len);
+                    let remaining = count - out.len();
+                    out.extend(body.lines.iter().skip(body_start).take(remaining).cloned());
+                }
+                out
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn diff_plain_text(&self) -> String {
+        let total = self.diff_line_count();
+        self.visible_diff_lines(0, total)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// AI メッセージ生成 (Ctrl-g) が走っている間の経過時間。走って
@@ -646,7 +644,7 @@ impl App {
     fn begin_remote(&mut self, action: RemoteAction) {
         // A startup snapshot must never overwrite the post-operation log.
         self.startup_rx = None;
-        self.diff_prefetch_rx = None;
+        self.diff_workers.cancel_all_pending();
         let jj = self.jj.clone();
         let revset = self.revset.clone();
         let (tx, rx) = mpsc::channel();
@@ -781,6 +779,22 @@ impl App {
         {
             self.marked = None;
         }
+        // 世代を進めて再読込前の未着手要求を破棄し、遅着結果を拒否する。
+        self.generation = self.generation.wrapping_add(1);
+        self.diff_workers.cancel_all_pending();
+        self.pending_filter_error = None;
+        self.loading_meta_commit = None;
+        self.loading_diff_key = None;
+        self.shown_diff = None;
+        let current_commit = self.selected_change().map(|c| c.full_commit_id.as_str());
+        if self.shown_commit.as_deref() != current_commit {
+            self.files.clear();
+            self.file_selected = 0;
+            self.header = Arc::new(Text::default());
+            self.diff_body = DiffBody::Empty;
+            self.shown_commit = None;
+            self.diff_scroll = 0;
+        }
     }
 
     fn index_of(&self, id: &str) -> Option<usize> {
@@ -861,48 +875,242 @@ impl App {
         self.file_selected = self.files.len().saturating_sub(1);
     }
 
-    /// 選択が変わっていたら diff を取り直す。描画前に呼ぶ。
+    fn can_batch_commit(&self, commit_id: &str) -> bool {
+        self.diff_filter_cmd.is_none()
+            && self.diff_batch_config.is_some()
+            && self.batch_disabled_generation != Some(self.generation)
+            && !self.batch_fallback_commits.contains(commit_id)
+            && !self.files.is_empty()
+    }
+
+    fn active_render_mode(&self, commit_id: &str, diff_width: u16) -> (RenderModeKey, u16) {
+        if let Some(cmd) = &self.diff_filter_cmd {
+            (RenderModeKey::Filter(cmd.clone()), diff_width)
+        } else if self.can_batch_commit(commit_id) {
+            (RenderModeKey::BatchDelta, diff_width)
+        } else {
+            (RenderModeKey::Raw, 0)
+        }
+    }
+
+    /// バックグラウンド diff ワーカーの完了結果をノンブロッキングで反映する。
+    pub fn poll_diff(&mut self) {
+        while let Some(resp) = self.diff_workers.try_recv_meta() {
+            if resp.generation != self.generation {
+                continue;
+            }
+            let is_current = self
+                .selected_change()
+                .is_some_and(|c| c.full_commit_id == resp.commit_id);
+            match resp.outcome {
+                MetaOutcome::Ready {
+                    files,
+                    header_raw,
+                    header_text,
+                } => {
+                    self.diff_cache
+                        .insert(resp.commit_id.clone(), CommitCache::new(files.clone(), header_raw));
+                    self.header_cache
+                        .insert(resp.commit_id.clone(), Arc::clone(&header_text));
+                    if is_current {
+                        self.files = files;
+                        self.header = header_text;
+                        self.file_selected = 0;
+                        self.file_selection.clear();
+                        self.shown_commit = Some(resp.commit_id);
+                        self.loading_meta_commit = None;
+                        self.shown_diff = None;
+                        self.loading_diff_key = None;
+                        self.diff_body = DiffBody::LoadingDiff;
+                        self.diff_scroll = 0;
+                    }
+                }
+                MetaOutcome::Error { files, header_text } => {
+                    // 失敗はキャッシュしない。現在選択中の commit だけ表示に反映する。
+                    if is_current {
+                        self.files = files;
+                        self.header = header_text;
+                        self.file_selected = 0;
+                        self.file_selection.clear();
+                        self.shown_commit = Some(resp.commit_id.clone());
+                        self.loading_meta_commit = None;
+                        self.loading_diff_key = None;
+                        self.diff_body = DiffBody::Empty;
+                        self.diff_scroll = 0;
+                        if self.files.is_empty() {
+                            let width = self.last_diff_width.unwrap_or(80);
+                            let (mode, effective_width) =
+                                self.active_render_mode(&resp.commit_id, width);
+                            self.shown_diff = Some(ShownDiffKey {
+                                commit_id: resp.commit_id,
+                                file_key: DiffFileKey::WholeCommit,
+                                width: effective_width,
+                                mode,
+                                generation: resp.generation,
+                            });
+                        } else {
+                            self.shown_diff = None;
+                        }
+                    }
+                }
+            }
+        }
+
+        while let Some(resp) = self.diff_workers.try_recv_body() {
+            if resp.generation != self.generation {
+                continue;
+            }
+            match resp.outcome {
+                BodyOutcome::BatchReady { raw_patch, entries } => {
+                    self.raw_patch_cache
+                        .insert(resp.commit_id.clone(), raw_patch);
+                    let mut batch_to_cache = Vec::with_capacity(entries.len());
+                    let mut current_match: Option<Arc<Text<'static>>> = None;
+                    let is_current_commit = self
+                        .selected_change()
+                        .is_some_and(|c| c.full_commit_id == resp.commit_id)
+                        && self.shown_commit.as_deref() == Some(resp.commit_id.as_str())
+                        && self.last_diff_width == Some(resp.width)
+                        && self.diff_filter_cmd.is_none();
+                    let current_file_key = is_current_commit
+                        .then(|| DiffFileKey::from_file(self.selected_file()));
+
+                    for (file_key, text) in entries {
+                        if current_file_key.as_ref() == Some(&file_key) {
+                            current_match = Some(Arc::clone(&text));
+                        }
+                        batch_to_cache.push((
+                            RenderedKey {
+                                commit_id: resp.commit_id.clone(),
+                                file_key,
+                                width: resp.width,
+                                mode: RenderModeKey::BatchDelta,
+                            },
+                            text,
+                        ));
+                    }
+                    self.rendered_cache.insert_batch(batch_to_cache);
+
+                    if let (Some(file_key), Some(text)) = (current_file_key, current_match) {
+                        self.diff_body = DiffBody::Ready(text);
+                        self.shown_diff = Some(ShownDiffKey {
+                            commit_id: resp.commit_id,
+                            file_key,
+                            width: resp.width,
+                            mode: RenderModeKey::BatchDelta,
+                            generation: resp.generation,
+                        });
+                        self.loading_diff_key = None;
+                        self.pending_filter_error = None;
+                    }
+                }
+                BodyOutcome::BatchDisabledForGeneration(payload) => {
+                    self.batch_disabled_generation = Some(resp.generation);
+                    self.apply_single_body(resp.commit_id, resp.generation, payload);
+                }
+                BodyOutcome::BatchFallback { fallback } => {
+                    self.batch_fallback_commits.insert(resp.commit_id.clone());
+                    self.apply_single_body(resp.commit_id, resp.generation, fallback);
+                }
+                BodyOutcome::SingleReady(payload) => {
+                    self.apply_single_body(resp.commit_id, resp.generation, payload);
+                }
+            }
+        }
+    }
+
+    fn apply_single_body(
+        &mut self,
+        commit_id: String,
+        generation: u64,
+        payload: SingleBodyPayload,
+    ) {
+        if let Some(raw) = payload.fetched_raw {
+            self.diff_cache
+                .insert_file_diff(&commit_id, payload.file_key.raw_cache_path(), raw);
+        }
+        if payload.cacheable {
+            self.rendered_cache.insert(
+                RenderedKey {
+                    commit_id: commit_id.clone(),
+                    file_key: payload.file_key.clone(),
+                    width: payload.effective_width,
+                    mode: payload.mode.clone(),
+                },
+                Arc::clone(&payload.text),
+            );
+        }
+
+        let Some(current) = self.selected_change() else {
+            return;
+        };
+        if current.full_commit_id != commit_id
+            || self.shown_commit.as_deref() != Some(commit_id.as_str())
+        {
+            return;
+        }
+        let current_file_key = DiffFileKey::from_file(self.selected_file());
+        if current_file_key != payload.file_key {
+            return;
+        }
+        let current_width = self.last_diff_width.unwrap_or(80);
+        let (expected_mode, expected_width) = self.active_render_mode(&commit_id, current_width);
+        if expected_mode != payload.mode || expected_width != payload.effective_width {
+            return;
+        }
+
+        let key = ShownDiffKey {
+            commit_id,
+            file_key: payload.file_key,
+            width: payload.effective_width,
+            mode: payload.mode,
+            generation,
+        };
+        self.diff_body = DiffBody::Ready(payload.text);
+        self.loading_diff_key = None;
+        if let Some(err_msg) = payload.filter_error {
+            if self.status_fresh {
+                self.pending_filter_error = Some((key.clone(), err_msg));
+            } else {
+                self.status = Status::error(err_msg);
+                self.pending_filter_error = None;
+            }
+        } else {
+            self.pending_filter_error = None;
+        }
+        self.shown_diff = Some(key);
+    }
+
+    /// 選択中 commit / ファイルと表示幅に合わせて diff 状態を非同期同期する。
     ///
-    /// 遅延させる理由: j/k で連続移動しているあいだに 1 行ごとに
-    /// `jj diff` を起動すると、キー入力より diff の方が遅くなる。
-    /// 描画直前に「今の選択の分だけ」1 回取る。
-    ///
-    /// `commit_id` ごとに [`DiffStore`] へ生出力を溜め、同じ commit /
-    /// 同じ (commit, ファイル) の組を再訪したときは jj を一切呼ばない
-    /// (`Ctrl-r` で reload しても、内容が変わっていない commit の
-    /// キャッシュはそのまま使い回される — content-addressed な jj の
-    /// 性質上、それで安全なことは [`crate::cache`] 参照)。ANSI 解決
-    /// (`parse_ansi`) はキャッシュ命中時も毎回やり直す — プロセス起動と
-    /// 違って純 CPU 処理なので、これを避けるために生文字列と
-    /// `Text` を二重にキャッシュする価値はない。
-    ///
-    /// `diff_width` は `SHIKIGAMI_DIFF_FILTER` (`crate::diff_filter`) が
-    /// 設定されているときだけ使う — フィルタの子プロセスへ `COLUMNS` と
-    /// して渡す diff pane の実幅。選択が同じでも、前回フィルタを実行した
-    /// ときの幅 (`shown_diff_width`) と異なればフィルタを再実行する
-    /// (`diff_raw` 自体は commit/path キーのキャッシュを使い回すので、
-    /// jj を呼び直すわけではない)。
+    /// イベントループからは一切サブプロセス待ちも巨大パッチの ANSI 変換も行わない。
+    /// キャッシュ命中なら即座に共有 `Text` を差し替え、未命中なら表示を「待機中」へ
+    /// 切り替えてバックグラウンドワーカーへ最新要求だけを送る。
     pub fn sync_diff(&mut self, diff_width: u16) {
         if self.remote_job.is_some() {
             return;
         }
-        // 直前の `handle_key` が status を書き換えていたら、その 1 回だけ
-        // diff-filter 失敗による上書きを控える (`status_fresh` 参照)。
+        self.last_diff_width = Some(diff_width);
+        self.poll_diff();
         let status_just_reported = std::mem::take(&mut self.status_fresh);
+
         let Some(change) = self.selected_change() else {
-            self.files = Vec::new();
+            self.files.clear();
             self.file_selected = 0;
             self.file_selection.clear();
-            self.header = Text::default();
-            self.diff = Text::default();
+            self.header = Arc::new(Text::default());
+            self.diff_body = DiffBody::Empty;
             self.shown_commit = None;
+            self.loading_meta_commit = None;
             self.shown_diff = None;
-            self.shown_diff_width = None;
+            self.loading_diff_key = None;
+            self.pending_filter_error = None;
+            self.diff_workers.cancel_all_pending();
             return;
         };
-        let rev = change.id.clone();
-        let commit_id = change.commit_id.clone();
+        let commit_id = change.full_commit_id.clone();
 
+        // 1. コミットメタデータ (files + header) の同期。
         if self.shown_commit.as_deref() != Some(commit_id.as_str()) {
             if self.diff_cache.contains(&commit_id) {
                 self.diff_cache.touch(&commit_id);
@@ -910,117 +1118,152 @@ impl App {
                     .diff_cache
                     .get(&commit_id)
                     .expect("checked contains above");
-                self.files = entry.files.clone();
-                self.header = parse_ansi(&entry.header_raw);
+                let files = entry.files.clone();
+                let header = match self.header_cache.get(&commit_id) {
+                    Some(h) => h,
+                    None => {
+                        let parsed = parse_ansi(&entry.header_raw);
+                        self.header_cache
+                            .insert(commit_id.clone(), Arc::clone(&parsed));
+                        parsed
+                    }
+                };
+                self.files = files;
+                self.header = header;
+                self.file_selected = 0;
+                self.file_selection.clear();
+                self.shown_commit = Some(commit_id.clone());
+                self.loading_meta_commit = None;
+                self.shown_diff = None;
+                self.loading_diff_key = None;
+                self.pending_filter_error = None;
+                self.diff_scroll = 0;
+                self.diff_workers.cancel_pending_meta();
             } else {
-                // jj の呼び出し失敗はこの commit の内容ではない (一時的な
-                // 失敗かもしれない) ので、content-addressed キャッシュには
-                // 書かない — 成功した組だけを `insert` する。失敗を
-                // キャッシュしてしまうと、次回同じ commit を開いたときも
-                // jj を呼び直さずに同じ失敗をずっと見せ続けることになる。
-                match (self.jj.diff_summary(&rev), self.jj.show(&rev)) {
-                    (Ok(files), Ok(header_raw)) => {
-                        self.files = files.clone();
-                        self.header = parse_ansi(&header_raw);
-                        self.diff_cache
-                            .insert(commit_id.clone(), CommitCache::new(files, header_raw));
-                    }
-                    (files_result, header_result) => {
-                        self.files = files_result.unwrap_or_default();
-                        self.header =
-                            parse_ansi(&header_result.unwrap_or_else(|err| err.to_string()));
-                    }
+                // 未取得: 旧コミットの files / header / diff を残さず即座に待機表示へ。
+                let already_loading = self
+                    .loading_meta_commit
+                    .as_ref()
+                    .is_some_and(|(cid, g)| cid == &commit_id && *g == self.generation);
+                if !already_loading {
+                    self.files.clear();
+                    self.file_selected = 0;
+                    self.file_selection.clear();
+                    self.header = Arc::new(Text::default());
+                    self.diff_body = DiffBody::LoadingMeta;
+                    self.shown_commit = None;
+                    self.shown_diff = None;
+                    self.loading_diff_key = None;
+                    self.pending_filter_error = None;
+                    self.diff_scroll = 0;
+                    self.loading_meta_commit = Some((commit_id.clone(), self.generation));
                 }
+                self.diff_workers.cancel_pending_body();
+                self.diff_workers.submit_meta(MetaRequest {
+                    commit_id,
+                    generation: self.generation,
+                });
+                return;
             }
-            self.file_selected = 0;
-            self.file_selection.clear();
-            self.shown_commit = Some(commit_id.clone());
         }
 
-        // 同じ表示になるリネームも、実パスでキャッシュと選択を区別する。
-        let path = self.selected_file().map(DiffFile::target_path);
-        let key = (commit_id.clone(), path.clone());
-        let selection_changed = self.shown_diff.as_ref() != Some(&key);
-        // フィルタ設定時は選択が同じでも、リサイズで幅が変わったら
-        // 再実行する — フィルタの子プロセスへ渡す `COLUMNS` が古いままだと
-        // side-by-side 出力が実幅に合わなくなる。
-        let width_changed =
-            self.diff_filter_cmd.is_some() && self.shown_diff_width != Some(diff_width);
-        if selection_changed || width_changed {
-            let cached = self
-                .diff_cache
-                .get(&commit_id)
-                .and_then(|entry| entry.diffs_raw.get(&path))
-                .cloned();
-            let diff_raw = match cached {
-                Some(raw) => raw,
-                // 失敗はここでも同様にキャッシュしない (上の files/header
-                // と同じ理由)。
-                None => match self.jj.diff(
-                    &rev,
-                    &self
-                        .selected_file()
-                        .map(DiffFile::diff_paths)
-                        .unwrap_or_default(),
-                ) {
-                    Ok(raw) => {
-                        if let Some(entry) = self.diff_cache.get_mut(&commit_id) {
-                            entry.diffs_raw.insert(path.clone(), raw.clone());
-                        }
-                        raw
-                    }
-                    Err(err) => err.to_string(),
-                },
-            };
-            let mut text = self.header.clone();
-            // フィルタが失敗した回、直前の操作結果を一度も見せずに status
-            // を上書きするのを避けたときに立てる (`status_fresh` 参照)。
-            // 立った場合は shown_diff/shown_diff_width を更新しない —
-            // 次フレームでまだ状況が同じなら再試行し、そのときは
-            // (status_fresh はもう立っていないので) 実際にエラーを
-            // status bar へ報告する。更新してしまうと、この
-            // (commit, path, width) キーに落ち着いている限り再試行され
-            // ず、フィルタが壊れていることが一度も表に出ないままになる。
-            let mut suppressed_error = false;
-            if diff_raw.trim().is_empty() {
-                text.extend(Text::from("(no changes)"));
-            } else {
-                let rendered = match &self.diff_filter_cmd {
-                    Some(cmd) => match crate::diff_filter::apply(cmd, &diff_raw, diff_width) {
-                        Ok(filtered) => filtered,
-                        Err(err) => {
-                            // フィルタが壊れていても diff pane を空にはしない —
-                            // jj の生出力にフォールバックしつつ、原因は
-                            // status bar に出す。
-                            if status_just_reported {
-                                suppressed_error = true;
-                            } else {
-                                self.status = Status::error(format!(
-                                    "{}: {err}",
-                                    crate::diff_filter::DIFF_FILTER_ENV
-                                ));
-                            }
-                            diff_raw.clone()
-                        }
-                    },
-                    None => diff_raw.clone(),
-                };
-                text.extend(parse_ansi(&rendered));
+        // 2. 本文 (選択中ファイル + 表示幅 + 整形経路) の同期。
+        let file_key = DiffFileKey::from_file(self.selected_file());
+        let (mode, effective_width) = self.active_render_mode(&commit_id, diff_width);
+        let target_key = ShownDiffKey {
+            commit_id: commit_id.clone(),
+            file_key: file_key.clone(),
+            width: effective_width,
+            mode: mode.clone(),
+            generation: self.generation,
+        };
+
+        if self.shown_diff.as_ref() == Some(&target_key) {
+            if !status_just_reported
+                && let Some((err_key, err_msg)) = self.pending_filter_error.take()
+                && err_key == target_key
+            {
+                self.status = Status::error(err_msg);
             }
-            self.diff = text;
-            if !suppressed_error {
-                self.shown_diff = Some(key);
-                self.shown_diff_width = Some(diff_width);
-            }
-            if selection_changed {
-                self.diff_scroll = 0;
-            }
+            return;
         }
+
+        // 選択対象 (commit または file) が変わったときだけ scroll を先頭へ戻す。
+        let prev_selection = self
+            .shown_diff
+            .as_ref()
+            .or(self.loading_diff_key.as_ref())
+            .map(|k| (&k.commit_id, &k.file_key));
+        let selection_changed = prev_selection != Some((&commit_id, &file_key));
+        if selection_changed {
+            self.diff_scroll = 0;
+        }
+
+        let rendered_key = RenderedKey {
+            commit_id: commit_id.clone(),
+            file_key: file_key.clone(),
+            width: effective_width,
+            mode: mode.clone(),
+        };
+        if let Some(cached_text) = self.rendered_cache.get(&rendered_key) {
+            self.diff_body = DiffBody::Ready(cached_text);
+            self.shown_diff = Some(target_key);
+            self.loading_diff_key = None;
+            self.pending_filter_error = None;
+            self.diff_workers.cancel_pending_body();
+            return;
+        }
+
+        // 未命中: 前のファイルの diff を現ファイルのタイトル下に残さない。
+        self.diff_body = DiffBody::LoadingDiff;
+        self.shown_diff = None;
+        self.loading_diff_key = Some(target_key);
+        self.pending_filter_error = None;
+
+        let cached_raw_file_diff = self
+            .diff_cache
+            .get(&commit_id)
+            .and_then(|entry| entry.diffs_raw.get(&file_key.raw_cache_path()))
+            .cloned();
+
+        let strategy = match mode {
+            RenderModeKey::BatchDelta => {
+                let config = self
+                    .diff_batch_config
+                    .clone()
+                    .expect("BatchDelta mode requires diff_batch_config");
+                let cached_raw_patch = self.raw_patch_cache.get(&commit_id);
+                BodyStrategy::BatchDelta {
+                    config,
+                    files: self.files.clone(),
+                    selected_file: self.selected_file().cloned(),
+                    cached_raw_patch,
+                    cached_selected_raw_diff: cached_raw_file_diff,
+                }
+            }
+            RenderModeKey::Filter(cmd) => BodyStrategy::PerFile {
+                selected_file: self.selected_file().cloned(),
+                filter_cmd: Some(cmd),
+                cached_raw_diff: cached_raw_file_diff,
+            },
+            RenderModeKey::Raw => BodyStrategy::PerFile {
+                selected_file: self.selected_file().cloned(),
+                filter_cmd: None,
+                cached_raw_diff: cached_raw_file_diff,
+            },
+        };
+
+        self.diff_workers.submit_body(BodyRequest {
+            commit_id,
+            width: diff_width,
+            generation: self.generation,
+            strategy,
+        });
     }
 
     pub fn scroll_diff(&mut self, delta: isize) {
         let next = self.diff_scroll as isize + delta;
-        let max = self.diff.lines.len().saturating_sub(1) as isize;
+        let max = self.diff_line_count().saturating_sub(1) as isize;
         self.diff_scroll = next.clamp(0, max.max(0)) as u16;
     }
 
@@ -1423,9 +1666,14 @@ impl App {
         }
     }
 
-    /// Ctrl-r: 選択を捨ててから reload する。
+    /// Ctrl-r: 選択と表示キャッシュを捨ててから reload する。
     fn reload_and_clear(&mut self) -> Result<()> {
         self.file_selection.clear();
+        self.rendered_cache.clear();
+        self.batch_fallback_commits.clear();
+        self.batch_disabled_generation = None;
+        self.shown_commit = None;
+        self.shown_diff = None;
         self.reload()
     }
 
@@ -2551,7 +2799,7 @@ mod tests {
         while app.selected_change().unwrap().description != "second change" {
             app.handle_key(key(KeyCode::Char('j')));
         }
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert_eq!(app.files.len(), 1, "{:?}", app.files);
         assert_eq!(app.files[0].path, "b.txt");
 
@@ -2572,7 +2820,7 @@ mod tests {
         // "second change" を指す。description も残る (empty にはなるが
         // abandon はされない)。
         assert_eq!(app.selected_change().unwrap().description, "second change");
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert!(app.files.is_empty(), "{:?}", app.files);
     }
 
@@ -2586,7 +2834,7 @@ mod tests {
             std::fs::write(app.jj.root().join(name), format!("{name}\n")).unwrap();
         }
         app.reload().unwrap();
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert_eq!(app.files.len(), 3, "{:?}", app.files);
         app.handle_key(key(KeyCode::Tab));
         Some((tmp, app))
@@ -2612,10 +2860,18 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT));
             assert_eq!(app.file_selected, index);
             assert_eq!(app.focus, Focus::Diff);
-            app.sync_diff(80);
+            app.sync_diff_blocking(80);
             assert_eq!(app.diff_scroll, 0);
-            assert_eq!(app.shown_diff.as_ref().unwrap().1.as_deref(), Some(path));
-            assert!(app.diff.to_string().contains(path));
+            assert_eq!(
+                app.shown_diff
+                    .as_ref()
+                    .unwrap()
+                    .file_key
+                    .raw_cache_path()
+                    .as_deref(),
+                Some(path)
+            );
+            assert!(app.diff_plain_text().contains(path));
             assert_eq!(app.file_selection, selection);
             assert_eq!(
                 app.file_targets(),
@@ -2626,10 +2882,10 @@ mod tests {
         // A blocked move must not reset the reading position on the next draw.
         for (index, c) in [(0, '['), (2, ']')] {
             app.file_selected = index;
-            app.sync_diff(80);
+            app.sync_diff_blocking(80);
             app.diff_scroll = 7;
             app.handle_key(key(KeyCode::Char(c)));
-            app.sync_diff(80);
+            app.sync_diff_blocking(80);
             assert_eq!(app.file_selected, index);
             assert_eq!(app.diff_scroll, 7);
             assert_eq!(app.focus, Focus::Diff);
@@ -2725,7 +2981,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('y')));
         assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
         assert!(!app.file_selection.is_active());
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert_eq!(
             app.files
                 .iter()
@@ -2770,7 +3026,7 @@ mod tests {
                 }
                 app.handle_key(key(KeyCode::Tab));
                 app.handle_key(key(KeyCode::Char(']')));
-                app.sync_diff(80);
+                app.sync_diff_blocking(80);
                 assert_eq!(app.focus, Focus::Diff);
                 let selection = app.file_selection.clone();
                 assert_eq!(app.action_file_targets(), vec![1]);
@@ -2781,7 +3037,7 @@ mod tests {
                         vec![app.jj.root().join("y.txt")]
                     );
                     app.reload_after_editor().unwrap();
-                    app.sync_diff(80);
+                    app.sync_diff_blocking(80);
                     assert_eq!(app.file_selection, selection);
                     continue;
                 }
@@ -2815,7 +3071,7 @@ mod tests {
                 } else {
                     assert!(!tmp.path().join("y.txt").exists());
                 }
-                app.sync_diff(80);
+                app.sync_diff_blocking(80);
                 assert!(app.files.iter().any(|f| f.path == "x.txt"));
                 assert!(app.files.iter().any(|f| f.path == "z.txt"));
                 assert!(!app.files.iter().any(|f| f.path == "y.txt"));
@@ -3002,7 +3258,7 @@ mod tests {
         std::fs::write(dir.join("c.txt"), "c\n").unwrap();
         app.reload().unwrap();
         assert!(app.selected_change().unwrap().is_working_copy);
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert_eq!(app.files[0].path, "c.txt", "{:?}", app.files);
 
         app.handle_key(key(KeyCode::Tab));
@@ -3030,7 +3286,7 @@ mod tests {
         while app.selected_change().unwrap().description != "second change" {
             app.handle_key(key(KeyCode::Char('j')));
         }
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert_eq!(app.files[0].path, "b.txt");
         app.editor_cmd = Some("code --wait".to_string());
 
@@ -3050,7 +3306,7 @@ mod tests {
         while app.selected_change().unwrap().description != "second change" {
             app.handle_key(key(KeyCode::Char('j')));
         }
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         app.editor_cmd = None;
 
         app.handle_key(key(KeyCode::Tab));
@@ -3110,7 +3366,7 @@ mod tests {
         while app.selected_change().unwrap().description != "rename" {
             app.handle_key(key(KeyCode::Char('j')));
         }
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert_eq!(app.files.len(), 1, "{:?}", app.files);
         assert_eq!(app.files[0].path, "{old.rs => new.rs}");
 
@@ -3129,7 +3385,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('y')));
         assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
 
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert!(app.files.is_empty(), "{:?}", app.files);
         assert_eq!(
             std::fs::read_to_string(dir.join("old.rs")).unwrap(),
@@ -3171,7 +3427,7 @@ mod tests {
         while app.selected_change().unwrap().description != "add token" {
             app.handle_key(key(KeyCode::Char('j')));
         }
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert_eq!(app.files.len(), 1, "{:?}", app.files);
 
         app.handle_key(key(KeyCode::Tab));
@@ -3227,7 +3483,7 @@ mod tests {
         while app.selected_change().unwrap().description != "top" {
             app.handle_key(key(KeyCode::Char('j')));
         }
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert_eq!(app.files.len(), 2, "{:?}", app.files);
         assert_eq!(app.files[0].path, "f.txt");
 
@@ -3242,7 +3498,7 @@ mod tests {
         assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
 
         assert_eq!(app.selected_change().unwrap().description, "top");
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         if focus == Focus::Diff {
             assert_eq!(app.files.len(), 1, "{:?}", app.files);
             assert_eq!(app.files[0].path, "g.txt");
@@ -3287,7 +3543,7 @@ mod tests {
         while app.selected_change().unwrap().description != "rename and edit" {
             app.handle_key(key(KeyCode::Char('j')));
         }
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert_eq!(app.files.len(), 1, "{:?}", app.files);
         assert_eq!(app.files[0].status, 'R');
 
@@ -3296,7 +3552,7 @@ mod tests {
         assert_eq!(app.status.kind, StatusKind::Error, "{:?}", app.status);
 
         // 何もしていないので、選択中 change の diff はまだ元のまま。
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert_eq!(app.files.len(), 1, "{:?}", app.files);
         assert_eq!(app.files[0].status, 'R');
     }
@@ -3404,19 +3660,8 @@ mod tests {
         while app.selected_change().unwrap().description != "second change" {
             app.handle_key(key(KeyCode::Char('j')));
         }
-        app.sync_diff(80);
-        let text = app
-            .diff
-            .lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        app.sync_diff_blocking(80);
+        let text = app.diff_plain_text();
         assert!(
             text.contains("second change"),
             "diff header missing: {text}"
@@ -3440,7 +3685,7 @@ mod tests {
         assert_eq!(app.diff_scroll, 0);
         // 下端を超えない。
         app.handle_key(key(KeyCode::Char('G')));
-        assert!((app.diff_scroll as usize) < app.diff.lines.len());
+        assert!((app.diff_scroll as usize) < app.diff_line_count());
         // focus が diff のあいだ、log の選択は動かない。
         let selected = app.selected_change().unwrap().id.clone();
         app.handle_key(ctrl('d'));
@@ -3480,19 +3725,8 @@ mod tests {
             app.handle_key(key(KeyCode::Char('j')));
         }
         app.diff_filter_cmd = Some(wrap_cmd().to_string());
-        app.sync_diff(42);
-        let text = app
-            .diff
-            .lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        app.sync_diff_blocking(42);
+        let text = app.diff_plain_text();
         assert!(
             text.contains("FILTERED_MARKER"),
             "diff was not routed through the filter: {text}"
@@ -3512,20 +3746,9 @@ mod tests {
             app.handle_key(key(KeyCode::Char('j')));
         }
         app.diff_filter_cmd = Some(wrap_cmd().to_string());
-        app.sync_diff(42);
-        app.sync_diff(80);
-        let text = app
-            .diff
-            .lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        app.sync_diff_blocking(42);
+        app.sync_diff_blocking(80);
+        let text = app.diff_plain_text();
         assert!(
             text.contains("WIDTH:80"),
             "resize with the same selection did not re-run the filter with the new width: {text}"
@@ -3539,19 +3762,8 @@ mod tests {
             app.handle_key(key(KeyCode::Char('j')));
         }
         app.diff_filter_cmd = Some("exit 1".to_string());
-        app.sync_diff(80);
-        let text = app
-            .diff
-            .lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        app.sync_diff_blocking(80);
+        let text = app.diff_plain_text();
         assert!(
             text.contains("b.txt"),
             "diff pane went blank instead of falling back to raw jj output: {text}"
@@ -3572,7 +3784,7 @@ mod tests {
         }
         app.diff_filter_cmd = Some("exit 1".to_string());
         // describe 前の commit_id 分のキャッシュを埋めておく。
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
 
         app.handle_key(key(KeyCode::Char('e')));
         for c in "-renamed".chars() {
@@ -3585,7 +3797,7 @@ mod tests {
         // describe で commit_id が変わったので、次の sync_diff は新しい
         // diff を取り直し、フィルタが壊れているので失敗する。それでも
         // 直前の describe 成功メッセージを一度も見せずに消してはいけない。
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert_eq!(
             app.status.text, status_after_describe,
             "diff-filter failure overwrote the just-reported action status: {:?}",
@@ -3607,7 +3819,7 @@ mod tests {
     fn diff_filter_failure_suppressed_after_reload_is_still_reported_next_frame() {
         let (_tmp, mut app) = repo_or_skip!();
         app.diff_filter_cmd = Some(fail_on_new_content_cmd().to_string());
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
 
         // 別プロセスによる working copy への変更を模す。フィルタは
@@ -3618,14 +3830,12 @@ mod tests {
 
         // reload 直後の 1 回はまだ "reloaded" を見せる (直前の操作結果を
         // 一度も見せずに消さないための抑制)。
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert_eq!(app.status.text, "reloaded", "{:?}", app.status);
 
         // だが、選択が変わらなければ次のフレームで必ず再試行され、壊れた
-        // フィルタは実際に status bar へ出る — 抑制した分を
-        // shown_diff/shown_diff_width に記録して二度と再試行しない、と
-        // いうことがあってはならない。
-        app.sync_diff(80);
+        // フィルタは実際に status bar へ出る。
+        app.sync_diff_blocking(80);
         assert_eq!(
             app.status.kind,
             StatusKind::Error,
@@ -3637,49 +3847,27 @@ mod tests {
     #[test]
     fn files_pane_lists_every_changed_file_and_diff_follows_the_selection() {
         let (_tmp, mut app) = repo_or_skip!();
-        // working copy (third change) に 2 ファイル追加して、files pane に
-        // 複数行出ることと、選択したファイルだけが diff pane に出ることを
-        // 確認する。
         std::fs::write(app.jj.root().join("x.txt"), "x\n").unwrap();
         std::fs::write(app.jj.root().join("y.txt"), "y\n").unwrap();
         app.reload().unwrap();
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
 
         let mut paths: Vec<&str> = app.files.iter().map(|f| f.path.as_str()).collect();
         paths.sort_unstable();
         assert_eq!(paths, vec!["x.txt", "y.txt"], "{:?}", app.files);
 
-        let text_of = |app: &App| -> String {
-            app.diff
-                .lines
-                .iter()
-                .map(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| s.content.as_ref())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-
-        // 先頭ファイルだけが diff pane に出て、もう一方は出ない。
-        // `jj diff` はもう `--git` を強制しない (ui.diff-formatter に従う)
-        // ので、ヘッダの厳密な文字列ではなくパス名の有無だけを見る —
-        // どの formatter でもファイルパスはヘッダに出る。
         let first_path = app.files[0].path.clone();
         let second_path = app.files[1].path.clone();
-        let first_text = text_of(&app);
+        let first_text = app.diff_plain_text();
         assert!(first_text.contains(&first_path));
         assert!(!first_text.contains(&second_path));
 
-        // files pane に移って次のファイルへ動かすと、diff pane が切り替わる。
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Files);
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.file_selected, 1);
-        app.sync_diff(80);
-        let second_text = text_of(&app);
+        app.sync_diff_blocking(80);
+        let second_text = app.diff_plain_text();
         assert!(second_text.contains(&second_path));
         assert!(!second_text.contains(&first_path));
     }
@@ -3777,7 +3965,7 @@ mod tests {
                 )
             })
             .unwrap();
-        let commit_id = app.selected_change().unwrap().commit_id.clone();
+        let commit_id = app.selected_change().unwrap().full_commit_id.clone();
         let files = app.jj.diff_summary("@").unwrap();
         assert!(files.iter().any(|file| file.status == 'R'), "{files:?}");
         #[cfg(unix)]
@@ -3804,39 +3992,25 @@ mod tests {
             .cloned()
             .collect();
 
-        // No commit cache, an existing entry without file diffs, then prefetch.
+        // No commit cache, an existing metadata-only entry, then warm rendered cache.
         for route in 0..3 {
-            app.diff_cache.forget(&commit_id);
-            app.shown_commit = None;
-            app.shown_diff = None;
+            if route < 2 {
+                app.diff_cache.forget(&commit_id);
+                app.rendered_cache.clear();
+                app.shown_commit = None;
+                app.shown_diff = None;
+            }
             if route == 1 {
                 app.diff_cache.insert(
                     commit_id.clone(),
                     CommitCache::new(files.clone(), app.jj.show("@").unwrap()),
                 );
-            } else if route == 2 {
-                app.begin_diff_prefetch();
-                app.wait_for_startup();
-                let entry = app.diff_cache.get(&commit_id).unwrap();
-                for file in &targets {
-                    assert!(
-                        entry.diffs_raw.contains_key(&Some(file.target_path())),
-                        "prefetch missed {}",
-                        file.path
-                    );
-                }
             }
-            app.sync_diff(80);
+            app.sync_diff_blocking(80);
             for file in &targets {
                 app.file_selected = app.files.iter().position(|f| f == file).unwrap();
-                app.sync_diff(80);
-                let text = app
-                    .diff
-                    .lines
-                    .iter()
-                    .map(|line| line.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                app.sync_diff_blocking(80);
+                let text = app.diff_plain_text();
                 assert!(
                     text.contains("diff --git"),
                     "configured formatter missing, route {route}: {text}"
@@ -3947,30 +4121,17 @@ mod tests {
     #[test]
     fn revisiting_a_commit_reuses_the_cached_diff_without_calling_jj_again() {
         let (_tmp, mut app) = repo_or_skip!();
-        let text_of = |app: &App| -> String {
-            app.diff
-                .lines
-                .iter()
-                .map(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| s.content.as_ref())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
 
         // 先頭 (working copy = third change) の diff/files を一度取ってキャッシュさせる。
-        app.sync_diff(80);
-        let first_id = app.selected_change().unwrap().commit_id.clone();
-        let first_text = text_of(&app);
+        app.sync_diff_blocking(80);
+        let first_id = app.selected_change().unwrap().full_commit_id.clone();
+        let first_text = app.diff_plain_text();
         let first_files: Vec<String> = app.files.iter().map(|f| f.path.clone()).collect();
 
         // 別 commit (second change) へ移動して files/diff を取り直させる。
         app.handle_key(key(KeyCode::Char('j')));
-        app.sync_diff(80);
-        assert_ne!(app.selected_change().unwrap().commit_id, first_id);
+        app.sync_diff_blocking(80);
+        assert_ne!(app.selected_change().unwrap().full_commit_id, first_id);
 
         // ここで repo 自体を消す: これ以降に本当に `jj` を叩けば必ず失敗する。
         std::fs::remove_dir_all(app.jj.root()).unwrap();
@@ -3978,9 +4139,9 @@ mod tests {
         // 元の commit に戻る。commit_id は content-addressed で不変なので、
         // キャッシュヒットするなら jj を一切呼ばずに同じ内容が復元されるはず。
         app.handle_key(key(KeyCode::Char('k')));
-        app.sync_diff(80);
-        assert_eq!(app.selected_change().unwrap().commit_id, first_id);
-        assert_eq!(text_of(&app), first_text);
+        app.sync_diff_blocking(80);
+        assert_eq!(app.selected_change().unwrap().full_commit_id, first_id);
+        assert_eq!(app.diff_plain_text(), first_text);
         let files_again: Vec<String> = app.files.iter().map(|f| f.path.clone()).collect();
         assert_eq!(files_again, first_files);
     }
@@ -3989,31 +4150,23 @@ mod tests {
     fn jj_failures_are_not_cached_and_are_retried_on_the_next_view() {
         let (_tmp, mut app) = repo_or_skip!();
         // 先頭 (working copy) はここでキャッシュさせておき、壊す対象から外す。
-        app.sync_diff(80);
-        // 壊す対象 (second change) へ移動するが、まだ sync_diff は呼ばない —
-        // ここでキャッシュしてしまうと失敗を注入する前に成功が残ってしまう。
+        app.sync_diff_blocking(80);
+        // 壊す対象 (second change) へ移動するが、まだ sync_diff は呼ばない。
         app.handle_key(key(KeyCode::Char('j')));
-        let commit_id = app.selected_change().unwrap().commit_id.clone();
-        // 起動直後の diff 先読み (`begin_diff_prefetch`, `wait_for_startup`
-        // 経由で `repo_or_skip!` が待ち切っている) がこの commit も既に
-        // 温めてしまっている可能性がある — このテストは「まだ
-        // キャッシュされていない commit で jj が失敗したら焼き付かない」
-        // ことを見たいので、先読み分は一旦忘れさせる。
+        let commit_id = app.selected_change().unwrap().full_commit_id.clone();
         app.diff_cache.forget(&commit_id);
 
         // repo を一時的に隠して `jj diff --summary`/`jj show` を失敗させる。
         let jj_dir = app.jj.root().join(".jj");
         let hidden = app.jj.root().join(".jj-hidden");
         std::fs::rename(&jj_dir, &hidden).unwrap();
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         std::fs::rename(&hidden, &jj_dir).unwrap();
 
         assert!(
             !app.diff_cache.contains(&commit_id),
             "jj の失敗が成功データとしてキャッシュに残っている"
         );
-        // jj 自体のエラー文言のバージョン依存は避け、「何らかのエラー
-        // 文が出ている (空の diff pane のままではない)」ことだけ見る。
         assert!(
             !app.header.lines.is_empty(),
             "失敗理由が header に出ていない (空のまま)"
@@ -4022,9 +4175,9 @@ mod tests {
         // repo を戻して別 commit を経由 → 同じ commit に戻ると、
         // キャッシュされていないので jj を叩き直し、今度は成功する。
         app.handle_key(key(KeyCode::Char('j')));
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         app.handle_key(key(KeyCode::Char('k')));
-        app.sync_diff(80);
+        app.sync_diff_blocking(80);
         assert!(
             app.diff_cache.contains(&commit_id),
             "リトライ後は成功データがキャッシュされているはず"
@@ -4207,5 +4360,626 @@ mod tests {
         );
         // 失敗しても入力は消えず、キャンセルもされない。
         assert!(matches!(app.mode, Mode::Input(_)));
+    }
+
+    // ─── Async diff pipeline & delta-v1 batching deterministic tests ───
+
+    struct Gate {
+        state: std::sync::Mutex<GateState>,
+        cv: std::sync::Condvar,
+    }
+
+    struct GateState {
+        entered: usize,
+        released: usize,
+    }
+
+    impl Gate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                state: std::sync::Mutex::new(GateState {
+                    entered: 0,
+                    released: 0,
+                }),
+                cv: std::sync::Condvar::new(),
+            })
+        }
+
+        fn arrive_and_wait(&self) {
+            let mut guard = self.state.lock().unwrap();
+            let ticket = guard.entered + 1;
+            guard.entered = ticket;
+            self.cv.notify_all();
+            while guard.released < ticket {
+                guard = self.cv.wait(guard).unwrap();
+            }
+        }
+
+        fn wait_entered(&self, count: usize) {
+            let mut guard = self.state.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while guard.entered < count {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                assert!(!rem.is_zero(), "timed out waiting for worker to enter gate");
+                let (g, _) = self.cv.wait_timeout(guard, rem).unwrap();
+                guard = g;
+            }
+        }
+
+        fn release_next(&self) {
+            let mut guard = self.state.lock().unwrap();
+            guard.released += 1;
+            self.cv.notify_all();
+        }
+
+        fn release_all(&self) {
+            let mut guard = self.state.lock().unwrap();
+            guard.released = usize::MAX;
+            self.cv.notify_all();
+        }
+    }
+
+    struct FakeBackend {
+        formatter: std::sync::Mutex<String>,
+        files: std::sync::Mutex<std::collections::HashMap<String, Vec<DiffFile>>>,
+        headers: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        git_patches: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        per_file_diffs: std::sync::Mutex<std::collections::HashMap<(String, Vec<String>), String>>,
+        corrupt_delta: std::sync::atomic::AtomicBool,
+        fail_delta: std::sync::atomic::AtomicBool,
+        delta_gate: Option<Arc<Gate>>,
+        filter_gate: Option<Arc<Gate>>,
+        diff_git_calls: std::sync::atomic::AtomicUsize,
+        delta_batch_calls: std::sync::atomic::AtomicUsize,
+        diff_file_calls: std::sync::atomic::AtomicUsize,
+        filter_calls: std::sync::atomic::AtomicUsize,
+        filter_seen_inputs: std::sync::Mutex<Vec<(String, u16)>>,
+    }
+
+    impl FakeBackend {
+        fn new(formatter: &str) -> Arc<Self> {
+            Arc::new(Self {
+                formatter: std::sync::Mutex::new(formatter.to_string()),
+                files: std::sync::Mutex::new(std::collections::HashMap::new()),
+                headers: std::sync::Mutex::new(std::collections::HashMap::new()),
+                git_patches: std::sync::Mutex::new(std::collections::HashMap::new()),
+                per_file_diffs: std::sync::Mutex::new(std::collections::HashMap::new()),
+                corrupt_delta: std::sync::atomic::AtomicBool::new(false),
+                fail_delta: std::sync::atomic::AtomicBool::new(false),
+                delta_gate: None,
+                filter_gate: None,
+                diff_git_calls: std::sync::atomic::AtomicUsize::new(0),
+                delta_batch_calls: std::sync::atomic::AtomicUsize::new(0),
+                diff_file_calls: std::sync::atomic::AtomicUsize::new(0),
+                filter_calls: std::sync::atomic::AtomicUsize::new(0),
+                filter_seen_inputs: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn add_commit(
+            &self,
+            commit_id: &str,
+            files: Vec<DiffFile>,
+            header: &str,
+            git_patch: &str,
+            per_file: Vec<(Vec<String>, String)>,
+        ) {
+            self.files
+                .lock()
+                .unwrap()
+                .insert(commit_id.to_string(), files);
+            self.headers
+                .lock()
+                .unwrap()
+                .insert(commit_id.to_string(), header.to_string());
+            self.git_patches
+                .lock()
+                .unwrap()
+                .insert(commit_id.to_string(), git_patch.to_string());
+            let mut map = self.per_file_diffs.lock().unwrap();
+            for (paths, diff) in per_file {
+                map.insert((commit_id.to_string(), paths), diff);
+            }
+        }
+    }
+
+    impl DiffBackend for FakeBackend {
+        fn diff_summary(&self, commit_id: &str) -> Result<Vec<DiffFile>> {
+            Ok(self
+                .files
+                .lock()
+                .unwrap()
+                .get(commit_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        fn show(&self, commit_id: &str) -> Result<String> {
+            Ok(self
+                .headers
+                .lock()
+                .unwrap()
+                .get(commit_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        fn diff_formatter(&self) -> Result<String> {
+            Ok(self.formatter.lock().unwrap().clone())
+        }
+
+        fn diff_git_full(&self, commit_id: &str) -> Result<String> {
+            self.diff_git_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.git_patches
+                .lock()
+                .unwrap()
+                .get(commit_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing fake git patch for {commit_id}"))
+        }
+
+        fn diff_file(&self, commit_id: &str, paths: &[String]) -> Result<String> {
+            self.diff_file_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self
+                .per_file_diffs
+                .lock()
+                .unwrap()
+                .get(&(commit_id.to_string(), paths.to_vec()))
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        fn run_delta_batch(
+            &self,
+            _config: &DeltaBatchConfig,
+            framed: &crate::diff_batch::FramedBatch,
+            width: u16,
+        ) -> Result<String> {
+            self.delta_batch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(gate) = &self.delta_gate {
+                gate.arrive_and_wait();
+            }
+            if self.fail_delta.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("simulated delta failure");
+            }
+            if self.corrupt_delta.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok("STRAY_OUTSIDE_MARKERS\n".to_string());
+            }
+            // Echo markers untouched while tagging each section with ANSI + width.
+            let mut out = String::new();
+            for line in framed.input.lines() {
+                if line.starts_with("commit ") {
+                    out.push_str(line);
+                    out.push('\n');
+                } else {
+                    out.push_str(&format!("\x1b[32mDELTA[w={width}]: {line}\x1b[0m\n"));
+                }
+            }
+            Ok(out)
+        }
+
+        fn run_diff_filter(&self, _cmd: &str, raw: &str, width: u16) -> Result<String> {
+            self.filter_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.filter_seen_inputs
+                .lock()
+                .unwrap()
+                .push((raw.to_string(), width));
+            if let Some(gate) = &self.filter_gate {
+                gate.arrive_and_wait();
+            }
+            Ok(format!("\x1b[36mFILTER[w={width}]: {raw}\x1b[0m"))
+        }
+    }
+
+    fn fake_app(backend: Arc<FakeBackend>, commits: &[(&str, &str)]) -> (tempfile::TempDir, App) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".jj")).unwrap();
+        let jj = Jj::discover(tmp.path()).unwrap();
+        let mut app = App::with_backend(jj, None, backend, false);
+        app.diff_filter_cmd = None;
+        app.diff_batch_config = None;
+        let rows: Vec<Row> = commits
+            .iter()
+            .enumerate()
+            .map(|(i, (cid, desc))| Row::Change {
+                graph: "@  ".to_string(),
+                change: Change {
+                    id: format!("chg{i}"),
+                    short_id: format!("chg{i}"),
+                    commit_id: cid.chars().take(8).collect(),
+                    full_commit_id: (*cid).to_string(),
+                    is_working_copy: i == 0,
+                    is_empty: false,
+                    has_conflict: false,
+                    is_immutable: false,
+                    author: "test".to_string(),
+                    timestamp: "2026-11-21 00:00".to_string(),
+                    bookmarks: Vec::new(),
+                    description: (*desc).to_string(),
+                },
+            })
+            .collect();
+        app.apply_rows(rows, "chg0".to_string());
+        app.status = Status::info("? for help");
+        (tmp, app)
+    }
+
+    fn sample_multi_file_commit() -> (Vec<DiffFile>, String, Vec<(Vec<String>, String)>) {
+        let files = vec![
+            DiffFile {
+                status: 'M',
+                path: "alpha.rs".into(),
+                source_path: "alpha.rs".into(),
+                destination_path: "alpha.rs".into(),
+            },
+            DiffFile {
+                status: 'R',
+                path: "{old space.txt => new space.txt}".into(),
+                source_path: "old space.txt".into(),
+                destination_path: "new space.txt".into(),
+            },
+            DiffFile {
+                status: 'A',
+                path: "日本語.txt".into(),
+                source_path: "日本語.txt".into(),
+                destination_path: "日本語.txt".into(),
+            },
+            DiffFile {
+                status: 'M',
+                path: "exec.sh".into(),
+                source_path: "exec.sh".into(),
+                destination_path: "exec.sh".into(),
+            },
+        ];
+        let git_patch = concat!(
+            "diff --git a/alpha.rs b/alpha.rs\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/alpha.rs\n",
+            "+++ b/alpha.rs\n",
+            "@@ -1 +1 @@\n",
+            "-old_alpha\n",
+            "+new_alpha\n",
+            "diff --git a/old space.txt b/new space.txt\n",
+            "rename from old space.txt\n",
+            "rename to new space.txt\n",
+            "diff --git a/日本語.txt b/日本語.txt\n",
+            "new file mode 100644\n",
+            "index 0000000..3333333\n",
+            "--- /dev/null\n",
+            "+++ b/日本語.txt\n",
+            "@@ -0,0 +1 @@\n",
+            "+こんにちは\n",
+            "diff --git a/exec.sh b/exec.sh\n",
+            "old mode 100644\n",
+            "new mode 100755\n",
+        )
+        .to_string();
+        let per_file = vec![
+            (vec!["alpha.rs".into()], "RAW_ALPHA\n".into()),
+            (
+                vec!["old space.txt".into(), "new space.txt".into()],
+                "RAW_RENAME\n".into(),
+            ),
+            (vec!["日本語.txt".into()], "RAW_UTF8\n".into()),
+            (vec!["exec.sh".into()], "RAW_MODE\n".into()),
+        ];
+        (files, git_patch, per_file)
+    }
+
+    #[test]
+    fn batch_delta_keeps_cursor_visual_range_and_quit_live_while_blocked_and_counts_calls() {
+        use std::sync::atomic::Ordering;
+
+        let gate = Gate::new();
+        let mut backend_inner = Arc::try_unwrap(FakeBackend::new(":git")).ok().unwrap();
+        backend_inner.delta_gate = Some(Arc::clone(&gate));
+        let backend = Arc::new(backend_inner);
+        let (files, git_patch, per_file) = sample_multi_file_commit();
+        let cid = "1111111111111111111111111111111111111111";
+        backend.add_commit(cid, files, "Commit header: multi\n", &git_patch, per_file);
+
+        let (_tmp, mut app) = fake_app(Arc::clone(&backend), &[(cid, "multi")]);
+        app.diff_batch_config = Some(DeltaBatchConfig::delta_v1());
+
+        // Step 1: metadata loads quickly; then body worker blocks inside delta.
+        app.sync_diff(100);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.files.is_empty() {
+            assert!(Instant::now() < deadline, "metadata never arrived");
+            app.sync_diff(100);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.files.len(), 4);
+        // Body worker should now have entered the blocked delta gate.
+        gate.wait_entered(1);
+        assert!(app.is_diff_loading());
+
+        // Step 2: while delta is STILL blocked, focus files pane, press V,
+        // extend range with j/j/j, shrink with k, and verify live UI state!
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Files);
+        app.handle_key(key(KeyCode::Char('V')));
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.file_selected, 3);
+        assert_eq!(
+            app.file_selection.selected(app.file_selected, app.files.len()),
+            vec![0, 1, 2, 3]
+        );
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.file_selected, 2);
+        assert_eq!(
+            app.file_selection.selected(app.file_selected, app.files.len()),
+            vec![0, 1, 2]
+        );
+        // Non-blocking sync_diff during rapid moves must preserve header,
+        // show loading state (not stale file 0 diff), and NOT spawn extra batches.
+        app.sync_diff(100);
+        let loading_text = app.diff_plain_text();
+        assert!(loading_text.contains("Commit header: multi"), "{loading_text}");
+        assert!(loading_text.contains("loading diff…"), "{loading_text}");
+        assert!(!loading_text.contains("new_alpha"), "{loading_text}");
+        assert_eq!(backend.diff_git_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.delta_batch_calls.load(Ordering::SeqCst), 1);
+
+        // Step 3: release delta gate — completion must display file 2 (selected at completion)!
+        gate.release_all();
+        app.sync_diff_blocking(100);
+        let text2 = app.diff_plain_text();
+        assert!(text2.contains("DELTA[w=100]"), "{text2}");
+        assert!(text2.contains("こんにちは"), "{text2}");
+        assert!(!text2.contains("new_alpha"), "{text2}");
+        assert_eq!(backend.diff_git_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.delta_batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 0);
+
+        // Step 4: first and repeat visits to ALL 4 files at width 100 are cache hits!
+        for idx in [0, 1, 3, 2, 0, 3, 1] {
+            app.file_selected = idx;
+            app.sync_diff(100);
+            assert!(!app.is_diff_loading(), "expected warm cache hit for idx {idx}");
+        }
+        assert_eq!(backend.diff_git_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.delta_batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 0);
+
+        // Step 5: resize to 140 reuses raw patch (diff_git_calls stays 1!) and runs delta ONCE!
+        app.file_selected = 0;
+        app.sync_diff_blocking(140);
+        let resized = app.diff_plain_text();
+        assert!(resized.contains("DELTA[w=140]"), "{resized}");
+        assert!(resized.contains("new_alpha"), "{resized}");
+        assert_eq!(backend.diff_git_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.delta_batch_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 0);
+
+        // Resizing back to 100 hits Tier 2 rendered cache directly.
+        app.sync_diff(100);
+        assert!(!app.is_diff_loading());
+        assert!(app.diff_plain_text().contains("DELTA[w=100]"));
+        assert_eq!(backend.delta_batch_calls.load(Ordering::SeqCst), 2);
+
+        // Step 6: quit input works immediately even while blocked on a new width.
+        let gate2 = Gate::new();
+        let mut b2 = Arc::try_unwrap(FakeBackend::new(":git")).ok().unwrap();
+        b2.delta_gate = Some(Arc::clone(&gate2));
+        let b2 = Arc::new(b2);
+        let (f2, p2, pf2) = sample_multi_file_commit();
+        b2.add_commit(cid, f2, "Commit header\n", &p2, pf2);
+        let (_tmp2, mut app2) = fake_app(Arc::clone(&b2), &[(cid, "multi")]);
+        app2.diff_batch_config = Some(DeltaBatchConfig::delta_v1());
+        app2.sync_diff(80);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app2.files.is_empty() {
+            assert!(Instant::now() < deadline);
+            app2.sync_diff(80);
+            thread::sleep(Duration::from_millis(1));
+        }
+        gate2.wait_entered(1);
+        app2.handle_key(key(KeyCode::Char('q')));
+        assert!(app2.should_quit, "quit must not wait for blocked delta");
+        drop(app2);
+        gate2.release_all();
+    }
+
+    #[test]
+    fn slow_filter_coalesces_obsolete_moves_rejects_stale_results_and_caches_success() {
+        use std::sync::atomic::Ordering;
+
+        let gate = Gate::new();
+        let mut backend_inner = Arc::try_unwrap(FakeBackend::new(":git")).ok().unwrap();
+        backend_inner.filter_gate = Some(Arc::clone(&gate));
+        let backend = Arc::new(backend_inner);
+        let (files, git_patch, per_file) = sample_multi_file_commit();
+        let cid = "2222222222222222222222222222222222222222";
+        backend.add_commit(cid, files, "Filter header\n", &git_patch, per_file);
+
+        let (_tmp, mut app) = fake_app(Arc::clone(&backend), &[(cid, "filter-test")]);
+        // Setting SHIKIGAMI_DIFF_FILTER keeps per-file async path even when batch is configured.
+        app.diff_batch_config = Some(DeltaBatchConfig::delta_v1());
+        app.diff_filter_cmd = Some("fake-filter".to_string());
+
+        app.sync_diff(90);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.files.is_empty() {
+            assert!(Instant::now() < deadline);
+            app.sync_diff(90);
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Worker enters filter for file 0 (alpha.rs) and blocks.
+        gate.wait_entered(1);
+        assert_eq!(backend.diff_git_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.delta_batch_calls.load(Ordering::SeqCst), 0);
+
+        // Rapidly jump 0 -> 1 -> 2 -> 3 while file 0 is still blocked.
+        app.handle_key(key(KeyCode::Tab));
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Char('j')));
+            app.sync_diff(90);
+        }
+        assert_eq!(app.file_selected, 3);
+        assert!(app.diff_plain_text().contains("loading diff…"));
+
+        // Release file 0: stale result must NOT be displayed under file 3!
+        gate.release_next();
+        // Wait until worker enters filter for coalesced file 3 (skipping files 1 & 2!).
+        gate.wait_entered(2);
+        app.poll_diff();
+        let still_loading = app.diff_plain_text();
+        assert!(
+            !still_loading.contains("RAW_ALPHA"),
+            "stale file 0 diff leaked onto file 3: {still_loading}"
+        );
+        assert!(still_loading.contains("loading diff…"), "{still_loading}");
+
+        // Release file 3 -> file 3 displays cleanly!
+        gate.release_all();
+        app.sync_diff_blocking(90);
+        let text3 = app.diff_plain_text();
+        assert!(text3.contains("FILTER[w=90]"), "{text3}");
+        assert!(text3.contains("RAW_MODE"), "{text3}");
+        // Only file 0 (in-flight) and file 3 (latest) ran — files 1 & 2 were coalesced!
+        assert_eq!(backend.filter_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 2);
+
+        // Revisiting file 0 and file 3 at width 90 are cache hits (0 new filter/jj calls).
+        app.file_selected = 0;
+        app.sync_diff(90);
+        assert!(!app.is_diff_loading());
+        assert!(app.diff_plain_text().contains("RAW_ALPHA"));
+        app.file_selected = 3;
+        app.sync_diff(90);
+        assert!(!app.is_diff_loading());
+        assert!(app.diff_plain_text().contains("RAW_MODE"));
+        assert_eq!(backend.filter_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 2);
+
+        // Resize to 120 reuses cached raw per-file diff (0 new jj calls) and runs filter once.
+        app.sync_diff_blocking(120);
+        assert!(app.diff_plain_text().contains("FILTER[w=120]"));
+        assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.filter_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn non_git_formatter_and_corrupt_delta_fall_back_cleanly_without_poisoning_cache() {
+        use std::sync::atomic::Ordering;
+
+        // Case 1: ui.diff-formatter is :color-words -> batch disabled, per-file cached.
+        let backend1 = FakeBackend::new(":color-words");
+        let (files, git_patch, per_file) = sample_multi_file_commit();
+        let cid = "3333333333333333333333333333333333333333";
+        backend1.add_commit(cid, files, "Header\n", &git_patch, per_file);
+        let (_tmp1, mut app1) = fake_app(Arc::clone(&backend1), &[(cid, "non-git")]);
+        app1.diff_batch_config = Some(DeltaBatchConfig::delta_v1());
+        app1.sync_diff_blocking(80);
+        assert!(app1.diff_plain_text().contains("RAW_ALPHA"));
+        assert_eq!(backend1.diff_git_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend1.delta_batch_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend1.diff_file_calls.load(Ordering::SeqCst), 1);
+        // Revisit is cached.
+        app1.file_selected = 1;
+        app1.sync_diff_blocking(80);
+        assert!(app1.diff_plain_text().contains("RAW_RENAME"));
+        app1.file_selected = 0;
+        app1.sync_diff(80);
+        assert!(!app1.is_diff_loading());
+        assert_eq!(backend1.diff_file_calls.load(Ordering::SeqCst), 2);
+
+        // Case 2: delta outputs stray/corrupt markers -> falls back without poisoning cache!
+        let backend2 = FakeBackend::new(":git");
+        backend2.corrupt_delta.store(true, Ordering::SeqCst);
+        let (files2, git_patch2, per_file2) = sample_multi_file_commit();
+        backend2.add_commit(cid, files2, "Header\n", &git_patch2, per_file2);
+        let (_tmp2, mut app2) = fake_app(Arc::clone(&backend2), &[(cid, "corrupt-delta")]);
+        app2.diff_batch_config = Some(DeltaBatchConfig::delta_v1());
+        app2.sync_diff_blocking(80);
+        let fallback_text = app2.diff_plain_text();
+        assert!(fallback_text.contains("RAW_ALPHA"), "{fallback_text}");
+        assert!(!fallback_text.contains("STRAY_OUTSIDE_MARKERS"), "{fallback_text}");
+        assert_eq!(backend2.delta_batch_calls.load(Ordering::SeqCst), 1);
+        // Switching to file 1 stays on fallback for this commit (does not retry broken delta).
+        app2.file_selected = 1;
+        app2.sync_diff_blocking(80);
+        assert!(app2.diff_plain_text().contains("RAW_RENAME"));
+        assert_eq!(backend2.delta_batch_calls.load(Ordering::SeqCst), 1);
+        // Raw patch cache must NOT contain poisoned entry from failed batch.
+        assert!(app2.raw_patch_cache.get(cid).is_none());
+    }
+
+    #[test]
+    fn real_jj_and_delta_batch_handles_special_paths_hunkless_changes_and_resize() {
+        if !jj_available() {
+            report_skip();
+            return;
+        }
+        let delta_ok = Command::new("delta")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !delta_ok {
+            eprintln!("skipping: `delta` is not on PATH");
+            return;
+        }
+
+        let (tmp, mut app) = repo_or_skip!();
+        let dir = tmp.path();
+        run(dir, &["config", "set", "--repo", "ui.diff-formatter", ":git"]);
+        std::fs::write(dir.join("old space.txt"), "hello\n").unwrap();
+        std::fs::write(dir.join("mode.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        run(dir, &["new", "-m", "batch delta showcase"]);
+        std::fs::rename(dir.join("old space.txt"), dir.join("new space.txt")).unwrap();
+        std::fs::write(dir.join("日本語 file.txt"), "こんにちは\n世界\n").unwrap();
+        std::fs::write(dir.join("bin.dat"), [0u8, 1, 2, 3, 255, 0, 4]).unwrap();
+        std::fs::write(dir.join("empty_new.txt"), "").unwrap();
+        run(dir, &["file", "chmod", "x", "mode.sh"]);
+
+        app.diff_filter_cmd = None;
+        app.diff_batch_config = Some(DeltaBatchConfig::delta_v1());
+        app.reload().unwrap();
+        while app.selected_change().unwrap().description != "batch delta showcase" {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.sync_diff_blocking(100);
+        assert_eq!(app.files.len(), 5, "{:?}", app.files);
+
+        // Every file must be served cleanly from the prepared batch without fallback.
+        assert!(app.batch_fallback_commits.is_empty());
+        assert!(app.batch_disabled_generation.is_none());
+        for i in 0..app.files.len() {
+            app.file_selected = i;
+            app.sync_diff(100);
+            assert!(
+                !app.is_diff_loading(),
+                "expected immediate batch cache hit for {:?}",
+                app.files[i]
+            );
+            let text = app.diff_plain_text();
+            assert!(
+                text.contains("batch delta showcase"),
+                "header missing for {:?}: {text}",
+                app.files[i]
+            );
+            assert!(
+                text.contains(&app.files[i].destination_path),
+                "expected destination path in delta output for {:?}: {text}",
+                app.files[i]
+            );
+        }
+
+        // Resize to 130 re-runs delta using cached raw patch and warms all files again.
+        app.sync_diff_blocking(130);
+        assert!(app.batch_fallback_commits.is_empty());
+        for i in 0..app.files.len() {
+            app.file_selected = i;
+            app.sync_diff(130);
+            assert!(!app.is_diff_loading());
+        }
     }
 }

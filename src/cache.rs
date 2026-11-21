@@ -1,32 +1,94 @@
-//! commit ごとの `jj diff`/`jj show` 出力をディスクへ永続化するキャッシュ。
+//! commit ごとの `jj diff`/`jj show` 出力と表示済み `Text` の二段キャッシュ。
 //!
-//! jj のオブジェクトストアは content-addressed: `commit_id` はコミットの
-//! 内容 (親・木・メッセージ) から決まり、rewrite (describe/squash/rebase/
-//! abandon/…) は既存の id を書き換えず新しい id を作る。だから
-//! `commit_id` が同じである限り `jj diff`/`jj show` の出力はプロセスを
-//! またいでも不変 — このキャッシュは commit の mutable/immutable を
-//! 問わず、セッションをまたいでディスクに置いても安全 (jj 側で書き換え
-//! られたら別の `commit_id` になるだけなので、古いエントリが誤って
-//! 新しい内容として表示されることはない)。
-//!
-//! ANSI 解決後の [`ratatui::text::Text`] ではなく生の stdout 文字列で
-//! 持つ: シリアライズ対象を素の `String`/`Vec` に留めておける (ratatui の
-//! 内部表現に serde 対応を持ち込まずに済む) し、表示直前の
-//! `ansi_to_tui` パースはプロセス起動と違って純 CPU 処理で軽い。
+//! - Tier 1 (生データ):
+//!   - [`DiffStore`]: commit ごとの `files` / `header_raw` / ファイル別生 diff
+//!     (ディスク永続化 + バイト上限付き LRU)。
+//!   - [`RawPatchCache`]: バッチ整形用の不変コミット全体 Git パッチ
+//!     (`Arc<String>`, インメモリ・バイト上限付き LRU)。リサイズ時はここから
+//!     再利用して `jj diff --git` を再実行しない。
+//! - Tier 2 (表示結果):
+//!   - [`RenderedDiffCache`]: ANSI パース済みの共有 [`ratatui::text::Text`]
+//!     (`Arc<Text<'static>>`, インメモリ・バイト上限付き LRU)。バッチ整形結果と
+//!     非同期フォールバック成功結果の両方を保持する。
+//!   - [`HeaderCache`]: ANSI パース済みの change ヘッダ (`Arc<Text<'static>>`)。
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use ratatui::text::{Line, Span, Text};
 use serde::{Deserialize, Serialize};
 
 use crate::jj::{DiffFile, Jj};
 
-/// ディスクに残す commit の上限。commit 1 件あたりのキャッシュはせいぜい
-/// 数 KB 程度 (files + header + 数ファイル分の diff) なので、この件数
-/// でも肥大化を気にする必要はない。超えた分は最も昔に使ったものから
-/// 捨てる (LRU)。
+/// ディスクに残す commit の上限。
 const CAP: usize = 300;
+
+/// Tier 1 (`DiffStore`) のインメモリ生出力バイト上限 (32 MiB)。
+const MAX_DIFF_STORE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Tier 1 (`RawPatchCache`) の生 Git パッチ合計バイト上限 (32 MiB)。
+const MAX_RAW_PATCH_BYTES: usize = 32 * 1024 * 1024;
+
+/// Tier 2 (`RenderedDiffCache`) の表示済み `Text` 合計バイト上限 (48 MiB)。
+const MAX_RENDERED_BYTES: usize = 48 * 1024 * 1024;
+
+/// Tier 2 (`RenderedDiffCache`) の最大エントリ数。
+const MAX_RENDERED_ENTRIES: usize = 4096;
+
+/// ヘッダ (`jj show --no-patch`) パース済み `Text` のキャッシュ上限。
+const HEADER_CACHE_CAP: usize = 64;
+
+/// `DiffFile` を表示名ではなく実パス + 変更種別で一意に識別するキー。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DiffFileKey {
+    WholeCommit,
+    File {
+        status: char,
+        source_path: String,
+        destination_path: String,
+    },
+}
+
+impl DiffFileKey {
+    pub fn from_file(file: Option<&DiffFile>) -> Self {
+        match file {
+            Some(f) => Self::File {
+                status: f.status,
+                source_path: f.source_path.clone(),
+                destination_path: f.destination_path.clone(),
+            },
+            None => Self::WholeCommit,
+        }
+    }
+
+    pub fn raw_cache_path(&self) -> Option<String> {
+        match self {
+            Self::WholeCommit => None,
+            Self::File {
+                destination_path, ..
+            } => Some(destination_path.clone()),
+        }
+    }
+}
+
+/// 表示キャッシュを整形経路ごとに分離するキー。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RenderModeKey {
+    BatchDelta,
+    Filter(String),
+    Raw,
+}
+
+/// Tier 2 表示キャッシュのキー。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RenderedKey {
+    pub commit_id: String,
+    pub file_key: DiffFileKey,
+    pub width: u16,
+    pub mode: RenderModeKey,
+}
 
 /// 1 commit 分の `jj` 生出力。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,12 +99,6 @@ pub struct CommitCache {
     pub header_raw: String,
     /// 選択ファイルの実パス (`None` は change 全体) ごとの `jj diff --color
     /// always` 生出力。
-    ///
-    /// JSON のオブジェクトキーは文字列でなければならず、serde_json は
-    /// `HashMap` を素直にシリアライズしようとするとキー型に `Option<String>`
-    /// (特に `None`) を許さずエラーにする。`diffs_raw_as_pairs` で
-    /// `Vec<(Option<String>, String)>` へ変換してから載せる — 実行時の
-    /// 参照 (`get`/`insert`/`contains_key`) は引き続き `HashMap` のまま。
     #[serde(with = "diffs_raw_as_pairs")]
     pub diffs_raw: HashMap<Option<String>, String>,
 }
@@ -78,18 +134,49 @@ impl CommitCache {
             diffs_raw: HashMap::new(),
         }
     }
+
+    fn approx_bytes(&self) -> usize {
+        let files_bytes: usize = self
+            .files
+            .iter()
+            .map(|f| f.path.len() + f.source_path.len() + f.destination_path.len() + 32)
+            .sum();
+        let diffs_bytes: usize = self
+            .diffs_raw
+            .iter()
+            .map(|(k, v)| k.as_ref().map_or(0, String::len) + v.len() + 32)
+            .sum();
+        files_bytes + self.header_raw.len() + diffs_bytes + 64
+    }
 }
 
 /// `commit_id` → [`CommitCache`] の LRU。`load`/`save` でディスクの
 /// 1 ファイルと同期する (repo ごとに 1 ファイル、詳細は [`cache_path`])。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DiffStore {
     /// 使った順 (先頭が最も古い)。
     order: VecDeque<String>,
     map: HashMap<String, CommitCache>,
+    total_bytes: usize,
+    max_bytes: usize,
+}
+
+impl Default for DiffStore {
+    fn default() -> Self {
+        Self::with_max_bytes(MAX_DIFF_STORE_BYTES)
+    }
 }
 
 impl DiffStore {
+    pub fn with_max_bytes(max_bytes: usize) -> Self {
+        Self {
+            order: VecDeque::new(),
+            map: HashMap::new(),
+            total_bytes: 0,
+            max_bytes,
+        }
+    }
+
     pub fn contains(&self, commit_id: &str) -> bool {
         self.map.contains_key(commit_id)
     }
@@ -98,20 +185,41 @@ impl DiffStore {
         self.map.get(commit_id)
     }
 
-    pub fn get_mut(&mut self, commit_id: &str) -> Option<&mut CommitCache> {
-        self.map.get_mut(commit_id)
+    /// 新しい commit を入れる。件数またはバイト上限を超えたら最も古いものを消す。
+    pub fn insert(&mut self, commit_id: String, entry: CommitCache) {
+        let new_bytes = entry.approx_bytes();
+        if new_bytes > self.max_bytes {
+            return;
+        }
+        if let Some(prev) = self.map.remove(&commit_id) {
+            self.total_bytes = self.total_bytes.saturating_sub(prev.approx_bytes());
+            self.forget_order(&commit_id);
+        }
+        self.order.push_back(commit_id.clone());
+        self.total_bytes = self.total_bytes.saturating_add(new_bytes);
+        self.map.insert(commit_id, entry);
+        self.evict_excess();
     }
 
-    /// 新しい commit を入れる。上限を超えたら最も昔に使ったものを消す。
-    pub fn insert(&mut self, commit_id: String, entry: CommitCache) {
-        self.forget_order(&commit_id);
-        self.order.push_back(commit_id.clone());
-        self.map.insert(commit_id, entry);
-        while self.order.len() > CAP {
-            if let Some(oldest) = self.order.pop_front() {
-                self.map.remove(&oldest);
-            }
+    /// 既存 commit にファイル別生 diff を 1 件追加する (バイト上限を維持)。
+    pub fn insert_file_diff(&mut self, commit_id: &str, path: Option<String>, raw: String) {
+        let Some(entry) = self.map.get_mut(commit_id) else {
+            return;
+        };
+        let added_bytes = path.as_ref().map_or(0, String::len) + raw.len() + 32;
+        if added_bytes > self.max_bytes {
+            return;
         }
+        let before = entry.approx_bytes();
+        entry.diffs_raw.insert(path, raw);
+        let after = entry.approx_bytes();
+        if after >= before {
+            self.total_bytes = self.total_bytes.saturating_add(after - before);
+        } else {
+            self.total_bytes = self.total_bytes.saturating_sub(before - after);
+        }
+        self.touch(commit_id);
+        self.evict_excess();
     }
 
     /// 既存 commit を再訪した扱いにする (LRU の末尾へ移す)。
@@ -122,13 +230,29 @@ impl DiffStore {
         }
     }
 
-    /// テスト用: 1 commit ぶんのエントリを消す。起動直後の diff 先読み
-    /// (`App::begin_diff_prefetch`) が対象を既に埋めてしまっているケースを
-    /// 「まだキャッシュされていない」状態へ戻すのに使う。
     #[cfg(test)]
     pub fn forget(&mut self, commit_id: &str) {
         self.forget_order(commit_id);
-        self.map.remove(commit_id);
+        if let Some(prev) = self.map.remove(commit_id) {
+            self.total_bytes = self.total_bytes.saturating_sub(prev.approx_bytes());
+        }
+    }
+
+    fn evict_excess(&mut self) {
+        while (self.order.len() > CAP || self.total_bytes > self.max_bytes) && self.order.len() > 1
+        {
+            if let Some(oldest) = self.order.pop_front()
+                && let Some(removed) = self.map.remove(&oldest)
+            {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.approx_bytes());
+            }
+        }
+        if self.total_bytes > self.max_bytes
+            && let Some(oldest) = self.order.pop_front()
+            && let Some(removed) = self.map.remove(&oldest)
+        {
+            self.total_bytes = self.total_bytes.saturating_sub(removed.approx_bytes());
+        }
     }
 
     fn forget_order(&mut self, commit_id: &str) {
@@ -146,22 +270,16 @@ impl DiffStore {
         let Ok(bytes) = std::fs::read(&path) else {
             return store;
         };
-        // 実パスを持たない旧形式も拒否する。表示から推測した差分の
-        // キャッシュを使うと、曖昧なリネームの誤表示が残ってしまう。
         let Ok(entries) = serde_json::from_slice::<Vec<(String, CommitCache)>>(&bytes) else {
             return store;
         };
-        // 保存時は古い順 (`order` の並びどおり) に書き出しているので、
-        // そのまま insert すれば LRU の並びも復元される。
         for (commit_id, entry) in entries {
             store.insert(commit_id, entry);
         }
         store
     }
 
-    /// repo ごとのキャッシュファイルへ書き出す。ベストエフォート:
-    /// 書けなくても (権限・ディスク満杯・キャッシュ dir 不明など)
-    /// 終了処理自体は失敗させない。
+    /// repo ごとのキャッシュファイルへ書き出す。ベストエフォート。
     pub fn save(&self, jj: &Jj) {
         let Some(path) = cache_path(jj) else {
             return;
@@ -181,6 +299,241 @@ impl DiffStore {
     }
 }
 
+/// Tier 1: 不変コミット全体の生 Git パッチ (`jj diff --color never --git`) を
+/// バイト上限付き LRU で保持する。リサイズ時はこれを再利用する。
+#[derive(Debug)]
+pub struct RawPatchCache {
+    order: VecDeque<String>,
+    map: HashMap<String, Arc<String>>,
+    total_bytes: usize,
+    max_bytes: usize,
+}
+
+impl Default for RawPatchCache {
+    fn default() -> Self {
+        Self::with_max_bytes(MAX_RAW_PATCH_BYTES)
+    }
+}
+
+impl RawPatchCache {
+    pub fn with_max_bytes(max_bytes: usize) -> Self {
+        Self {
+            order: VecDeque::new(),
+            map: HashMap::new(),
+            total_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    pub fn get(&mut self, commit_id: &str) -> Option<Arc<String>> {
+        let val = self.map.get(commit_id).cloned()?;
+        self.touch(commit_id);
+        Some(val)
+    }
+
+    pub fn insert(&mut self, commit_id: String, patch: Arc<String>) {
+        let bytes = patch.len() + commit_id.len();
+        if bytes > self.max_bytes {
+            return;
+        }
+        if let Some(prev) = self.map.remove(&commit_id) {
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(prev.len() + commit_id.len());
+            self.forget_order(&commit_id);
+        }
+        self.order.push_back(commit_id.clone());
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.map.insert(commit_id, patch);
+        while self.total_bytes > self.max_bytes {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.map.remove(&oldest) {
+                self.total_bytes = self
+                    .total_bytes
+                    .saturating_sub(removed.len() + oldest.len());
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.order.clear();
+        self.map.clear();
+        self.total_bytes = 0;
+    }
+
+    fn touch(&mut self, commit_id: &str) {
+        self.forget_order(commit_id);
+        self.order.push_back(commit_id.to_string());
+    }
+
+    fn forget_order(&mut self, commit_id: &str) {
+        if let Some(pos) = self.order.iter().position(|id| id == commit_id) {
+            self.order.remove(pos);
+        }
+    }
+}
+
+/// Tier 2: ANSI 変換済みの共有 `Text` をバイト上限・件数上限付き LRU で管理する。
+#[derive(Debug)]
+pub struct RenderedDiffCache {
+    order: VecDeque<RenderedKey>,
+    map: HashMap<RenderedKey, (Arc<Text<'static>>, usize)>,
+    total_bytes: usize,
+    max_bytes: usize,
+    max_entries: usize,
+}
+
+impl Default for RenderedDiffCache {
+    fn default() -> Self {
+        Self::with_limits(MAX_RENDERED_BYTES, MAX_RENDERED_ENTRIES)
+    }
+}
+
+impl RenderedDiffCache {
+    pub fn with_limits(max_bytes: usize, max_entries: usize) -> Self {
+        Self {
+            order: VecDeque::new(),
+            map: HashMap::new(),
+            total_bytes: 0,
+            max_bytes,
+            max_entries,
+        }
+    }
+
+    pub fn get(&mut self, key: &RenderedKey) -> Option<Arc<Text<'static>>> {
+        let val = self.map.get(key).map(|(text, _)| Arc::clone(text))?;
+        self.forget_order(key);
+        self.order.push_back(key.clone());
+        Some(val)
+    }
+
+    pub fn insert(&mut self, key: RenderedKey, text: Arc<Text<'static>>) {
+        let bytes = estimate_text_bytes(&text);
+        if bytes > self.max_bytes || self.max_entries == 0 {
+            return;
+        }
+        if let Some((_, prev_bytes)) = self.map.remove(&key) {
+            self.total_bytes = self.total_bytes.saturating_sub(prev_bytes);
+            self.forget_order(&key);
+        }
+        self.order.push_back(key.clone());
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.map.insert(key, (text, bytes));
+        self.evict_excess();
+    }
+
+    /// バッチ全件をまとめて公開する。バッチ全体が上限を超える場合はキャッシュを
+    /// 全消去しないよう、上限に収まる場合のみ登録する。
+    pub fn insert_batch(&mut self, entries: Vec<(RenderedKey, Arc<Text<'static>>)>) {
+        if entries.is_empty() || entries.len() > self.max_entries {
+            return;
+        }
+        let sized: Vec<(RenderedKey, Arc<Text<'static>>, usize)> = entries
+            .into_iter()
+            .map(|(k, v)| {
+                let bytes = estimate_text_bytes(&v);
+                (k, v, bytes)
+            })
+            .collect();
+        let batch_bytes: usize = sized.iter().map(|(_, _, b)| *b).sum();
+        if batch_bytes > self.max_bytes {
+            return;
+        }
+        for (key, text, bytes) in sized {
+            if let Some((_, prev_bytes)) = self.map.remove(&key) {
+                self.total_bytes = self.total_bytes.saturating_sub(prev_bytes);
+                self.forget_order(&key);
+            }
+            self.order.push_back(key.clone());
+            self.total_bytes = self.total_bytes.saturating_add(bytes);
+            self.map.insert(key, (text, bytes));
+        }
+        self.evict_excess();
+    }
+
+    pub fn clear(&mut self) {
+        self.order.clear();
+        self.map.clear();
+        self.total_bytes = 0;
+    }
+
+    #[cfg(test)]
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn evict_excess(&mut self) {
+        while self.total_bytes > self.max_bytes || self.map.len() > self.max_entries {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((_, bytes)) = self.map.remove(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(bytes);
+            }
+        }
+    }
+
+    fn forget_order(&mut self, key: &RenderedKey) {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+    }
+}
+
+/// ANSI パース済みの change ヘッダを保持する小型 LRU。
+#[derive(Debug, Default)]
+pub struct HeaderCache {
+    order: VecDeque<String>,
+    map: HashMap<String, Arc<Text<'static>>>,
+}
+
+impl HeaderCache {
+    pub fn get(&mut self, commit_id: &str) -> Option<Arc<Text<'static>>> {
+        let val = self.map.get(commit_id).cloned()?;
+        if let Some(pos) = self.order.iter().position(|id| id == commit_id) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(commit_id.to_string());
+        Some(val)
+    }
+
+    pub fn insert(&mut self, commit_id: String, header: Arc<Text<'static>>) {
+        if let Some(pos) = self.order.iter().position(|id| id == &commit_id) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(commit_id.clone());
+        self.map.insert(commit_id, header);
+        while self.order.len() > HEADER_CACHE_CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+    }
+}
+
+pub fn estimate_text_bytes(text: &Text<'static>) -> usize {
+    let lines_bytes: usize = text
+        .lines
+        .iter()
+        .map(|line| {
+            let spans_bytes: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.len() + std::mem::size_of::<Span<'static>>())
+                .sum();
+            spans_bytes + std::mem::size_of::<Line<'static>>()
+        })
+        .sum();
+    lines_bytes.max(64)
+}
+
 /// OS ごとのキャッシュディレクトリ配下、repo root ごとに 1 ファイル。
 /// `SHIKIGAMI_CACHE_DIR` があればそちらを優先する (テスト/カスタム用途)。
 fn cache_path(jj: &Jj) -> Option<PathBuf> {
@@ -188,9 +541,6 @@ fn cache_path(jj: &Jj) -> Option<PathBuf> {
         Some(dir) => PathBuf::from(dir),
         None => dirs::cache_dir()?.join("shikigami"),
     };
-    // repo root ごとに別ファイルにする (commit_id は repo 内でしか一意性
-    // を保証されない)。symlink 越し等で表記揺れしても同じキャッシュに
-    // 当たるよう canonicalize してからハッシュ化する。
     let root = jj
         .root()
         .canonicalize()
@@ -212,8 +562,6 @@ mod tests {
         for i in 0..CAP {
             store.insert(format!("c{i}"), CommitCache::new(Vec::new(), String::new()));
         }
-        // c0 を touch して最近使った扱いにしてから、新しい commit を
-        // 1 件足すと、touch していない次点の c1 が捨てられるはず。
         store.touch("c0");
         store.insert(
             "overflow".to_string(),
@@ -222,6 +570,48 @@ mod tests {
         assert!(store.contains("c0"));
         assert!(!store.contains("c1"));
         assert!(store.contains("overflow"));
+    }
+
+    #[test]
+    fn raw_patch_and_rendered_caches_enforce_byte_budgets() {
+        let mut raw_cache = RawPatchCache::with_max_bytes(200);
+        raw_cache.insert("c1".into(), Arc::new("a".repeat(90)));
+        raw_cache.insert("c2".into(), Arc::new("b".repeat(90)));
+        assert!(raw_cache.get("c1").is_some());
+        // c1 was touched, so inserting c3 evicts c2.
+        raw_cache.insert("c3".into(), Arc::new("c".repeat(90)));
+        assert!(raw_cache.get("c1").is_some());
+        assert!(raw_cache.get("c2").is_none());
+        assert!(raw_cache.get("c3").is_some());
+
+        // Oversized single entry is ignored without wiping existing cache.
+        raw_cache.insert("huge".into(), Arc::new("x".repeat(500)));
+        assert!(raw_cache.get("huge").is_none());
+        assert!(raw_cache.get("c1").is_some());
+
+        let key = |name: &str| RenderedKey {
+            commit_id: "c1".into(),
+            file_key: DiffFileKey::File {
+                status: 'M',
+                source_path: name.into(),
+                destination_path: name.into(),
+            },
+            width: 80,
+            mode: RenderModeKey::BatchDelta,
+        };
+        let one_line = Arc::new(Text::from("x".repeat(120)));
+        let one_bytes = estimate_text_bytes(&one_line);
+        let mut rendered = RenderedDiffCache::with_limits(one_bytes * 2 + 10, 10);
+        rendered.insert(key("a"), Arc::clone(&one_line));
+        rendered.insert(key("b"), Arc::clone(&one_line));
+        assert_eq!(rendered.len(), 2);
+        // Touching "a" makes "b" oldest; inserting "c" evicts "b".
+        assert!(rendered.get(&key("a")).is_some());
+        rendered.insert(key("c"), Arc::clone(&one_line));
+        assert!(rendered.get(&key("a")).is_some());
+        assert!(rendered.get(&key("b")).is_none());
+        assert!(rendered.get(&key("c")).is_some());
+        assert!(rendered.total_bytes() <= one_bytes * 2 + 10);
     }
 
     #[test]
@@ -250,9 +640,6 @@ mod tests {
     #[test]
     fn save_then_load_round_trips_entries_and_lru_order() {
         let tmp = tempfile::tempdir().unwrap();
-        // SHIKIGAMI_CACHE_DIR で dirs::cache_dir() を経由せず temp dir を
-        // 直接使わせ、テストが実行環境のホームディレクトリに書かないよう
-        // にする。
         // SAFETY: テストは単一スレッドの `cargo test` ワーカー内で直列に
         // 環境変数を触っており、他のテストは `SHIKIGAMI_CACHE_DIR` を
         // 読まない。
@@ -276,16 +663,11 @@ mod tests {
         entry
             .diffs_raw
             .insert(Some("a.txt".to_string()), "diff\n".to_string());
-        // change 全体の diff (`None` キー) も一緒に持たせる: これは
-        // JSON のオブジェクトキーとして素の `Option<String>` を渡すと
-        // serde_json が拒否する組み合わせで、それを潰さず気付けるように
-        // 混ぜておく。
         entry
             .diffs_raw
             .insert(None, "whole change diff\n".to_string());
         store.insert("abc123".to_string(), entry);
-        // 以前の名前に有効な構造化キャッシュがあっても、root: で取得した
-        // 差分なので読み込まない。新しい完全一致の差分を再取得させる。
+
         let mut legacy_hasher = std::collections::hash_map::DefaultHasher::new();
         jj.root().canonicalize().unwrap().hash(&mut legacy_hasher);
         let legacy_path = tmp
