@@ -54,7 +54,7 @@ tokio = { version = "1.54.1", features = ["rt"] }
 # commit がキャッシュに載っていれば `jj diff`/`jj show` を叩かずに初回描画
 # できる。serde/serde_json は保存形式、dirs は OS ごとのキャッシュ
 # ディレクトリ解決に使う。
-serde = { version = "1.0.229", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.154"
 dirs = "7.0.0"
 

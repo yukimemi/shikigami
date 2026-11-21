@@ -32,6 +32,7 @@ const LOG_TEMPLATE: &str = concat!(
     r#" ++ change_id ++ "\x1f""#,
     r#" ++ change_id.shortest(8) ++ "\x1f""#,
     r#" ++ commit_id.shortest(8) ++ "\x1f""#,
+    r#" ++ commit_id ++ "\x1f""#,
     r#" ++ if(current_working_copy, "1", "0") ++ "\x1f""#,
     r#" ++ if(empty, "1", "0") ++ "\x1f""#,
     r#" ++ if(conflict, "1", "0") ++ "\x1f""#,
@@ -116,6 +117,8 @@ pub struct Change {
     pub short_id: String,
     /// 表示用の短縮 commit id。
     pub commit_id: String,
+    /// 完全な不変 commit id。バックグラウンド diff 取得やキャッシュキーに使う。
+    pub full_commit_id: String,
     pub is_working_copy: bool,
     pub is_empty: bool,
     pub has_conflict: bool,
@@ -241,10 +244,16 @@ impl Jj {
         cmd.args(globals);
         cmd.args(args);
         // 認証プロンプトが TUI の入力を奪わないよう、標準入力を閉じる。
-        cmd.stdin(std::process::Stdio::null());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to run `jj {}`", args.join(" ")))?;
+        let out = if matches!(args.first(), Some(&"diff" | &"show"))
+            || args == ["config", "get", "ui.diff-formatter"]
+        {
+            crate::diff_filter::capture(&mut cmd, None)
+        } else {
+            cmd.stdin(std::process::Stdio::null())
+                .output()
+                .map_err(Into::into)
+        }
+        .with_context(|| format!("failed to run `jj {}`", args.join(" ")))?;
         if !out.status.success() {
             // jj のエラーは stderr に人間向けの Error/Hint で出る。
             // それをそのまま status bar に載せたいので、整形せず返す。
@@ -367,6 +376,17 @@ impl Jj {
     /// 消費者へ渡す用途に使う。常に change 全体 (path 絞り込みなし)。
     pub fn diff_plain(&self, rev: &str) -> Result<String> {
         self.read(&["diff", "-r", rev, "--git"])
+    }
+
+    /// バッチ整形用の不変コミット全体 Git パッチ (`--color never --git`)。
+    pub fn diff_git_full(&self, full_commit_id: &str) -> Result<String> {
+        self.read(&["diff", "-r", full_commit_id, "--git"])
+    }
+
+    /// 現在のリポジトリで有効な `ui.diff-formatter` 設定値を取得する。
+    pub fn diff_formatter(&self) -> Result<String> {
+        let out = self.read(&["config", "get", "ui.diff-formatter"])?;
+        Ok(out.trim().to_string())
     }
 
     /// 選択中 change で変更されたファイルの表示名と実パスの一覧。
@@ -572,6 +592,7 @@ fn parse_change(data: &str) -> Option<Change> {
     let id = f.next()?.to_string();
     let short_id = f.next()?.to_string();
     let commit_id = f.next()?.to_string();
+    let full_commit_id = f.next()?.to_string();
     let is_working_copy = f.next()? == "1";
     let is_empty = f.next()? == "1";
     let has_conflict = f.next()? == "1";
@@ -587,6 +608,7 @@ fn parse_change(data: &str) -> Option<Change> {
         id,
         short_id,
         commit_id,
+        full_commit_id,
         is_working_copy,
         is_empty,
         has_conflict,
@@ -629,6 +651,7 @@ mod tests {
                 "qxymuzsqabc",
                 "qxymuzsq",
                 "5e3b8962",
+                "5e3b896200000000000000000000000000000000",
                 "1",
                 "0",
                 "0",
@@ -647,6 +670,10 @@ mod tests {
         // (`│ ○  ` のインデントが崩れると枝が繋がらなく見える)。
         assert_eq!(graph, "@  ");
         assert_eq!(change.id, "qxymuzsqabc");
+        assert_eq!(
+            change.full_commit_id,
+            "5e3b896200000000000000000000000000000000"
+        );
         assert!(change.is_working_copy);
         assert!(!change.is_empty);
         assert_eq!(change.bookmarks, vec!["main", "push-abc"]);
@@ -669,6 +696,7 @@ mod tests {
                 "zzz",
                 "zzz",
                 "0000",
+                "0000000000000000000000000000000000000000",
                 "0",
                 "1",
                 "0",
