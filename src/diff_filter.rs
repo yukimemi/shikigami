@@ -11,8 +11,8 @@
 //! 外 — そちらは `ui.diff-formatter` (`Jj::diff` が `--git` を強制しない
 //! ことで既に従える) 側の役割。
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io::{self, Read, Write};
+use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, bail};
 
@@ -32,28 +32,10 @@ pub fn apply(cmd: &str, diff: &str, width: u16) -> Result<String> {
         bail!("{DIFF_FILTER_ENV} is empty");
     }
 
-    let mut child = shell_command(cmd)
-        .env("COLUMNS", width.to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let mut command = shell_command(cmd);
+    command.env("COLUMNS", width.to_string());
+    let out = capture(&mut command, Some(diff))
         .with_context(|| format!("failed to run {DIFF_FILTER_ENV}"))?;
-
-    let mut stdin = child.stdin.take().expect("stdin was piped");
-    let payload = diff.to_string();
-    // 書き込みは別スレッドに逃がす: diff が大きいとき、子プロセスが
-    // stdout をあまり出さないまま stdin を読み切る前に親が書き込みで
-    // ブロックし、同時に子の stdout パイプも埋まって双方待ちになりうる
-    // (`ai.rs::generate_message` と同じ理由)。
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(payload.as_bytes());
-    });
-
-    let out = child
-        .wait_with_output()
-        .with_context(|| format!("failed to read output of {DIFF_FILTER_ENV}"))?;
-    let _ = writer.join();
 
     if !out.status.success() {
         let stderr = crate::decode::decode(&out.stderr);
@@ -65,6 +47,51 @@ pub fn apply(cmd: &str, diff: &str, width: u16) -> Result<String> {
     }
 
     Ok(crate::decode::decode(&out.stdout))
+}
+
+const MAX_STDOUT: u64 = 32 * 1024 * 1024;
+const MAX_STDERR: u64 = 256 * 1024;
+
+pub(crate) fn capture(command: &mut Command, input: Option<&str>) -> Result<Output> {
+    let mut child = command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (stdout, stderr, status) = std::thread::scope(|scope| {
+        if let Some(input) = input {
+            let mut stdin = child.stdin.take().expect("stdin was piped");
+            scope.spawn(move || {
+                let _ = stdin.write_all(input.as_bytes());
+            });
+        }
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let errors = scope.spawn(move || drain(stderr, MAX_STDERR));
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let output = drain(stdout, MAX_STDOUT);
+        (output, errors.join().unwrap(), child.wait())
+    });
+    let (stdout, overflow) = stdout?;
+    if overflow {
+        bail!("diff output exceeds {} MiB", MAX_STDOUT / (1024 * 1024));
+    }
+    Ok(Output {
+        status: status?,
+        stdout,
+        stderr: stderr?.0,
+    })
+}
+
+fn drain(mut pipe: impl Read, limit: u64) -> io::Result<(Vec<u8>, bool)> {
+    let mut bytes = Vec::new();
+    pipe.by_ref().take(limit).read_to_end(&mut bytes)?;
+    // 上限超過を検出しつつ、子が出力パイプに詰まらないよう EOF まで捨てる。
+    let overflow = io::copy(&mut pipe, &mut io::sink())? != 0;
+    Ok((bytes, overflow))
 }
 
 #[cfg(unix)]
@@ -90,6 +117,35 @@ fn shell_command(cmd: &str) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_drains_oversized_pipes_without_returning_truncated_stdout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("oversized");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_STDOUT + 1).unwrap();
+        drop(file);
+
+        #[cfg(unix)]
+        let (emit, emit_stderr) = (r#"cat "$PAYLOAD""#, r#"cat "$PAYLOAD" >&2; echo done"#);
+        #[cfg(windows)]
+        let (emit, emit_stderr) = (
+            r#"type "%PAYLOAD%""#,
+            r#"type "%PAYLOAD%" 1>&2 && echo done"#,
+        );
+
+        let mut command = shell_command(emit_stderr);
+        command.env("PAYLOAD", &path);
+        let out = capture(&mut command, None).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stderr.len(), MAX_STDERR as usize);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+
+        let mut command = shell_command(emit);
+        command.env("PAYLOAD", &path);
+        let err = capture(&mut command, None).unwrap_err();
+        assert!(err.to_string().contains("exceeds 32 MiB"), "{err}");
+    }
 
     #[cfg(unix)]
     fn cat_cmd() -> &'static str {

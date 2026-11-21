@@ -18,7 +18,10 @@ use std::thread;
 use anyhow::Result;
 use ratatui::text::Text;
 
-use crate::cache::{DiffFileKey, RenderModeKey};
+use crate::cache::{
+    DiffFileKey, MAX_RENDERED_BYTES, MAX_RENDERED_ENTRIES, RawPatchCache, RenderModeKey,
+    estimate_text_bytes,
+};
 use crate::diff_batch::{
     DeltaBatchConfig, FramedBatch, build_framed_batch, extract_and_validate_delta_output,
     parse_and_match_git_patch, run_delta_batch,
@@ -80,7 +83,7 @@ impl DiffBackend for RealDiffBackend {
         framed: &FramedBatch,
         width: u16,
     ) -> Result<String> {
-        run_delta_batch(config, framed, width)
+        run_delta_batch(config, self.jj.root(), framed, width)
     }
 
     fn run_diff_filter(&self, cmd: &str, raw: &str, width: u16) -> Result<String> {
@@ -131,7 +134,6 @@ pub enum BodyStrategy {
         config: DeltaBatchConfig,
         files: Vec<DiffFile>,
         selected_file: Option<DiffFile>,
-        cached_raw_patch: Option<Arc<String>>,
         cached_selected_raw_diff: Option<String>,
     },
     PerFile {
@@ -205,19 +207,21 @@ pub struct SingleBodyPayload {
 }
 
 #[derive(Debug)]
+pub struct BatchEntry {
+    pub file_key: DiffFileKey,
+    pub text: Arc<Text<'static>>,
+    pub bytes: usize,
+}
+
+#[derive(Debug)]
 pub enum BodyOutcome {
-    BatchReady {
-        raw_patch: Arc<String>,
-        entries: Vec<(DiffFileKey, Arc<Text<'static>>)>,
-    },
+    BatchReady(Arc<[BatchEntry]>),
     /// `ui.diff-formatter` が `:git` ではないため、この世代全体でバッチを無効化し、
     /// 併せて現選択ファイルの従来経路結果を返す。
     BatchDisabledForGeneration(SingleBodyPayload),
     /// このコミットのバッチ分割・整形・検証が失敗/曖昧だったためキャッシュを汚染せず、
     /// 現選択ファイルの従来経路結果を返す。
     BatchFallback {
-        /// パッチ取得・照合まで成功して `delta` 側だけ失敗した場合は `None` にして
-        /// 壊れたバッチ結果を再利用しない。
         fallback: SingleBodyPayload,
     },
     SingleReady(SingleBodyPayload),
@@ -410,7 +414,7 @@ fn meta_worker_loop(
             }
             (files_res, header_res) => {
                 let files = files_res.unwrap_or_default();
-                let header_raw = header_res.unwrap_or_else(|err| err.to_string());
+                let header_raw = header_res.unwrap_or_else(|err| format!("{err:#}"));
                 let header_text = parse_ansi(&header_raw);
                 MetaOutcome::Error { files, header_text }
             }
@@ -439,6 +443,9 @@ fn body_worker_loop(
 ) {
     // 世代ごとの `ui.diff-formatter == ":git"` 判定キャッシュ。
     let mut formatter_check: Option<(u64, bool)> = None;
+    let mut raw_patches = RawPatchCache::default();
+    // UI に未配信の同一バッチも再整形しない。本文はレスポンスと共有する。
+    let mut latest_batch: Option<(InFlightBody, Arc<[BatchEntry]>)> = None;
 
     loop {
         let req = {
@@ -460,7 +467,6 @@ fn body_worker_loop(
                 config,
                 files,
                 selected_file,
-                cached_raw_patch,
                 cached_selected_raw_diff,
             } => {
                 let is_git = match formatter_check {
@@ -485,15 +491,28 @@ fn body_worker_loop(
                     );
                     BodyOutcome::BatchDisabledForGeneration(payload)
                 } else {
-                    match execute_batch_delta(
-                        &*backend,
-                        config,
-                        &req.commit_id,
-                        files,
-                        req.width,
-                        cached_raw_patch.as_ref(),
-                    ) {
-                        Ok((raw_patch, entries)) => BodyOutcome::BatchReady { raw_patch, entries },
+                    let key = req.in_flight_key();
+                    let result = match &latest_batch {
+                        Some((previous, entries)) if previous == &key => Ok(Arc::clone(entries)),
+                        _ => prepare_batch(
+                            &*backend,
+                            config,
+                            &req.commit_id,
+                            files,
+                            req.width,
+                            &mut raw_patches,
+                        )
+                        .inspect(|entries| {
+                            if entries.len() <= MAX_RENDERED_ENTRIES
+                                && entries.iter().map(|entry| entry.bytes).sum::<usize>()
+                                    <= MAX_RENDERED_BYTES
+                            {
+                                latest_batch = Some((key, Arc::clone(entries)));
+                            }
+                        }),
+                    };
+                    match result {
+                        Ok(entries) => BodyOutcome::BatchReady(entries),
                         Err(_) => {
                             let fallback = execute_per_file(
                                 &*backend,
@@ -542,17 +561,17 @@ fn body_worker_loop(
     }
 }
 
-type BatchDeltaOutput = (Arc<String>, Vec<(DiffFileKey, Arc<Text<'static>>)>);
-fn execute_batch_delta(
+fn prepare_batch(
     backend: &dyn DiffBackend,
     config: &DeltaBatchConfig,
     commit_id: &str,
     files: &[DiffFile],
     width: u16,
-    cached_raw_patch: Option<&Arc<String>>,
-) -> Result<BatchDeltaOutput> {
-    let raw_patch = match cached_raw_patch {
-        Some(cached) => Arc::clone(cached),
+    raw_patches: &mut RawPatchCache,
+) -> Result<Arc<[BatchEntry]>> {
+    let cached = raw_patches.get(commit_id);
+    let raw_patch = match &cached {
+        Some(patch) => Arc::clone(patch),
         None => Arc::new(backend.diff_git_full(commit_id)?),
     };
 
@@ -570,10 +589,17 @@ fn execute_batch_delta(
         } else {
             parse_ansi(rendered)
         };
-        entries.push((key, text));
+        entries.push(BatchEntry {
+            file_key: key,
+            bytes: estimate_text_bytes(&text),
+            text,
+        });
     }
 
-    Ok((raw_patch, entries))
+    if cached.is_none() {
+        raw_patches.insert(commit_id.to_owned(), raw_patch);
+    }
+    Ok(entries.into())
 }
 
 fn execute_per_file(
@@ -597,7 +623,7 @@ fn execute_per_file(
             let paths = selected_file.map(DiffFile::diff_paths).unwrap_or_default();
             match backend.diff_file(commit_id, &paths) {
                 Ok(raw) => (raw.clone(), Some(raw), false),
-                Err(err) => (err.to_string(), None, true),
+                Err(err) => (format!("{err:#}"), None, true),
             }
         }
     };
@@ -644,7 +670,7 @@ fn execute_per_file(
                 fetched_raw,
                 text: parse_ansi(&diff_raw),
                 cacheable: false,
-                filter_error: Some(format!("{}: {err}", crate::diff_filter::DIFF_FILTER_ENV)),
+                filter_error: Some(format!("{}: {err:#}", crate::diff_filter::DIFF_FILTER_ENV)),
             },
         },
         None => SingleBodyPayload {

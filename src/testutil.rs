@@ -104,6 +104,8 @@ pub fn repo() -> (tempfile::TempDir, App) {
 
     let jj = Jj::discover(dir).unwrap();
     let mut app = App::new(jj, Some("all()".to_string())).unwrap();
+    app.diff_filter_cmd = None;
+    app.diff_batch_config = None;
     // App::new はもう `jj log` をブロッキングで待たない (起動時の
     // jj 呼び出しはバックグラウンドスレッドに逃がしている)。テストは
     // rows が同期的に揃っている前提で書かれているので、ここで待つ。

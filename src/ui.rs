@@ -337,13 +337,13 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App) {
         (Some(change), None) => format!(" {} {} ", change.short_id, change.commit_id),
         (None, _) => " diff ".to_string(),
     };
-    // wrap しない: diff は桁が意味を持つ (`+`/`-` の列、インデント)。
-    // 折り返し無しなので可視範囲の行だけを共有 `Text` から切り出して渡し、
-    // 毎フレーム巨大な diff 全文を複製しない。
-    let inner_height = area.height.saturating_sub(2) as usize;
-    let visible = app.visible_diff_lines(app.diff_scroll as usize, inner_height);
-    let paragraph = Paragraph::new(visible).block(pane_block(title, app.focus == Focus::Diff));
-    frame.render_widget(paragraph, area);
+    let block = pane_block(title, app.focus == Focus::Diff);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines = app.diff_lines().skip(app.diff_draw_offset());
+    for (y, line) in (inner.top()..inner.bottom()).zip(lines) {
+        frame.render_widget(line, Rect::new(inner.x, y, inner.width, 1));
+    }
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {

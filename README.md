@@ -218,19 +218,20 @@ setup carry straight through:
 
   ```sh
   export SHIKIGAMI_DIFF_BATCH=delta-v1
-  # Optional: enable side-by-side via ~/.gitconfig [delta] or DELTA_FEATURES:
-  export DELTA_FEATURES=+side-by-side
   ```
 
-  shikigami invokes `delta` with `--paging=never`, `--width <pane-width>` (plus `COLUMNS`), and
-  internal `--commit-regex` / `--commit-style=raw` / `--commit-decoration-style=none` flags to
-  preserve file boundaries while leaving all other delta display settings (`side-by-side`, themes,
-  `line-numbers`, etc.) untouched. Once the batch completes, every file in that commit is served
-  from the rendered cache on both first and repeat visits, and terminal resizes reuse the cached
-  raw Git patch without re-running `jj diff`. If `ui.diff-formatter` is not `:git`,
+  shikigami runs `delta` from the repository root with `--paging=never`, `--side-by-side`,
+  `--width <pane-width>` (plus `COLUMNS`), and internal `--commit-regex` / `--commit-style=raw` /
+  `--commit-decoration-style=none` flags to preserve file boundaries. Other settings, such as
+  themes and line numbers, are untouched. A cached batch serves first and repeat file visits,
+  and terminal resizes reuse the cached raw Git patch even if the previous width's result has
+  not reached the UI. If `ui.diff-formatter` is not `:git`,
   `SHIKIGAMI_DIFF_FILTER` is set, or batch parsing/formatting fails or produces ambiguous
   boundaries, shikigami does not poison caches and falls back asynchronously to the existing
   per-file path.
+
+  Diff subprocesses reject stdout over 32 MiB and retain at most 256 KiB of stderr. The
+  on-disk diff cache ignores files over 64 MiB.
 
 ## Opening files in your editor
 

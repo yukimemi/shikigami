@@ -5,17 +5,15 @@
 //!    hunk 行数に従ってセクション分割し、C クォートを復号して `DiffFile` と
 //!    一対一に照合する (整形前に実パスと変更種別で確定させる)。
 //! 2. 入力本文と衝突しない合成 `commit` 境界行で各セクションを囲み、
-//!    `delta --paging=never --width <W> --commit-regex ... --commit-style=raw
-//!    --commit-decoration-style=none` を 1 回だけ起動する (ユーザの他の表示
-//!    設定 `side-by-side` / theme 等は変更しない)。
+//!    `delta --paging=never --side-by-side --width <W> --commit-regex ...
+//!    --commit-style=raw --commit-decoration-style=none` をリポジトリ直下で 1 回起動する。
 //! 3. 出力の全境界ペアの一意性・順序・区間外に非空白出力が無いことを検証し、
 //!    曖昧または失敗ならエラーを返して呼び出し元を非同期のファイル単位経路へ
 //!    フォールバックさせる。
 
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
@@ -227,13 +225,17 @@ pub fn build_framed_batch(
 /// `delta` を 1 回だけ起動し、バッチ入力全体を整形する。
 pub fn run_delta_batch(
     config: &DeltaBatchConfig,
+    root: &Path,
     framed: &FramedBatch,
     width: u16,
 ) -> Result<String> {
     let width_str = width.to_string();
-    let mut child = Command::new(&config.delta_bin)
+    let mut command = Command::new(&config.delta_bin);
+    command
+        .current_dir(root)
         .args([
             "--paging=never",
+            "--side-by-side",
             "--width",
             &width_str,
             "--commit-regex",
@@ -241,23 +243,9 @@ pub fn run_delta_batch(
             "--commit-style=raw",
             "--commit-decoration-style=none",
         ])
-        .env("COLUMNS", &width_str)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to spawn `{}`", config.delta_bin.display()))?;
-
-    let mut stdin = child.stdin.take().expect("stdin was piped");
-    let payload = framed.input.as_bytes().to_vec();
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&payload);
-    });
-
-    let out = child
-        .wait_with_output()
-        .with_context(|| format!("failed to read `{}` output", config.delta_bin.display()))?;
-    let _ = writer.join();
+        .env("COLUMNS", &width_str);
+    let out = crate::diff_filter::capture(&mut command, Some(&framed.input))
+        .with_context(|| format!("failed to run `{}`", config.delta_bin.display()))?;
 
     if !out.status.success() {
         let stderr = crate::decode::decode(&out.stderr);
@@ -1000,18 +988,27 @@ mod tests {
             "@@ -0,0 +1,2 @@\n",
             "+こんにちは\n",
             "+世界\n",
+            "diff --git a/split.txt b/split.txt\n",
+            "--- a/split.txt\n",
+            "+++ b/split.txt\n",
+            "@@ -1 +1 @@\n",
+            "-old_left\n",
+            "+new_right\n",
         );
         let files = vec![
             file('M', "mode_only.txt"),
             renamed('R', "old space.txt", "new space.txt"),
             file('A', "bin.dat"),
             file('A', "日本語.txt"),
+            file('M', "split.txt"),
         ];
         let matched = parse_and_match_git_patch(patch, &files).unwrap();
         let framed = build_framed_batch(&matched, patch, "12345678");
-        let raw_out = run_delta_batch(&DeltaBatchConfig::delta_v1(), &framed, 90).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let raw_out =
+            run_delta_batch(&DeltaBatchConfig::delta_v1(), root.path(), &framed, 90).unwrap();
         let sections = extract_and_validate_delta_output(&raw_out, &framed, files.len()).unwrap();
-        assert_eq!(sections.len(), 4);
+        assert_eq!(sections.len(), 5);
         assert!(sections[0].contains("mode_only.txt"), "{}", sections[0]);
         assert!(
             !sections[1].contains("mode_only.txt"),
@@ -1023,5 +1020,20 @@ mod tests {
         assert!(sections[2].contains("bin.dat"), "{}", sections[2]);
         assert!(sections[3].contains("日本語.txt"), "{}", sections[3]);
         assert!(sections[3].contains("こんにちは"), "{}", sections[3]);
+        use ansi_to_tui::IntoText;
+        let text = sections[4].as_str().into_text().unwrap();
+        let mut left = None;
+        let mut right = None;
+        for line in &text.lines {
+            let plain: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            left = left.or_else(|| plain.find("old_left"));
+            right = right.or_else(|| plain.find("new_right"));
+        }
+        assert!(left.is_some_and(|column| column < 45), "{text:?}");
+        assert!(right.is_some_and(|column| column >= 45), "{text:?}");
     }
 }

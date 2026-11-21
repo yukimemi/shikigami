@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,6 +25,7 @@ use crate::jj::{DiffFile, Jj};
 
 /// ディスクに残す commit の上限。
 const CAP: usize = 300;
+const MAX_DISK_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Tier 1 (`DiffStore`) のインメモリ生出力バイト上限 (32 MiB)。
 const MAX_DIFF_STORE_BYTES: usize = 32 * 1024 * 1024;
@@ -32,10 +34,10 @@ const MAX_DIFF_STORE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RAW_PATCH_BYTES: usize = 32 * 1024 * 1024;
 
 /// Tier 2 (`RenderedDiffCache`) の表示済み `Text` 合計バイト上限 (48 MiB)。
-const MAX_RENDERED_BYTES: usize = 48 * 1024 * 1024;
+pub(crate) const MAX_RENDERED_BYTES: usize = 48 * 1024 * 1024;
 
 /// Tier 2 (`RenderedDiffCache`) の最大エントリ数。
-const MAX_RENDERED_ENTRIES: usize = 4096;
+pub(crate) const MAX_RENDERED_ENTRIES: usize = 4096;
 
 /// ヘッダ (`jj show --no-patch`) パース済み `Text` のキャッシュ上限。
 const HEADER_CACHE_CAP: usize = 64;
@@ -263,13 +265,29 @@ impl DiffStore {
 
     /// repo ごとのキャッシュファイルから読み込む。無い/壊れていれば空。
     pub fn load(jj: &Jj) -> Self {
+        cache_path(jj).map_or_else(Self::default, Self::load_file)
+    }
+
+    fn load_file(path: PathBuf) -> Self {
         let mut store = Self::default();
-        let Some(path) = cache_path(jj) else {
+        let Ok(file) = std::fs::File::open(path) else {
             return store;
         };
-        let Ok(bytes) = std::fs::read(&path) else {
+        if file
+            .metadata()
+            .map_or(true, |meta| meta.len() > MAX_DISK_BYTES)
+        {
             return store;
-        };
+        }
+        let mut bytes = Vec::new();
+        if file
+            .take(MAX_DISK_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > MAX_DISK_BYTES
+        {
+            return store;
+        }
         let Ok(entries) = serde_json::from_slice::<Vec<(String, CommitCache)>>(&bytes) else {
             return store;
         };
@@ -292,6 +310,9 @@ impl DiffStore {
         let Ok(bytes) = serde_json::to_vec(&entries) else {
             return;
         };
+        if bytes.len() as u64 > MAX_DISK_BYTES {
+            return;
+        }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -426,22 +447,15 @@ impl RenderedDiffCache {
 
     /// バッチ全件をまとめて公開する。バッチ全体が上限を超える場合はキャッシュを
     /// 全消去しないよう、上限に収まる場合のみ登録する。
-    pub fn insert_batch(&mut self, entries: Vec<(RenderedKey, Arc<Text<'static>>)>) {
+    pub fn insert_batch(&mut self, entries: Vec<(RenderedKey, Arc<Text<'static>>, usize)>) {
         if entries.is_empty() || entries.len() > self.max_entries {
             return;
         }
-        let sized: Vec<(RenderedKey, Arc<Text<'static>>, usize)> = entries
-            .into_iter()
-            .map(|(k, v)| {
-                let bytes = estimate_text_bytes(&v);
-                (k, v, bytes)
-            })
-            .collect();
-        let batch_bytes: usize = sized.iter().map(|(_, _, b)| *b).sum();
+        let batch_bytes: usize = entries.iter().map(|(_, _, bytes)| *bytes).sum();
         if batch_bytes > self.max_bytes {
             return;
         }
-        for (key, text, bytes) in sized {
+        for (key, text, bytes) in entries {
             if let Some((_, prev_bytes)) = self.map.remove(&key) {
                 self.total_bytes = self.total_bytes.saturating_sub(prev_bytes);
                 self.forget_order(&key);
@@ -552,9 +566,8 @@ fn cache_path(jj: &Jj) -> Option<PathBuf> {
         .unwrap_or_else(|_| jj.root().to_path_buf());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     root.hash(&mut hasher);
-    // v2: 選択差分は完全一致。旧 root: の配下一致で取得した差分は
-    // 同じコミットでも無関係な内容を含み得るため再利用しない。
-    Some(dir.join(format!("{:016x}-v2.json", hasher.finish())))
+    // v3: diff 系コマンドの出力上限を適用したキャッシュだけを再利用する。
+    Some(dir.join(format!("{:016x}-v3.json", hasher.finish())))
 }
 
 #[cfg(test)]
@@ -640,6 +653,25 @@ mod tests {
             restored.files[0].diff_paths(),
             ["{literal => dir}/a", "{literal => dir}/b"]
         );
+    }
+
+    #[test]
+    fn oversized_disk_cache_is_ignored_even_when_json_is_valid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache.json");
+        let entries = [("commit", CommitCache::new(Vec::new(), String::new()))];
+        let json = serde_json::to_vec(&entries).unwrap();
+        std::fs::write(&path, &json).unwrap();
+        assert!(DiffStore::load_file(path.clone()).contains("commit"));
+
+        let padding = MAX_DISK_BYTES + 1 - json.len() as u64;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::copy(&mut std::io::repeat(b' ').take(padding), &mut file).unwrap();
+        drop(file);
+        assert!(!DiffStore::load_file(path).contains("commit"));
     }
 
     #[test]

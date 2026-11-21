@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, LazyLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,8 +16,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 
 use crate::cache::{
-    CommitCache, DiffFileKey, DiffStore, HeaderCache, RawPatchCache, RenderModeKey,
-    RenderedDiffCache, RenderedKey,
+    CommitCache, DiffFileKey, DiffStore, HeaderCache, RenderModeKey, RenderedDiffCache, RenderedKey,
 };
 use crate::diff_batch::DeltaBatchConfig;
 use crate::diff_worker::{
@@ -85,6 +84,19 @@ pub enum DiffBody {
     LoadingDiff,
     Ready(Arc<Text<'static>>),
 }
+
+static LOADING_META_LINE: LazyLock<Line<'static>> = LazyLock::new(|| {
+    Line::from(Span::styled(
+        "loading…",
+        Style::default().fg(Color::DarkGray),
+    ))
+});
+static LOADING_DIFF_LINE: LazyLock<Line<'static>> = LazyLock::new(|| {
+    Line::from(Span::styled(
+        "loading diff…",
+        Style::default().fg(Color::DarkGray),
+    ))
+});
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ShownDiffKey {
@@ -298,8 +310,6 @@ pub struct App {
     /// Tier 1: commit ごとの `jj diff --summary` / `jj show` / ファイル別生 diff
     /// のディスク永続 + バイト上限付きキャッシュ。キーは完全な `full_commit_id`。
     diff_cache: DiffStore,
-    /// Tier 1: バッチ整形用の不変コミット全体生 Git パッチ (`Arc<String>`)。
-    raw_patch_cache: RawPatchCache,
     /// Tier 2: ANSI 変換済みの表示用 `Text` キャッシュ (バッチ / フォールバック共通)。
     rendered_cache: RenderedDiffCache,
     /// ANSI 変換済みの change ヘッダキャッシュ。
@@ -385,7 +395,6 @@ impl App {
             file_selection: FileSelection::default(),
             header: Arc::new(Text::default()),
             diff_cache,
-            raw_patch_cache: RawPatchCache::default(),
             rendered_cache: RenderedDiffCache::default(),
             header_cache: HeaderCache::default(),
             diff_workers: DiffWorkers::new(backend),
@@ -530,66 +539,29 @@ impl App {
         }
     }
 
-    /// 描画用: `start` 行目から最大 `count` 行だけを共有 `Text` から切り出す。
-    /// 毎フレーム巨大な diff 全文を複製しないための可視範囲スライス。
-    pub fn visible_diff_lines(&self, start: usize, count: usize) -> Vec<Line<'static>> {
-        if count == 0 {
-            return Vec::new();
-        }
-        match &self.diff_body {
-            DiffBody::LoadingMeta => {
-                if start == 0 {
-                    vec![Line::from(Span::styled(
-                        "loading…",
-                        Style::default().fg(Color::DarkGray),
-                    ))]
-                } else {
-                    Vec::new()
-                }
-            }
-            DiffBody::Empty => self
-                .header
-                .lines
-                .iter()
-                .skip(start)
-                .take(count)
-                .cloned()
-                .collect(),
-            DiffBody::LoadingDiff => {
-                let mut out = Vec::with_capacity(count.min(self.header.lines.len() + 1));
-                let header_len = self.header.lines.len();
-                if start < header_len {
-                    out.extend(self.header.lines.iter().skip(start).take(count).cloned());
-                }
-                if out.len() < count && start <= header_len {
-                    out.push(Line::from(Span::styled(
-                        "loading diff…",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-                out
-            }
-            DiffBody::Ready(body) => {
-                let mut out = Vec::with_capacity(count);
-                let header_len = self.header.lines.len();
-                if start < header_len {
-                    out.extend(self.header.lines.iter().skip(start).take(count).cloned());
-                }
-                if out.len() < count {
-                    let body_start = start.saturating_sub(header_len);
-                    let remaining = count - out.len();
-                    out.extend(body.lines.iter().skip(body_start).take(remaining).cloned());
-                }
-                out
-            }
+    pub(crate) fn diff_lines(&self) -> impl Iterator<Item = &Line<'static>> {
+        let (header, body) = match &self.diff_body {
+            DiffBody::Empty => (self.header.lines.as_slice(), &[][..]),
+            DiffBody::LoadingMeta => (&[][..], std::slice::from_ref(&*LOADING_META_LINE)),
+            DiffBody::LoadingDiff => (
+                self.header.lines.as_slice(),
+                std::slice::from_ref(&*LOADING_DIFF_LINE),
+            ),
+            DiffBody::Ready(body) => (self.header.lines.as_slice(), body.lines.as_slice()),
+        };
+        header.iter().chain(body)
+    }
+
+    pub(crate) fn diff_draw_offset(&self) -> usize {
+        match self.diff_body {
+            DiffBody::LoadingMeta | DiffBody::LoadingDiff => 0,
+            _ => self.diff_scroll.into(),
         }
     }
 
     #[cfg(test)]
     pub fn diff_plain_text(&self) -> String {
-        let total = self.diff_line_count();
-        self.visible_diff_lines(0, total)
-            .iter()
+        self.diff_lines()
             .map(|l| {
                 l.spans
                     .iter()
@@ -968,9 +940,7 @@ impl App {
                 continue;
             }
             match resp.outcome {
-                BodyOutcome::BatchReady { raw_patch, entries } => {
-                    self.raw_patch_cache
-                        .insert(resp.commit_id.clone(), raw_patch);
+                BodyOutcome::BatchReady(entries) => {
                     let mut batch_to_cache = Vec::with_capacity(entries.len());
                     let mut current_match: Option<Arc<Text<'static>>> = None;
                     let is_current_commit = self
@@ -982,18 +952,19 @@ impl App {
                     let current_file_key =
                         is_current_commit.then(|| DiffFileKey::from_file(self.selected_file()));
 
-                    for (file_key, text) in entries {
-                        if current_file_key.as_ref() == Some(&file_key) {
-                            current_match = Some(Arc::clone(&text));
+                    for entry in entries.iter() {
+                        if current_file_key.as_ref() == Some(&entry.file_key) {
+                            current_match = Some(Arc::clone(&entry.text));
                         }
                         batch_to_cache.push((
                             RenderedKey {
                                 commit_id: resp.commit_id.clone(),
-                                file_key,
+                                file_key: entry.file_key.clone(),
                                 width: resp.width,
                                 mode: RenderModeKey::BatchDelta,
                             },
-                            text,
+                            Arc::clone(&entry.text),
+                            entry.bytes,
                         ));
                     }
                     self.rendered_cache.insert_batch(batch_to_cache);
@@ -1239,12 +1210,10 @@ impl App {
                     .diff_batch_config
                     .clone()
                     .expect("BatchDelta mode requires diff_batch_config");
-                let cached_raw_patch = self.raw_patch_cache.get(&commit_id);
                 BodyStrategy::BatchDelta {
                     config,
                     files: self.files.clone(),
                     selected_file: self.selected_file().cloned(),
-                    cached_raw_patch,
                     cached_selected_raw_diff: cached_raw_file_diff,
                 }
             }
@@ -4680,6 +4649,86 @@ mod tests {
     }
 
     #[test]
+    fn batch_worker_reuses_raw_and_formatted_results_before_ui_receives_them() {
+        use std::sync::atomic::Ordering;
+
+        let gate = Gate::new();
+        let mut backend = Arc::try_unwrap(FakeBackend::new(":git")).ok().unwrap();
+        backend.delta_gate = Some(Arc::clone(&gate));
+        let backend = Arc::new(backend);
+        let (files, patch, per_file) = sample_multi_file_commit();
+        let commit_id = "1111111111111111111111111111111111111111";
+        backend.add_commit(commit_id, files.clone(), "", &patch, per_file);
+        let workers = DiffWorkers::new(Arc::clone(&backend) as Arc<dyn DiffBackend>);
+        let mut request = BodyRequest {
+            commit_id: commit_id.into(),
+            width: 100,
+            generation: 0,
+            strategy: BodyStrategy::BatchDelta {
+                config: DeltaBatchConfig::delta_v1(),
+                selected_file: files.first().cloned(),
+                files,
+                cached_selected_raw_diff: None,
+            },
+        };
+        workers.submit_body(request.clone());
+        gate.wait_entered(1);
+        request.width = 140;
+        workers.submit_body(request.clone());
+        gate.release_all();
+
+        let wait_idle = || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while workers.is_busy() {
+                assert!(Instant::now() < deadline, "diff worker did not settle");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        wait_idle();
+        workers.submit_body(request);
+        wait_idle();
+        assert_eq!(backend.diff_git_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.delta_batch_calls.load(Ordering::SeqCst), 2);
+
+        assert_eq!(workers.try_recv_body().unwrap().width, 100);
+        let batches = [(); 2].map(|()| {
+            let response = workers.try_recv_body().unwrap();
+            assert_eq!(response.width, 140);
+            let BodyOutcome::BatchReady(entries) = response.outcome else {
+                panic!("expected batch at the new width");
+            };
+            entries
+        });
+        assert!(Arc::ptr_eq(&batches[0], &batches[1]));
+    }
+
+    #[test]
+    fn diff_draw_shows_loading_before_restoring_the_scroll_offset() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (_tmp, mut app) = fake_app(FakeBackend::new(":git"), &[]);
+        app.header = Arc::new(Text::raw("change header"));
+        app.diff_body = DiffBody::LoadingDiff;
+        app.diff_scroll = 20;
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+        let loading = terminal.backend().to_string();
+        assert!(loading.contains("change header"), "{loading}");
+        assert!(loading.contains("loading diff…"), "{loading}");
+        assert_eq!(app.diff_scroll, 20);
+
+        let mut lines = vec![Line::raw(""); 20];
+        lines[19] = Line::styled("resumed diff line", Style::default().fg(Color::Green));
+        app.diff_body = DiffBody::Ready(Arc::new(Text::from(lines)));
+        terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+        let ready = terminal.backend().to_string();
+        assert!(ready.contains("resumed diff line"), "{ready}");
+        assert!(!ready.contains("change header"), "{ready}");
+        assert!(!ready.contains("loading diff…"), "{ready}");
+    }
+
+    #[test]
     fn batch_delta_keeps_cursor_visual_range_and_quit_live_while_blocked_and_counts_calls() {
         use std::sync::atomic::Ordering;
 
@@ -4928,8 +4977,13 @@ mod tests {
         app2.sync_diff_blocking(80);
         assert!(app2.diff_plain_text().contains("RAW_RENAME"));
         assert_eq!(backend2.delta_batch_calls.load(Ordering::SeqCst), 1);
-        // Raw patch cache must NOT contain poisoned entry from failed batch.
-        assert!(app2.raw_patch_cache.get(cid).is_none());
+
+        // A fresh batch attempt after repairing delta must fetch the raw patch again.
+        backend2.corrupt_delta.store(false, Ordering::SeqCst);
+        app2.batch_fallback_commits.clear();
+        app2.sync_diff_blocking(80);
+        assert_eq!(backend2.diff_git_calls.load(Ordering::SeqCst), 2);
+        assert!(app2.diff_plain_text().contains("DELTA[w=80]"));
     }
 
     #[test]
