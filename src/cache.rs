@@ -102,28 +102,31 @@ pub struct CommitCache {
     /// 選択ファイルの実パス (`None` は change 全体) ごとの `jj diff --color
     /// always` 生出力。
     #[serde(with = "diffs_raw_as_pairs")]
-    pub diffs_raw: HashMap<Option<String>, String>,
+    pub diffs_raw: HashMap<Option<String>, Arc<String>>,
 }
 
 mod diffs_raw_as_pairs {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(
-        map: &HashMap<Option<String>, String>,
+        map: &HashMap<Option<String>, Arc<String>>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         map.iter()
-            .collect::<Vec<(&Option<String>, &String)>>()
+            .map(|(path, raw)| (path, raw.as_str()))
+            .collect::<Vec<_>>()
             .serialize(serializer)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<HashMap<Option<String>, String>, D::Error> {
+    ) -> Result<HashMap<Option<String>, Arc<String>>, D::Error> {
         Ok(Vec::<(Option<String>, String)>::deserialize(deserializer)?
             .into_iter()
+            .map(|(path, raw)| (path, Arc::new(raw)))
             .collect())
     }
 }
@@ -204,7 +207,7 @@ impl DiffStore {
     }
 
     /// 既存 commit にファイル別生 diff を 1 件追加する (バイト上限を維持)。
-    pub fn insert_file_diff(&mut self, commit_id: &str, path: Option<String>, raw: String) {
+    pub fn insert_file_diff(&mut self, commit_id: &str, path: Option<String>, raw: Arc<String>) {
         let Some(entry) = self.map.get_mut(commit_id) else {
             return;
         };
@@ -699,10 +702,10 @@ mod tests {
         );
         entry
             .diffs_raw
-            .insert(Some("a.txt".to_string()), "diff\n".to_string());
+            .insert(Some("a.txt".to_string()), Arc::new("diff\n".to_string()));
         entry
             .diffs_raw
-            .insert(None, "whole change diff\n".to_string());
+            .insert(None, Arc::new("whole change diff\n".to_string()));
         store.insert("abc123".to_string(), entry);
 
         let mut legacy_hasher = std::collections::hash_map::DefaultHasher::new();
@@ -719,12 +722,15 @@ mod tests {
         let restored = loaded.get("abc123").expect("entry persisted to disk");
         assert_eq!(restored.header_raw, "header\n");
         assert_eq!(
-            restored.diffs_raw.get(&Some("a.txt".to_string())),
-            Some(&"diff\n".to_string())
+            restored
+                .diffs_raw
+                .get(&Some("a.txt".to_string()))
+                .map(|raw| raw.as_str()),
+            Some("diff\n")
         );
         assert_eq!(
-            restored.diffs_raw.get(&None),
-            Some(&"whole change diff\n".to_string())
+            restored.diffs_raw.get(&None).map(|raw| raw.as_str()),
+            Some("whole change diff\n")
         );
         assert_eq!(restored.files[0].path, "a.txt");
 

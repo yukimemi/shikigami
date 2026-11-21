@@ -4,7 +4,7 @@
 //! 状態遷移 → jj 呼び出しまでをここで完結させる。おかげで、端末を開かずに
 //! 「このキーで本当にこの jj コマンドが飛ぶか」をテストできる。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, mpsc};
 use std::thread;
@@ -330,8 +330,8 @@ pub struct App {
     last_diff_width: Option<u16>,
     /// `ui.diff-formatter != :git` と判明してバッチを無効化した世代。
     batch_disabled_generation: Option<u64>,
-    /// この世代でバッチが失敗/曖昧となりファイル単位フォールバックへ切り替えたコミット群。
-    batch_fallback_commits: HashSet<String>,
+    /// バッチからファイル単位フォールバックへ切り替えたコミットと表示幅。
+    batch_fallback_widths: HashMap<String, HashSet<u16>>,
     /// `status_fresh` により 1 フレームだけ表示を保留した diff-filter エラー。
     pending_filter_error: Option<(ShownDiffKey, String)>,
     /// 起動時にバックグラウンドで走らせた `jj log`/`jj status` の
@@ -405,7 +405,7 @@ impl App {
             loading_diff_key: None,
             last_diff_width: None,
             batch_disabled_generation: None,
-            batch_fallback_commits: HashSet::new(),
+            batch_fallback_widths: HashMap::new(),
             pending_filter_error: None,
             startup_rx: None,
             startup_error: None,
@@ -852,18 +852,21 @@ impl App {
         self.file_selected = self.files.len().saturating_sub(1);
     }
 
-    fn can_batch_commit(&self, commit_id: &str) -> bool {
+    fn can_batch_commit(&self, commit_id: &str, width: u16) -> bool {
         self.diff_filter_cmd.is_none()
             && self.diff_batch_config.is_some()
             && self.batch_disabled_generation != Some(self.generation)
-            && !self.batch_fallback_commits.contains(commit_id)
+            && !self
+                .batch_fallback_widths
+                .get(commit_id)
+                .is_some_and(|widths| widths.contains(&width))
             && !self.files.is_empty()
     }
 
     fn active_render_mode(&self, commit_id: &str, diff_width: u16) -> (RenderModeKey, u16) {
         if let Some(cmd) = &self.diff_filter_cmd {
             (RenderModeKey::Filter(cmd.clone()), diff_width)
-        } else if self.can_batch_commit(commit_id) {
+        } else if self.can_batch_commit(commit_id, diff_width) {
             (RenderModeKey::BatchDelta, diff_width)
         } else {
             (RenderModeKey::Raw, 0)
@@ -911,25 +914,12 @@ impl App {
                         self.header = header_text;
                         self.file_selected = 0;
                         self.file_selection.clear();
-                        self.shown_commit = Some(resp.commit_id.clone());
+                        self.shown_commit = Some(resp.commit_id);
                         self.loading_meta_commit = None;
                         self.loading_diff_key = None;
-                        self.diff_body = DiffBody::Empty;
+                        self.diff_body = DiffBody::LoadingDiff;
                         self.diff_scroll = 0;
-                        if self.files.is_empty() {
-                            let width = self.last_diff_width.unwrap_or(80);
-                            let (mode, effective_width) =
-                                self.active_render_mode(&resp.commit_id, width);
-                            self.shown_diff = Some(ShownDiffKey {
-                                commit_id: resp.commit_id,
-                                file_key: DiffFileKey::WholeCommit,
-                                width: effective_width,
-                                mode,
-                                generation: resp.generation,
-                            });
-                        } else {
-                            self.shown_diff = None;
-                        }
+                        self.shown_diff = None;
                     }
                 }
             }
@@ -987,7 +977,10 @@ impl App {
                     self.apply_single_body(resp.commit_id, resp.generation, payload);
                 }
                 BodyOutcome::BatchFallback { fallback } => {
-                    self.batch_fallback_commits.insert(resp.commit_id.clone());
+                    self.batch_fallback_widths
+                        .entry(resp.commit_id.clone())
+                        .or_default()
+                        .insert(resp.width);
                     self.apply_single_body(resp.commit_id, resp.generation, fallback);
                 }
                 BodyOutcome::SingleReady(payload) => {
@@ -1646,7 +1639,7 @@ impl App {
     fn reload_and_clear(&mut self) -> Result<()> {
         self.file_selection.clear();
         self.rendered_cache.clear();
-        self.batch_fallback_commits.clear();
+        self.batch_fallback_widths.clear();
         self.batch_disabled_generation = None;
         self.shown_commit = None;
         self.shown_diff = None;
@@ -4402,7 +4395,7 @@ mod tests {
         git_patches: std::sync::Mutex<std::collections::HashMap<String, String>>,
         per_file_diffs: std::sync::Mutex<std::collections::HashMap<(String, Vec<String>), String>>,
         corrupt_delta: std::sync::atomic::AtomicBool,
-        fail_delta: std::sync::atomic::AtomicBool,
+        fail_delta_width: Option<u16>,
         delta_gate: Option<Arc<Gate>>,
         filter_gate: Option<Arc<Gate>>,
         diff_git_calls: std::sync::atomic::AtomicUsize,
@@ -4421,7 +4414,7 @@ mod tests {
                 git_patches: std::sync::Mutex::new(std::collections::HashMap::new()),
                 per_file_diffs: std::sync::Mutex::new(std::collections::HashMap::new()),
                 corrupt_delta: std::sync::atomic::AtomicBool::new(false),
-                fail_delta: std::sync::atomic::AtomicBool::new(false),
+                fail_delta_width: None,
                 delta_gate: None,
                 filter_gate: None,
                 diff_git_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -4461,13 +4454,12 @@ mod tests {
 
     impl DiffBackend for FakeBackend {
         fn diff_summary(&self, commit_id: &str) -> Result<Vec<DiffFile>> {
-            Ok(self
-                .files
+            self.files
                 .lock()
                 .unwrap()
                 .get(commit_id)
                 .cloned()
-                .unwrap_or_default())
+                .ok_or_else(|| anyhow::anyhow!("missing fake summary for {commit_id}"))
         }
 
         fn show(&self, commit_id: &str) -> Result<String> {
@@ -4518,8 +4510,8 @@ mod tests {
             if let Some(gate) = &self.delta_gate {
                 gate.arrive_and_wait();
             }
-            if self.fail_delta.load(std::sync::atomic::Ordering::SeqCst) {
-                anyhow::bail!("simulated delta failure");
+            if self.fail_delta_width == Some(width) {
+                anyhow::bail!("simulated delta output limit at width {width}");
             }
             if self.corrupt_delta.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok("STRAY_OUTSIDE_MARKERS\n".to_string());
@@ -4904,7 +4896,7 @@ mod tests {
         assert!(still_loading.contains("loading diff…"), "{still_loading}");
 
         // Release file 3 -> file 3 displays cleanly!
-        gate.release_all();
+        gate.release_next();
         app.sync_diff_blocking(90);
         let text3 = app.diff_plain_text();
         assert!(text3.contains("FILTER[w=90]"), "{text3}");
@@ -4926,6 +4918,13 @@ mod tests {
         assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 2);
 
         // Resize to 120 reuses cached raw per-file diff (0 new jj calls) and runs filter once.
+        app.sync_diff(120);
+        gate.wait_entered(3);
+        for _ in 0..10 {
+            app.sync_diff(120);
+            assert!(app.is_diff_loading());
+        }
+        gate.release_all();
         app.sync_diff_blocking(120);
         assert!(app.diff_plain_text().contains("FILTER[w=120]"));
         assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 2);
@@ -4972,18 +4971,135 @@ mod tests {
             "{fallback_text}"
         );
         assert_eq!(backend2.delta_batch_calls.load(Ordering::SeqCst), 1);
-        // Switching to file 1 stays on fallback for this commit (does not retry broken delta).
+        // Switching files at the failed width stays on the per-file fallback.
         app2.file_selected = 1;
         app2.sync_diff_blocking(80);
         assert!(app2.diff_plain_text().contains("RAW_RENAME"));
         assert_eq!(backend2.delta_batch_calls.load(Ordering::SeqCst), 1);
 
-        // A fresh batch attempt after repairing delta must fetch the raw patch again.
+        // A fresh batch attempt after repairing delta reuses the validated raw patch.
         backend2.corrupt_delta.store(false, Ordering::SeqCst);
-        app2.batch_fallback_commits.clear();
+        app2.batch_fallback_widths.clear();
         app2.sync_diff_blocking(80);
-        assert_eq!(backend2.diff_git_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backend2.diff_git_calls.load(Ordering::SeqCst), 1);
         assert!(app2.diff_plain_text().contains("DELTA[w=80]"));
+    }
+
+    #[test]
+    fn diff_summary_failure_preserves_header_and_loads_whole_commit() {
+        use std::sync::atomic::Ordering;
+
+        let backend = FakeBackend::new(":git");
+        let cid = "4444444444444444444444444444444444444444";
+        backend.add_commit(
+            cid,
+            Vec::new(),
+            "Change header\n",
+            "",
+            vec![(Vec::new(), "WHOLE_COMMIT_PATCH\n".into())],
+        );
+        backend.files.lock().unwrap().remove(cid);
+        let (_tmp, mut app) = fake_app(Arc::clone(&backend), &[(cid, "missing summary")]);
+        app.diff_batch_config = Some(DeltaBatchConfig::delta_v1());
+
+        app.sync_diff_blocking(80);
+
+        let text = app.diff_plain_text();
+        assert!(text.contains("Change header"), "{text}");
+        assert!(text.contains("WHOLE_COMMIT_PATCH"), "{text}");
+        assert!(app.files.is_empty());
+        assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.delta_batch_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn batch_failure_at_stale_width_preserves_new_and_cached_widths() {
+        use std::sync::atomic::Ordering;
+
+        let gate = Gate::new();
+        let mut backend = Arc::try_unwrap(FakeBackend::new(":git")).ok().unwrap();
+        backend.delta_gate = Some(Arc::clone(&gate));
+        backend.fail_delta_width = Some(160);
+        let backend = Arc::new(backend);
+        let (files, patch, per_file) = sample_multi_file_commit();
+        let cid = "5555555555555555555555555555555555555555";
+        backend.add_commit(cid, files, "Header\n", &patch, per_file);
+        let (_tmp, mut app) = fake_app(Arc::clone(&backend), &[(cid, "resize")]);
+        app.diff_batch_config = Some(DeltaBatchConfig::delta_v1());
+
+        gate.release_next();
+        app.sync_diff_blocking(100);
+        assert!(app.diff_plain_text().contains("DELTA[w=100]"));
+
+        app.sync_diff(160);
+        gate.wait_entered(2);
+        app.file_selected = 1;
+        app.sync_diff(80);
+        gate.release_all();
+        app.sync_diff_blocking(80);
+        let narrow = app.diff_plain_text();
+        assert!(narrow.contains("DELTA[w=80]"), "{narrow}");
+        assert!(narrow.contains("new space.txt"), "{narrow}");
+        assert!(!narrow.contains("RAW_ALPHA"), "{narrow}");
+
+        app.sync_diff(100);
+        assert!(!app.is_diff_loading());
+        assert!(app.diff_plain_text().contains("DELTA[w=100]"));
+
+        app.sync_diff_blocking(160);
+        assert!(app.diff_plain_text().contains("RAW_RENAME"));
+        assert_eq!(backend.diff_git_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.delta_batch_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn batch_over_entry_limit_uses_cached_per_file_fallback() {
+        use std::fmt::Write as _;
+        use std::sync::atomic::Ordering;
+
+        let backend = FakeBackend::new(":git");
+        let cid = "6666666666666666666666666666666666666666";
+        let mut patch = String::new();
+        let files = (0..=crate::cache::MAX_RENDERED_ENTRIES)
+            .map(|i| {
+                let path = format!("file-{i}.txt");
+                write!(
+                    patch,
+                    "diff --git a/{path} b/{path}\nold mode 100644\nnew mode 100755\n"
+                )
+                .unwrap();
+                DiffFile {
+                    status: 'M',
+                    source_path: path.clone(),
+                    destination_path: path.clone(),
+                    path,
+                }
+            })
+            .collect();
+        backend.add_commit(
+            cid,
+            files,
+            "Header\n",
+            &patch,
+            vec![
+                (vec!["file-0.txt".into()], "RAW_ZERO\n".into()),
+                (vec!["file-1.txt".into()], "RAW_ONE\n".into()),
+            ],
+        );
+        let (_tmp, mut app) = fake_app(Arc::clone(&backend), &[(cid, "many files")]);
+        app.diff_batch_config = Some(DeltaBatchConfig::delta_v1());
+
+        app.sync_diff_blocking(80);
+        assert!(app.diff_plain_text().contains("RAW_ZERO"));
+        app.file_selected = 1;
+        app.sync_diff_blocking(80);
+        assert!(app.diff_plain_text().contains("RAW_ONE"));
+        app.file_selected = 0;
+        app.sync_diff(80);
+        assert!(!app.is_diff_loading());
+        assert!(app.diff_plain_text().contains("RAW_ZERO"));
+        assert_eq!(backend.delta_batch_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -5031,7 +5147,7 @@ mod tests {
         assert_eq!(app.files.len(), 5, "{:?}", app.files);
 
         // Every file must be served cleanly from the prepared batch without fallback.
-        assert!(app.batch_fallback_commits.is_empty());
+        assert!(app.batch_fallback_widths.is_empty());
         assert!(app.batch_disabled_generation.is_none());
         for i in 0..app.files.len() {
             app.file_selected = i;
@@ -5056,7 +5172,7 @@ mod tests {
 
         // Resize to 130 re-runs delta using cached raw patch and warms all files again.
         app.sync_diff_blocking(130);
-        assert!(app.batch_fallback_commits.is_empty());
+        assert!(app.batch_fallback_widths.is_empty());
         for i in 0..app.files.len() {
             app.file_selected = i;
             app.sync_diff(130);

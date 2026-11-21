@@ -15,7 +15,7 @@
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use ratatui::text::Text;
 
 use crate::cache::{
@@ -134,12 +134,12 @@ pub enum BodyStrategy {
         config: DeltaBatchConfig,
         files: Vec<DiffFile>,
         selected_file: Option<DiffFile>,
-        cached_selected_raw_diff: Option<String>,
+        cached_selected_raw_diff: Option<Arc<String>>,
     },
     PerFile {
         selected_file: Option<DiffFile>,
         filter_cmd: Option<String>,
-        cached_raw_diff: Option<String>,
+        cached_raw_diff: Option<Arc<String>>,
     },
 }
 
@@ -199,7 +199,7 @@ pub struct SingleBodyPayload {
     pub mode: RenderModeKey,
     pub effective_width: u16,
     /// `jj diff` が今回新規に成功したときだけ `Some` (Tier 1 生キャッシュ登録用)。
-    pub fetched_raw: Option<String>,
+    pub fetched_raw: Option<Arc<String>>,
     pub text: Arc<Text<'static>>,
     /// フィルタ失敗や `jj` エラーでない成功表示結果か (Tier 2 表示キャッシュ登録可否)。
     pub cacheable: bool,
@@ -219,8 +219,7 @@ pub enum BodyOutcome {
     /// `ui.diff-formatter` が `:git` ではないため、この世代全体でバッチを無効化し、
     /// 併せて現選択ファイルの従来経路結果を返す。
     BatchDisabledForGeneration(SingleBodyPayload),
-    /// このコミットのバッチ分割・整形・検証が失敗/曖昧だったためキャッシュを汚染せず、
-    /// 現選択ファイルの従来経路結果を返す。
+    /// このコミット・幅のバッチを使えないため、現選択ファイルの従来経路結果を返す。
     BatchFallback {
         fallback: SingleBodyPayload,
     },
@@ -487,7 +486,7 @@ fn body_worker_loop(
                         selected_file.as_ref(),
                         None,
                         req.width,
-                        cached_selected_raw_diff.as_deref(),
+                        cached_selected_raw_diff.as_ref().map(|raw| raw.as_str()),
                     );
                     BodyOutcome::BatchDisabledForGeneration(payload)
                 } else {
@@ -502,14 +501,7 @@ fn body_worker_loop(
                             req.width,
                             &mut raw_patches,
                         )
-                        .inspect(|entries| {
-                            if entries.len() <= MAX_RENDERED_ENTRIES
-                                && entries.iter().map(|entry| entry.bytes).sum::<usize>()
-                                    <= MAX_RENDERED_BYTES
-                            {
-                                latest_batch = Some((key, Arc::clone(entries)));
-                            }
-                        }),
+                        .inspect(|entries| latest_batch = Some((key, Arc::clone(entries)))),
                     };
                     match result {
                         Ok(entries) => BodyOutcome::BatchReady(entries),
@@ -520,7 +512,7 @@ fn body_worker_loop(
                                 selected_file.as_ref(),
                                 None,
                                 req.width,
-                                cached_selected_raw_diff.as_deref(),
+                                cached_selected_raw_diff.as_ref().map(|raw| raw.as_str()),
                             );
                             BodyOutcome::BatchFallback { fallback }
                         }
@@ -538,7 +530,7 @@ fn body_worker_loop(
                     selected_file.as_ref(),
                     filter_cmd.as_deref(),
                     req.width,
-                    cached_raw_diff.as_deref(),
+                    cached_raw_diff.as_ref().map(|raw| raw.as_str()),
                 );
                 BodyOutcome::SingleReady(payload)
             }
@@ -569,6 +561,10 @@ fn prepare_batch(
     width: u16,
     raw_patches: &mut RawPatchCache,
 ) -> Result<Arc<[BatchEntry]>> {
+    if files.len() > MAX_RENDERED_ENTRIES {
+        bail!("batch exceeds the rendered cache entry limit");
+    }
+
     let cached = raw_patches.get(commit_id);
     let raw_patch = match &cached {
         Some(patch) => Arc::clone(patch),
@@ -576,11 +572,15 @@ fn prepare_batch(
     };
 
     let matched = parse_and_match_git_patch(&raw_patch, files)?;
+    if cached.is_none() {
+        raw_patches.insert(commit_id.to_owned(), Arc::clone(&raw_patch));
+    }
     let framed = build_framed_batch(&matched, &raw_patch, commit_id);
     let formatted = backend.run_delta_batch(config, &framed, width)?;
     let extracted = extract_and_validate_delta_output(&formatted, &framed, matched.len())?;
 
     let mut entries = Vec::with_capacity(matched.len());
+    let mut total_bytes = 0;
     for (section, rendered) in matched.iter().zip(extracted.iter()) {
         let file = &files[section.file_index];
         let key = DiffFileKey::from_file(Some(file));
@@ -589,15 +589,16 @@ fn prepare_batch(
         } else {
             parse_ansi(rendered)
         };
+        let bytes = estimate_text_bytes(&text);
+        total_bytes += bytes;
+        if total_bytes > MAX_RENDERED_BYTES {
+            bail!("batch exceeds the rendered cache byte limit");
+        }
         entries.push(BatchEntry {
             file_key: key,
-            bytes: estimate_text_bytes(&text),
+            bytes,
             text,
         });
-    }
-
-    if cached.is_none() {
-        raw_patches.insert(commit_id.to_owned(), raw_patch);
     }
     Ok(entries.into())
 }
@@ -617,28 +618,27 @@ fn execute_per_file(
     };
     let effective_width = if filter_cmd.is_some() { width } else { 0 };
 
-    let (diff_raw, fetched_raw, jj_failed) = match cached_raw_diff {
-        Some(raw) => (raw.to_string(), None, false),
+    let mut fetched_raw = None;
+    let diff_raw = match cached_raw_diff {
+        Some(raw) => raw,
         None => {
             let paths = selected_file.map(DiffFile::diff_paths).unwrap_or_default();
             match backend.diff_file(commit_id, &paths) {
-                Ok(raw) => (raw.clone(), Some(raw), false),
-                Err(err) => (format!("{err:#}"), None, true),
+                Ok(raw) => fetched_raw.insert(Arc::new(raw)).as_str(),
+                Err(err) => {
+                    return SingleBodyPayload {
+                        file_key,
+                        mode,
+                        effective_width,
+                        fetched_raw: None,
+                        text: parse_ansi(&format!("{err:#}")),
+                        cacheable: false,
+                        filter_error: None,
+                    };
+                }
             }
         }
     };
-
-    if jj_failed {
-        return SingleBodyPayload {
-            file_key,
-            mode,
-            effective_width,
-            fetched_raw: None,
-            text: parse_ansi(&diff_raw),
-            cacheable: false,
-            filter_error: None,
-        };
-    }
 
     if diff_raw.trim().is_empty() {
         return SingleBodyPayload {
@@ -653,7 +653,7 @@ fn execute_per_file(
     }
 
     match filter_cmd {
-        Some(cmd) => match backend.run_diff_filter(cmd, &diff_raw, width) {
+        Some(cmd) => match backend.run_diff_filter(cmd, diff_raw, width) {
             Ok(filtered) => SingleBodyPayload {
                 file_key,
                 mode,
@@ -667,8 +667,8 @@ fn execute_per_file(
                 file_key,
                 mode,
                 effective_width,
+                text: parse_ansi(diff_raw),
                 fetched_raw,
-                text: parse_ansi(&diff_raw),
                 cacheable: false,
                 filter_error: Some(format!("{}: {err:#}", crate::diff_filter::DIFF_FILTER_ENV)),
             },
@@ -677,8 +677,8 @@ fn execute_per_file(
             file_key,
             mode,
             effective_width,
+            text: parse_ansi(diff_raw),
             fetched_raw,
-            text: parse_ansi(&diff_raw),
             cacheable: true,
             filter_error: None,
         },
