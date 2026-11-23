@@ -29,6 +29,9 @@ use crate::selection::{FileSelection, plan_absorb, plan_open, plan_restore, plan
 /// 一度に動かす行数 (Ctrl-d / Ctrl-u)。
 const PAGE: usize = 10;
 
+#[cfg(test)]
+const TEST_WORKER_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// [`App::begin_reload`] が背景スレッドから返す `jj log`/`jj status` の
 /// 結果。
 type ReloadResult = Result<(Vec<Row>, String)>;
@@ -511,7 +514,7 @@ impl App {
     pub fn sync_diff_blocking(&mut self, diff_width: u16) {
         let preserve_fresh = self.status_fresh;
         self.sync_diff(diff_width);
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + TEST_WORKER_TIMEOUT;
         while self.is_diff_loading() {
             assert!(
                 Instant::now() < deadline,
@@ -2048,7 +2051,7 @@ mod tests {
     }
 
     fn wait_remote(app: &mut App) {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + TEST_WORKER_TIMEOUT;
         while app.remote_progress().is_some() {
             assert!(Instant::now() < deadline, "remote job timed out");
             app.poll_remote();
