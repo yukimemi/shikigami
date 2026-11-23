@@ -72,7 +72,10 @@ pub const KEYS: &[(&str, &str)] = &[
         "jj rebase — selected onto the marked change (or a revset)",
     ),
     ("R", "cycle rebase mode: -r / -s / -b"),
-    ("L", "cycle pane layout: stacked / diff-below / vertical"),
+    (
+        "L",
+        "cycle layout: diff-below (default) / vertical / stacked",
+    ),
     ("a", "jj abandon"),
     ("u / U", "jj undo / jj redo"),
     ("/", "set the log revset"),
@@ -109,11 +112,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-/// `draw` 本体の pane 分割。`PaneLayout::Stacked` は現状どおり
-/// `log | (files - diff)` (右カラムを files/diff で縦分け)、
-/// `PaneLayout::DiffBelow` は `(log | files) - diff` (上段を log/files で
-/// 横分けし、diff は下段で全幅を使う — delta の side-by-side など幅が
-/// 要る diff フィルタ向け)、`PaneLayout::Vertical` は log / files / diff を
+/// `draw` 本体の pane 分割。起動時の `PaneLayout::DiffBelow` は
+/// `(log | files) - diff` (上段を log/files で横分けし、diff は下段で全幅を使う)。
+/// `PaneLayout::Stacked` は `log | (files - diff)` (右カラムを files/diff で縦分け)。
+/// `PaneLayout::Vertical` は log / files / diff を
 /// 全幅で縦に積む (狭い端末向け。files は件数に追従しつつ高さの 1/3 まで)。
 /// `diff_pane_width` もここを通すことで、実描画
 /// 幅とフィルタへ渡す `COLUMNS` がずれない。
@@ -589,22 +591,14 @@ mod tests {
     }
 
     #[test]
-    fn diff_below_layout_renders_the_diff_pane_spanning_the_full_width() {
+    fn startup_renders_the_diff_pane_spanning_the_full_width() {
         let (_tmp, mut app) = repo_or_skip!();
-        app.handle_key(key(KeyCode::Char('L')));
-        assert_eq!(app.layout, PaneLayout::DiffBelow);
         let lines = render(&mut app, 120, 24);
-        // diff pane's bottom border is the last content row before the
-        // status bar; in `DiffBelow` it must span (nearly) the full
-        // terminal width, not just the right half like `Stacked`.
-        let border = lines
-            .iter()
-            .rev()
-            .find(|l| l.starts_with('╰'))
-            .unwrap_or_else(|| panic!("diff pane bottom border missing:\n{}", lines.join("\n")));
+        let border = &lines[lines.len() - 2];
         assert!(
-            border.chars().count() >= 118,
-            "diff pane border is not full width: {border:?}"
+            border.starts_with('╰') && border.ends_with('╯') && border.chars().count() == 120,
+            "diff pane bottom border above the status bar is not full width:\n{}",
+            lines.join("\n")
         );
     }
 

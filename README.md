@@ -39,7 +39,7 @@
 ## Why
 
 `jj log` is already the best part of jj — but acting on what you see means retyping change ids into
-another command. shikigami keeps the log on screen, shows the selected change's diff next to it, and
+another command. shikigami keeps the log on screen, shows the selected change's diff below it, and
 binds the rewrite commands to single keys. Every key press is a real `jj` invocation, so your
 `~/.config/jj/config.toml` (`revsets.log`, `immutable_heads()`, diff formatter, colors) applies
 unchanged, and `jj op log` / `jj undo` still see everything shikigami did.
@@ -102,7 +102,7 @@ alone.
 | `s`               | `jj squash` — selected change into the marked one             |
 | `x`               | `jj rebase` — selected onto the marked change, or onto a revset you type |
 | `R`               | cycle rebase mode: `-r` / `-s` / `-b`                         |
-| `L`               | cycle pane layout: `stacked` (log \| files-over-diff) / `diff-below` (log+files on top, full-width diff below) / `vertical` (log, files, diff stacked full-width, for narrow terminals) |
+| `L`               | cycle pane layout: `diff-below` (default: log and files side by side above a full-width diff) → `vertical` (three full-width panes for narrow terminals) → `stacked` (log at left, files above diff at right) |
 | `a`               | `jj abandon`                                                  |
 | `u` / `U`         | `jj undo` / `jj redo`                                         |
 | `/`               | set the log revset                                            |
@@ -202,10 +202,10 @@ setup carry straight through:
 
   The diff pane's actual rendered width is passed to the command as `COLUMNS`, so a wrapper that
   reads it (as above) gets side-by-side output that fits the pane instead of wrapping at a fixed
-  80 columns. Since the default layout only gives the diff pane half the terminal width, press `L`
-  to switch to the `diff-below` layout (log/files on top, full-width diff below) or the `vertical`
-  layout (all three panes stacked full-width) for more room —
-  see "Keys" above. If the command fails (missing binary, bad flags, non-zero exit), the diff pane
+  80 columns. The default `diff-below` layout gives the diff pane the full terminal width.
+  The `vertical` layout also uses the full width, while `stacked` gives the diff pane only the
+  right half. Press `L` to cycle through the layouts.
+  If the command fails (missing binary, bad flags, non-zero exit), the diff pane
   falls back to jj's raw output and the error shows in the status bar — a broken filter never
   blanks the diff. Both `jj diff` and `SHIKIGAMI_DIFF_FILTER` run asynchronously off the UI thread,
   and successful formatted outputs are cached in memory per commit, file, and pane width.

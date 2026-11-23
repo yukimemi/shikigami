@@ -119,10 +119,10 @@ pub enum Focus {
 /// pane の配置。`L` で循環する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneLayout {
-    /// 現状のデフォルト: `log | (files - diff)`。log が全高、右カラムを
+    /// `log | (files - diff)`。log が全高、右カラムを
     /// files (上, 内容量に応じて伸縮) / diff (下) で縦に分ける。
     Stacked,
-    /// `(log | files) - diff`。上段を log/files で横に分け、diff は
+    /// 起動時のデフォルト: `(log | files) - diff`。上段を log/files で横に分け、diff は
     /// 下段で全幅を使う — delta の side-by-side など、幅が要る diff
     /// フィルタ向け。
     DiffBelow,
@@ -388,7 +388,7 @@ impl App {
             status: Status::info("loading…"),
             marked: None,
             rebase_mode: RebaseMode::Revision,
-            layout: PaneLayout::Stacked,
+            layout: PaneLayout::DiffBelow,
             diff_body: DiffBody::Empty,
             files: Arc::default(),
             file_selected: 0,
@@ -3278,16 +3278,16 @@ mod tests {
     #[test]
     fn pane_layout_toggle_cycles_and_updates_status() {
         let (_tmp, mut app) = repo_or_skip!();
-        assert_eq!(app.layout, PaneLayout::Stacked);
-        app.handle_key(key(KeyCode::Char('L')));
         assert_eq!(app.layout, PaneLayout::DiffBelow);
-        assert!(app.status.text.contains("diff-below"), "{:?}", app.status);
-        app.handle_key(key(KeyCode::Char('L')));
-        assert_eq!(app.layout, PaneLayout::Vertical);
-        assert!(app.status.text.contains("vertical"), "{:?}", app.status);
-        app.handle_key(key(KeyCode::Char('L')));
-        assert_eq!(app.layout, PaneLayout::Stacked);
-        assert!(app.status.text.contains("stacked"), "{:?}", app.status);
+        for (layout, status) in [
+            (PaneLayout::Vertical, "layout: vertical"),
+            (PaneLayout::Stacked, "layout: stacked"),
+            (PaneLayout::DiffBelow, "layout: diff-below"),
+        ] {
+            app.handle_key(key(KeyCode::Char('L')));
+            assert_eq!(app.layout, layout);
+            assert_eq!(app.status.text, status);
+        }
     }
 
     #[test]
