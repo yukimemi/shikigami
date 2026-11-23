@@ -29,6 +29,9 @@ use crate::selection::{FileSelection, plan_absorb, plan_open, plan_restore, plan
 /// 一度に動かす行数 (Ctrl-d / Ctrl-u)。
 const PAGE: usize = 10;
 
+#[cfg(test)]
+const TEST_WORKER_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// [`App::begin_reload`] が背景スレッドから返す `jj log`/`jj status` の
 /// 結果。
 type ReloadResult = Result<(Vec<Row>, String)>;
@@ -119,10 +122,10 @@ pub enum Focus {
 /// pane の配置。`L` で循環する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneLayout {
-    /// 現状のデフォルト: `log | (files - diff)`。log が全高、右カラムを
+    /// `log | (files - diff)`。log が全高、右カラムを
     /// files (上, 内容量に応じて伸縮) / diff (下) で縦に分ける。
     Stacked,
-    /// `(log | files) - diff`。上段を log/files で横に分け、diff は
+    /// 起動時のデフォルト: `(log | files) - diff`。上段を log/files で横に分け、diff は
     /// 下段で全幅を使う — delta の side-by-side など、幅が要る diff
     /// フィルタ向け。
     DiffBelow,
@@ -388,7 +391,7 @@ impl App {
             status: Status::info("loading…"),
             marked: None,
             rebase_mode: RebaseMode::Revision,
-            layout: PaneLayout::Stacked,
+            layout: PaneLayout::DiffBelow,
             diff_body: DiffBody::Empty,
             files: Arc::default(),
             file_selected: 0,
@@ -511,7 +514,7 @@ impl App {
     pub fn sync_diff_blocking(&mut self, diff_width: u16) {
         let preserve_fresh = self.status_fresh;
         self.sync_diff(diff_width);
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + TEST_WORKER_TIMEOUT;
         while self.is_diff_loading() {
             assert!(
                 Instant::now() < deadline,
@@ -2048,7 +2051,7 @@ mod tests {
     }
 
     fn wait_remote(app: &mut App) {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + TEST_WORKER_TIMEOUT;
         while app.remote_progress().is_some() {
             assert!(Instant::now() < deadline, "remote job timed out");
             app.poll_remote();
@@ -3278,16 +3281,16 @@ mod tests {
     #[test]
     fn pane_layout_toggle_cycles_and_updates_status() {
         let (_tmp, mut app) = repo_or_skip!();
-        assert_eq!(app.layout, PaneLayout::Stacked);
-        app.handle_key(key(KeyCode::Char('L')));
         assert_eq!(app.layout, PaneLayout::DiffBelow);
-        assert!(app.status.text.contains("diff-below"), "{:?}", app.status);
-        app.handle_key(key(KeyCode::Char('L')));
-        assert_eq!(app.layout, PaneLayout::Vertical);
-        assert!(app.status.text.contains("vertical"), "{:?}", app.status);
-        app.handle_key(key(KeyCode::Char('L')));
-        assert_eq!(app.layout, PaneLayout::Stacked);
-        assert!(app.status.text.contains("stacked"), "{:?}", app.status);
+        for (layout, status) in [
+            (PaneLayout::Vertical, "layout: vertical"),
+            (PaneLayout::Stacked, "layout: stacked"),
+            (PaneLayout::DiffBelow, "layout: diff-below"),
+        ] {
+            app.handle_key(key(KeyCode::Char('L')));
+            assert_eq!(app.layout, layout);
+            assert_eq!(app.status.text, status);
+        }
     }
 
     #[test]

@@ -1,0 +1,4 @@
+[env]
+# The jj-backed tests launch multiple subprocesses per test. On Windows,
+# running one test per logical CPU can exceed the diff and remote test deadlines.
+RUST_TEST_THREADS = "4"
