@@ -593,6 +593,7 @@ mod tests {
     #[test]
     fn startup_renders_the_diff_pane_spanning_the_full_width() {
         let (_tmp, mut app) = repo_or_skip!();
+        assert_eq!(app.layout, PaneLayout::DiffBelow);
         let lines = render(&mut app, 120, 24);
         let border = &lines[lines.len() - 2];
         assert!(
