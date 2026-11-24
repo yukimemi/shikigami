@@ -2529,7 +2529,7 @@ dependencies = [
 
 [[package]]
 name = "shikigami"
-version = "0.21.4"
+version = "0.22.0"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
