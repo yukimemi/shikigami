@@ -253,6 +253,8 @@ struct BodySlot {
 struct BodySlotState {
     pending: Option<BodyRequest>,
     in_flight: Option<InFlightBody>,
+    completed_file: Option<InFlightBody>,
+    unread_replies: usize,
     shutdown: bool,
 }
 
@@ -284,6 +286,8 @@ impl DiffWorkers {
             state: Mutex::new(BodySlotState {
                 pending: None,
                 in_flight: None,
+                completed_file: None,
+                unread_replies: 0,
                 shutdown: false,
             }),
             cv: Condvar::new(),
@@ -319,7 +323,7 @@ impl DiffWorkers {
     pub fn submit_body(&self, req: BodyRequest) {
         let key = req.in_flight_key();
         let mut guard = self.body_slot.state.lock().unwrap();
-        if guard.in_flight.as_ref() == Some(&key) {
+        if guard.in_flight.as_ref() == Some(&key) || guard.completed_file.as_ref() == Some(&key) {
             guard.pending = None;
             return;
         }
@@ -347,7 +351,13 @@ impl DiffWorkers {
     }
 
     pub fn try_recv_body(&self) -> Option<BodyResponse> {
-        self.body_rx.try_recv().ok()
+        let mut guard = self.body_slot.state.lock().unwrap();
+        let response = self.body_rx.try_recv().ok()?;
+        guard.unread_replies -= 1;
+        if guard.unread_replies == 0 {
+            guard.completed_file = None;
+        }
+        Some(response)
     }
 
     pub fn is_busy(&self) -> bool {
@@ -443,6 +453,19 @@ fn meta_worker_loop(
     }
 }
 
+struct LatestFileRaw {
+    commit_id: String,
+    file_key: DiffFileKey,
+    generation: u64,
+    raw: Arc<String>,
+}
+
+impl LatestFileRaw {
+    fn matches(&self, commit_id: &str, file_key: &DiffFileKey, generation: u64) -> bool {
+        self.commit_id == commit_id && self.file_key == *file_key && self.generation == generation
+    }
+}
+
 fn body_worker_loop(
     slot: Arc<BodySlot>,
     backend: Arc<dyn DiffBackend>,
@@ -453,6 +476,8 @@ fn body_worker_loop(
     let mut raw_patches = RawPatchCache::default();
     // UI に未配信の同一バッチも再整形しない。本文はレスポンスと共有する。
     let mut latest_batch: Option<(InFlightBody, Arc<[BatchEntry]>)> = None;
+    // 初回フィルタ完了前の幅変更でも直前の生差分を再利用し、`jj diff` を再起動しない。
+    let mut latest_file_raw: Option<LatestFileRaw> = None;
 
     loop {
         let req = {
@@ -468,6 +493,12 @@ fn body_worker_loop(
                 guard = slot.cv.wait(guard).unwrap();
             }
         };
+
+        if latest_file_raw.as_ref().is_some_and(|memo| {
+            memo.commit_id != req.commit_id || memo.generation != req.generation
+        }) {
+            latest_file_raw = None;
+        }
 
         let outcome = match &req.strategy {
             BodyStrategy::BatchDelta {
@@ -490,11 +521,11 @@ fn body_worker_loop(
                 if !is_git {
                     let payload = execute_per_file(
                         &*backend,
-                        &req.commit_id,
+                        &req,
                         selected_file.as_ref(),
                         None,
-                        req.width,
                         cached_selected_raw_diff.as_ref().map(|raw| raw.as_str()),
+                        &mut latest_file_raw,
                     );
                     BodyOutcome::BatchDisabledForGeneration(payload)
                 } else {
@@ -512,15 +543,18 @@ fn body_worker_loop(
                         .inspect(|entries| latest_batch = Some((key, Arc::clone(entries)))),
                     };
                     match result {
-                        Ok(entries) => BodyOutcome::BatchReady(entries),
+                        Ok(entries) => {
+                            latest_file_raw = None;
+                            BodyOutcome::BatchReady(entries)
+                        }
                         Err(_) => {
                             let fallback = execute_per_file(
                                 &*backend,
-                                &req.commit_id,
+                                &req,
                                 selected_file.as_ref(),
                                 None,
-                                req.width,
                                 cached_selected_raw_diff.as_ref().map(|raw| raw.as_str()),
+                                &mut latest_file_raw,
                             );
                             BodyOutcome::BatchFallback { fallback }
                         }
@@ -534,30 +568,37 @@ fn body_worker_loop(
             } => {
                 let payload = execute_per_file(
                     &*backend,
-                    &req.commit_id,
+                    &req,
                     selected_file.as_ref(),
                     filter_cmd.as_deref(),
-                    req.width,
                     cached_raw_diff.as_ref().map(|raw| raw.as_str()),
+                    &mut latest_file_raw,
                 );
                 BodyOutcome::SingleReady(payload)
             }
         };
 
-        let send_err = tx
+        let mut guard = slot.state.lock().unwrap();
+        if guard.shutdown {
+            return;
+        }
+        if tx
             .send(BodyResponse {
                 commit_id: req.commit_id,
                 width: req.width,
                 generation: req.generation,
                 outcome,
             })
-            .is_err();
-
-        let mut guard = slot.state.lock().unwrap();
-        guard.in_flight = None;
-        if send_err || guard.shutdown {
+            .is_err()
+        {
             return;
         }
+        // UI のポーリングと再送の間に完了しても、未受信のファイル差分は再実行しない。
+        guard.unread_replies += 1;
+        guard.completed_file = guard
+            .in_flight
+            .take()
+            .filter(|key| matches!(key, InFlightBody::PerFile { .. }));
     }
 }
 
@@ -613,37 +654,55 @@ fn prepare_batch(
 
 fn execute_per_file(
     backend: &dyn DiffBackend,
-    commit_id: &str,
+    req: &BodyRequest,
     selected_file: Option<&DiffFile>,
     filter_cmd: Option<&str>,
-    width: u16,
     cached_raw_diff: Option<&str>,
+    latest_file_raw: &mut Option<LatestFileRaw>,
 ) -> SingleBodyPayload {
+    let commit_id = req.commit_id.as_str();
     let file_key = DiffFileKey::from_file(selected_file);
     let mode = match filter_cmd {
         Some(cmd) => RenderModeKey::Filter(cmd.to_string()),
         None => RenderModeKey::Raw,
     };
-    let effective_width = if filter_cmd.is_some() { width } else { 0 };
+    let effective_width = if filter_cmd.is_some() { req.width } else { 0 };
+
+    if latest_file_raw
+        .as_ref()
+        .is_some_and(|memo| !memo.matches(commit_id, &file_key, req.generation))
+    {
+        *latest_file_raw = None;
+    }
 
     let mut fetched_raw = None;
-    let diff_raw = match cached_raw_diff {
-        Some(raw) => raw,
-        None => {
-            let paths = selected_file.map(DiffFile::diff_paths).unwrap_or_default();
-            match backend.diff_file(commit_id, &paths) {
-                Ok(raw) => fetched_raw.insert(Arc::new(raw)).as_str(),
-                Err(err) => {
-                    return SingleBodyPayload {
-                        file_key,
-                        mode,
-                        effective_width,
-                        fetched_raw: None,
-                        text: parse_ansi(&format!("{err:#}")),
-                        cacheable: false,
-                        filter_error: None,
-                    };
-                }
+    let diff_raw = if let Some(raw) = cached_raw_diff {
+        raw
+    } else if let Some(memo) = latest_file_raw.as_ref() {
+        memo.raw.as_str()
+    } else {
+        let paths = selected_file.map(DiffFile::diff_paths).unwrap_or_default();
+        match backend.diff_file(commit_id, &paths) {
+            Ok(raw) => {
+                let raw = Arc::new(raw);
+                *latest_file_raw = Some(LatestFileRaw {
+                    commit_id: req.commit_id.clone(),
+                    file_key: file_key.clone(),
+                    generation: req.generation,
+                    raw: Arc::clone(&raw),
+                });
+                fetched_raw.insert(raw).as_str()
+            }
+            Err(err) => {
+                return SingleBodyPayload {
+                    file_key,
+                    mode,
+                    effective_width,
+                    fetched_raw: None,
+                    text: parse_ansi(&format!("{err:#}")),
+                    cacheable: false,
+                    filter_error: None,
+                };
             }
         }
     };
@@ -661,7 +720,7 @@ fn execute_per_file(
     }
 
     match filter_cmd {
-        Some(cmd) => match backend.run_diff_filter(cmd, diff_raw, width) {
+        Some(cmd) => match backend.run_diff_filter(cmd, diff_raw, req.width) {
             Ok(filtered) => SingleBodyPayload {
                 file_key,
                 mode,

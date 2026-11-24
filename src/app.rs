@@ -4918,10 +4918,82 @@ mod tests {
             assert!(app.is_diff_loading());
         }
         gate.release_all();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.diff_workers.is_busy() {
+            assert!(Instant::now() < deadline, "diff worker did not settle");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Reproduce a worker finishing between the UI's poll and its same-key submit.
+        app.diff_workers.submit_body(BodyRequest {
+            commit_id: cid.into(),
+            width: 120,
+            generation: app.generation,
+            strategy: BodyStrategy::PerFile {
+                selected_file: app.selected_file().cloned(),
+                filter_cmd: app.diff_filter_cmd.clone(),
+                cached_raw_diff: None,
+            },
+        });
         app.sync_diff_blocking(120);
         assert!(app.diff_plain_text().contains("FILTER[w=120]"));
         assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 2);
         assert_eq!(backend.filter_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn resize_before_first_filter_completes_reuses_raw_file_diff() {
+        use std::sync::atomic::Ordering;
+
+        let gate = Gate::new();
+        let mut backend_inner = Arc::try_unwrap(FakeBackend::new(":git")).ok().unwrap();
+        backend_inner.filter_gate = Some(Arc::clone(&gate));
+        let backend = Arc::new(backend_inner);
+        let (files, git_patch, per_file) = sample_multi_file_commit();
+        let cid = "9999999999999999999999999999999999999999";
+        backend.add_commit(cid, files, "Filter header\n", &git_patch, per_file);
+
+        let (_tmp, mut app) = fake_app(Arc::clone(&backend), &[(cid, "resize-before-filter")]);
+        app.diff_filter_cmd = Some("fake-filter".to_string());
+
+        app.sync_diff(90);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.files.is_empty() {
+            assert!(Instant::now() < deadline, "metadata never arrived");
+            app.sync_diff(90);
+            thread::sleep(Duration::from_millis(1));
+        }
+        gate.wait_entered(1);
+        assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 1);
+
+        // Resize while the first filter is still running (before App receives fetched_raw).
+        app.sync_diff(120);
+        assert!(app.is_diff_loading());
+
+        gate.release_next();
+        gate.wait_entered(2);
+        assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 1);
+
+        gate.release_all();
+        app.sync_diff_blocking(120);
+        let text = app.diff_plain_text();
+        assert!(text.contains("FILTER[w=120]"), "{text}");
+        assert!(text.contains("RAW_ALPHA"), "{text}");
+        assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.filter_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            backend.filter_seen_inputs.lock().unwrap().as_slice(),
+            &[
+                ("RAW_ALPHA\n".to_string(), 90),
+                ("RAW_ALPHA\n".to_string(), 120),
+            ]
+        );
+        assert!(
+            app.diff_cache
+                .get(cid)
+                .and_then(|entry| entry.diffs_raw.get(&Some("alpha.rs".into())))
+                .is_some(),
+            "App diff_cache should be populated by the first response's fetched_raw"
+        );
     }
 
     #[test]
