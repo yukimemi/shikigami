@@ -57,6 +57,7 @@ tokio = { version = "1.54.1", features = ["rt"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.154"
 dirs = "7.0.0"
+tempfile = "3.27"
 
 # Windows のみ: `cmd /C` 越しに `SHIKIGAMI_AI_CMD`/`SHIKIGAMI_DIFF_FILTER`
 # を呼んだとき、cmd.exe 自身が出すローカライズ済みエラー (プログラムが
@@ -65,6 +66,3 @@ dirs = "7.0.0"
 # (詳細は同ファイルのコメント参照)。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Globalization"] }
-
-[dev-dependencies]
-tempfile = "3.27"

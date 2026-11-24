@@ -5,6 +5,7 @@
 //! ([`plan_append`]) と薄い I/O ([`ignore_paths`]) に分けてあり、
 //! 追記ロジックは jj 無しでテストできる。
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -36,26 +37,20 @@ fn entry_line(path: &str) -> Result<String> {
     Ok(out)
 }
 
-/// `entry` (`/path`) と等価な既存行か。末尾 `/` の行はディレクトリ専用で
-/// 通常ファイルに効かないので等価とみなさない。先頭の空白も意味を持つ。
-/// (末尾の空白だけは gitignore が無視する。)
-fn is_equivalent(line: &str, entry: &str) -> bool {
-    let line = line.trim_end();
-    line == entry || line == &entry[1..]
-}
-
 /// `existing` に `paths` を追記した新しい内容を返す。変更不要なら `None`。
 /// 既に等価な行があるパスは足さない。常に末尾改行で終える。
 pub fn plan_append(existing: Option<&str>, paths: &[String]) -> Result<Option<String>> {
     let existing = existing.unwrap_or("");
-    let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+    let mut seen: HashSet<String> = existing.lines().map(|l| l.trim_end().to_string()).collect();
     let mut added: Vec<String> = Vec::new();
     for p in paths {
         let entry = entry_line(p)?;
-        if lines.iter().any(|l| is_equivalent(l, &entry)) {
+        // `is_equivalent` と同じ判定: 末尾空白を落とした既存行が `/path` または
+        // `path` に一致すれば重複とみなす。
+        if seen.contains(&entry) || seen.contains(&entry[1..]) {
             continue;
         }
-        lines.push(entry.clone());
+        seen.insert(entry.trim_end().to_string());
         added.push(entry);
     }
     if added.is_empty() {
