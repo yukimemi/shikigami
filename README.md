@@ -134,9 +134,10 @@ the current row; moving the cursor grows or shrinks the range, and `V` / `v` / `
 and the visual range coexist — the target set is their union. Marked rows show `●`, range rows have a
 blue background, the cursor row stays reversed, and the files title and the status bar show the count.
 
-In the files pane, every file-targeted action (`r` restore, `p` absorb, `i` ignore + untrack, `I` untrack only, `o` open) applies to the whole target set, or to
-the file under the cursor when nothing is selected. Each runs as one `jj` call (so one `u` undoes a
-batch), and `r`, `i`, and `I` ask once for the whole set ("restore 3 files …"). Files an action cannot handle are
+In the files pane, every file-targeted action (`r` restore, `p` absorb, `i` ignore + untrack,
+`I` untrack only, `o` open) applies to the whole target set, or to the file under the cursor
+when nothing is selected. Batch mutations use one mutating `jj` call (so one `u` undoes the
+jj operation), and `r`, `i`, and `I` ask once for the whole set. Files an action cannot handle are
 skipped and counted in the status line (`absorb` skips renames/copies; `open` skips deleted files when
 several are selected). jj has no index, so there is no stage/unstage. The selection is cleared after an
 action runs (a cancelled confirm keeps it), on `Esc`, and whenever the file list changes. The pane is
@@ -148,10 +149,15 @@ visual range remain in the files pane. Opening the editor or cancelling a confir
 that selection; mutating actions clear it when executed. These keys are inactive in the log pane.
 
 `i` and `I` only operate on the working-copy change (`@`) and keep files on disk.
-`I` never changes `.gitignore`: paths must already be ignored or excluded from
-`snapshot.auto-track`. If any target would immediately be tracked again, jj refuses the entire
-batch; the error is shown without adding ignore rules or retrying. Use `i` when you also want
-to add the paths to the root `.gitignore`. Deleted files are skipped; renames use the new path.
+Both verify the exact selection against the recorded `@` without snapshotting it, then pass
+the literal paths to jj through a temporary configuration outside the working copy rather than
+through command-line arguments. Deleted files are skipped; renames use the new path.
+
+`I` never changes `.gitignore`. If any selected path would immediately be tracked again,
+jj refuses the entire batch. Use `i` to add only missing rules to the root `.gitignore` before
+untracking. On failure, the TUI reloads the file list and reports the cause and, when known,
+how many targets were untracked and how many remain. Rules already written are kept; reselect
+the remaining files and retry without duplicating those rules.
 
 `[` and `]` navigate to the previous and next file directly from the diff pane.
 Navigation stops at the first or last file without wrapping.

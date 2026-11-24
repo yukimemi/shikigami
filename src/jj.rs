@@ -11,9 +11,9 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 
@@ -194,55 +194,26 @@ fn summarize_command(args: &[&str]) -> String {
     }
 }
 
-static TEMP_CONFIG_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// 作業コピー外に置く一時 `--config-file`。ドロップ時に必ず削除する。
-struct TempConfigFile {
-    path: PathBuf,
-}
-
-impl TempConfigFile {
-    fn write(contents: &str) -> Result<Self> {
-        let dir = std::env::temp_dir();
-        let pid = std::process::id();
-        for _ in 0..64 {
-            let seq = TEMP_CONFIG_SEQ.fetch_add(1, Ordering::Relaxed);
-            let path = dir.join(format!("shikigami-untrack-{pid}-{seq}.toml"));
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            match opts.open(&path) {
-                Ok(mut file) => {
-                    use std::io::Write as _;
-                    if let Err(err) = file.write_all(contents.as_bytes()) {
-                        drop(file);
-                        let _ = std::fs::remove_file(&path);
-                        return Err(err).context("cannot write temporary fileset config");
-                    }
-                    return Ok(Self { path });
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(err) => {
-                    return Err(err).context("cannot create temporary fileset config");
-                }
-            }
-        }
-        bail!("cannot allocate a unique temporary fileset config path")
+fn write_untrack_config(
+    root: &Path,
+    temp_dir: &Path,
+    contents: &str,
+) -> Result<tempfile::NamedTempFile> {
+    let temp_dir = temp_dir
+        .canonicalize()
+        .context("cannot resolve temporary directory")?;
+    if temp_dir.starts_with(root) {
+        bail!("temporary directory must be outside the working copy");
     }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempConfigFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
+    let mut config = tempfile::Builder::new()
+        .prefix("shikigami-untrack-")
+        .suffix(".toml")
+        .tempfile_in(temp_dir)
+        .context("cannot create temporary fileset config")?;
+    config
+        .write_all(contents.as_bytes())
+        .context("cannot write temporary fileset config")?;
+    Ok(config)
 }
 
 /// `jj file untrack` 失敗後の `@` 追跡一覧との照合結果。
@@ -286,7 +257,7 @@ impl fmt::Display for UntrackFailure {
 /// 保持し、実行完了または中止時のドロップで片付ける。
 pub struct UntrackBatch<'a> {
     jj: &'a Jj,
-    config: TempConfigFile,
+    config: tempfile::NamedTempFile,
     expected: BTreeSet<String>,
 }
 
@@ -840,12 +811,13 @@ impl Jj {
         }
         let expr = fileset_union_expr(&ordered);
         let toml = fileset_alias_toml(UNTRACK_ALIAS, &expr);
-        let config = TempConfigFile::write(&toml)?;
+        let config = write_untrack_config(self.root(), &std::env::temp_dir(), &toml)?;
 
         let out = self.exec_with_config(
             READ_GLOBALS,
             Some(config.path()),
             &[
+                "--ignore-working-copy",
                 "file",
                 "list",
                 "-r",
@@ -870,9 +842,10 @@ impl Jj {
         })
     }
 
-    /// エイリアスを使わずに `@` の追跡一覧を読み、失敗後の実状態を照合する。
+    /// エイリアスを使わず、再スナップショットせずに記録済みの `@` と照合する。
     fn reconcile_untrack_progress(&self, expected: &BTreeSet<String>) -> UntrackProgress {
         let Ok(out) = self.read(&[
+            "--ignore-working-copy",
             "file",
             "list",
             "-r",
@@ -1550,16 +1523,48 @@ mod tests {
     }
 
     #[test]
-    fn temp_config_file_lives_outside_repo_and_cleans_up_on_drop() {
-        let repo = tempfile::tempdir().unwrap();
-        let path = {
-            let cfg = TempConfigFile::write("[fileset-aliases]\nfoo = \"none()\"\n").unwrap();
-            let path = cfg.path().to_path_buf();
-            assert!(path.exists());
-            assert!(!path.starts_with(repo.path()));
-            path
-        };
+    fn untrack_temp_config_rejects_working_copy_directory_and_cleans_up() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("repo");
+        let inside = root.join("temp");
+        std::fs::create_dir_all(&inside).unwrap();
+        let root = root.canonicalize().unwrap();
+        let contents = "[fileset-aliases]\nfoo = \"none()\"\n";
+        let err = write_untrack_config(&root, &inside, contents).unwrap_err();
+        assert!(err.to_string().contains("outside the working copy"));
+        assert_eq!(std::fs::read_dir(inside).unwrap().count(), 0);
+
+        let config = write_untrack_config(&root, base.path(), contents).unwrap();
+        let path = config.path().to_path_buf();
+        assert!(!path.starts_with(root));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+        drop(config);
         assert!(!path.exists(), "temp config should be removed on drop");
+    }
+
+    #[test]
+    fn untrack_checks_recorded_paths_without_snapshotting() {
+        let (tmp, _) = crate::testutil::repo_or_skip!();
+        let dir = tmp.path();
+        let path = dir.join("target.txt");
+        std::fs::write(&path, "tracked").unwrap();
+        crate::testutil::run(dir, &["file", "track", "target.txt"]);
+        let jj = Jj::discover(dir).unwrap();
+        let target = "target.txt".to_string();
+
+        // 作業ツリーから消えても、次のスナップショットまでは @ に記録されている。
+        std::fs::remove_file(path).unwrap();
+        let batch = jj
+            .prepare_file_untrack(std::slice::from_ref(&target))
+            .unwrap();
+        assert_eq!(
+            jj.reconcile_untrack_progress(&BTreeSet::from([target])),
+            UntrackProgress::Verified {
+                untracked: 0,
+                remaining: 1,
+            }
+        );
+        drop(batch);
     }
 
     #[test]

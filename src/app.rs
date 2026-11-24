@@ -94,16 +94,24 @@ fn format_untrack_failure(
     failure: &UntrackFailure,
 ) -> String {
     let mut parts = Vec::new();
-    match gitignore {
-        GitignoreOutcome::Updated(added) => parts.push(format!(".gitignore updated (+{added})")),
-        GitignoreOutcome::Unchanged => {
-            if untrack_only && matches!(failure, UntrackFailure::AfterLaunch { .. }) {
-                parts.push(".gitignore unchanged; use i to ignore + untrack".to_string());
-            } else {
-                parts.push(".gitignore unchanged".to_string());
-            }
+    let mut lines = failure
+        .detail()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let first = lines.next();
+    if let Some(detail) = first
+        .filter(|line| line.starts_with("Error:"))
+        .or_else(|| lines.find(|line| line.starts_with("Error:")))
+        .or(first)
+    {
+        if detail.chars().count() > 60 {
+            let head_end = detail.char_indices().nth(19).unwrap().0;
+            let tail_start = detail.char_indices().nth_back(39).unwrap().0;
+            parts.push(format!("{}…{}", &detail[..head_end], &detail[tail_start..]));
+        } else {
+            parts.push(detail.to_string());
         }
-        GitignoreOutcome::WriteFailed => parts.push(".gitignore write failed".to_string()),
     }
     match failure {
         UntrackFailure::NotStarted { .. } => {
@@ -128,15 +136,21 @@ fn format_untrack_failure(
             parts.push("untrack outcome unknown".to_string());
         }
     }
+    match gitignore {
+        GitignoreOutcome::Updated(added) => parts.push(format!(".gitignore updated (+{added})")),
+        GitignoreOutcome::Unchanged => {
+            if untrack_only && matches!(failure, UntrackFailure::AfterLaunch { .. }) {
+                parts.push(".gitignore unchanged; use i to ignore + untrack".to_string());
+            } else {
+                parts.push(".gitignore unchanged".to_string());
+            }
+        }
+        GitignoreOutcome::WriteFailed => parts.push(".gitignore write failed".to_string()),
+    }
     if skipped > 0 {
         parts.push(format!("{skipped} skipped"));
     }
-    let detail = status_detail(failure.detail());
-    if detail.is_empty() {
-        format!("untrack failed ({})", parts.join("; "))
-    } else {
-        format!("untrack failed ({}): {detail}", parts.join("; "))
-    }
+    format!("untrack: {}", parts.join("; "))
 }
 
 /// diff pane の本文状態。共有 [`Text`] で保持し、描画時は可視行だけを切り出す。
@@ -3430,8 +3444,10 @@ mod tests {
             GitignoreOutcome::Updated(539),
             false,
             &UntrackFailure::NotStarted {
-                detail: "failed to run `jj file untrack`: filename too long (os error 206)"
-                    .to_string(),
+                detail: format!(
+                    "failed to run `jj file untrack`: {} filename too long (os error 206)",
+                    "長".repeat(70)
+                ),
             },
         );
         assert!(
@@ -3442,7 +3458,11 @@ mod tests {
             spawn_msg.contains("0/539 untracked, 539 remaining"),
             "{spawn_msg}"
         );
-        assert!(spawn_msg.contains("os error 206"), "{spawn_msg}");
+        assert!(
+            spawn_msg.starts_with("untrack: failed to run `jj f…")
+                && spawn_msg.contains("filename too long (os error 206); 0/539 untracked"),
+            "{spawn_msg}"
+        );
         assert!(!spawn_msg.contains("root:"), "{spawn_msg}");
 
         let partial_msg = format_untrack_failure(
@@ -3468,7 +3488,7 @@ mod tests {
         );
         assert!(partial_msg.contains("1 skipped"), "{partial_msg}");
         assert!(
-            partial_msg.contains("Error: interrupted | Hint: retry"),
+            partial_msg.starts_with("untrack: Error: interrupted;"),
             "{partial_msg}"
         );
 
@@ -3596,6 +3616,7 @@ mod tests {
             "keep_root.txt".to_string(),
             "bulk/keep with spaces (1).txt".to_string(),
             "bulk/残すファイル_日本語.txt".to_string(),
+            targets[1].replace("[a]", "a"),
         ];
         (targets, controls)
     }
@@ -3787,7 +3808,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_untrack_only_oversized_mixed_refusal_keeps_entire_selection_and_gitignore() {
+    fn bulk_untrack_oversized_mixed_refusal_then_ignore_retry() {
         let (targets, controls) = oversized_bulk_fixtures();
         let Some((tmp, mut app)) = setup_oversized_bulk_repo(&targets, &controls) else {
             report_skip();
@@ -3809,8 +3830,8 @@ mod tests {
             rules.push_str(line);
             rules.push_str("\r\n");
         }
-        let expected_bytes = rules.into_bytes();
-        std::fs::write(dir.join(".gitignore"), &expected_bytes).unwrap();
+        let ignore_path = dir.join(".gitignore");
+        std::fs::write(&ignore_path, &rules).unwrap();
 
         select_matching_files(&mut app, &targets);
         app.handle_key(key(KeyCode::Char('I')));
@@ -3833,10 +3854,7 @@ mod tests {
             "status bar must not dump literal fileset args: {}",
             app.status.text
         );
-        assert_eq!(
-            std::fs::read(dir.join(".gitignore")).unwrap(),
-            expected_bytes
-        );
+        assert_eq!(std::fs::read(&ignore_path).unwrap(), rules.as_bytes());
 
         let tracked = tracked_files_json(dir);
         for path in targets.iter().chain(controls.iter()) {
@@ -3845,6 +3863,29 @@ mod tests {
                 "mixed refusal must leave every path tracked: {path}"
             );
             assert!(dir.join(path).exists(), "missing on disk: {path}");
+        }
+
+        app.sync_diff_blocking(80);
+        select_matching_files(&mut app, &targets);
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+
+        // Only the two missing rules are appended to the handwritten CRLF prefix.
+        rules.push_str(&format!("/{}\n/{}\n", targets[0], targets.last().unwrap()));
+        assert_eq!(std::fs::read(&ignore_path).unwrap(), rules.as_bytes());
+        let tracked = tracked_files_json(dir);
+        for path in &targets {
+            assert!(!tracked.contains(path), "target still tracked: {path}");
+        }
+        for path in &controls {
+            assert!(tracked.contains(path), "control file was untracked: {path}");
+        }
+        for path in targets.iter().chain(controls.iter()) {
+            assert_eq!(
+                std::fs::read_to_string(dir.join(path)).unwrap(),
+                format!("payload:{path}\n")
+            );
         }
     }
 
@@ -3926,8 +3967,9 @@ mod tests {
         app.handle_key(key(KeyCode::Char('i')));
         assert!(matches!(app.mode, Mode::Confirm(_)), "{:?}", app.mode);
 
-        // Delete one selected file externally before confirming `y`.
+        // Record the external deletion in @ after opening the confirmation.
         std::fs::remove_file(dir.join("y.txt")).unwrap();
+        assert!(!tracked_files_json(dir).contains("y.txt"));
         app.handle_key(key(KeyCode::Char('y')));
 
         assert_eq!(app.status.kind, StatusKind::Error, "{:?}", app.status);
