@@ -10,8 +10,10 @@
 //!    その再実装が必要になる。
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 
@@ -92,19 +94,240 @@ const DIFF_SUMMARY_TEMPLATE: &str = concat!(
     r#" ++ ',"destination_path":' ++ json(target.path()) ++ "}\n""#,
 );
 
-/// リポジトリ相対パスを fileset のリテラルとして渡す。
-fn literal_fileset(path: &str, kind: &str) -> String {
+const FILE_LIST_JSON_TEMPLATE: &str = r#"json(path) ++ "\n""#;
+const UNTRACK_ALIAS: &str = "__shikigami_untrack_targets";
+
+/// 2 語で構成される jj サブコマンド。エラー要約時に第 2 語まで残す。
+const NESTED_SUBCOMMANDS: &[&str] = &[
+    "bookmark",
+    "config",
+    "debug",
+    "file",
+    "git",
+    "op",
+    "operation",
+    "sparse",
+    "util",
+    "workspace",
+];
+
+fn normalize_repo_path(path: &str) -> String {
     // Windows の jj だけが `\` を区切りとして出す。Unix では
-    // ファイル名の一部なので、fileset 文字列内でエスケープする。
-    let path = if cfg!(windows) {
+    // ファイル名の一部なのでそのまま残す。
+    if cfg!(windows) {
         path.replace('\\', "/")
     } else {
         path.to_owned()
-    };
-    format!(
-        "{kind}:\"{}\"",
-        path.replace('\\', "\\\\").replace('"', "\\\"")
-    )
+    }
+}
+
+/// リポジトリ相対パスを fileset のリテラルとして渡す。
+fn literal_fileset(path: &str, kind: &str) -> String {
+    let path = normalize_repo_path(path);
+    let mut escaped = String::with_capacity(path.len());
+    for ch in path.chars() {
+        match ch {
+            '\\' => escaped.push_str(r"\\"),
+            '"' => escaped.push_str(r#"\""#),
+            '\t' => escaped.push_str(r"\t"),
+            '\r' => escaped.push_str(r"\r"),
+            '\n' => escaped.push_str(r"\n"),
+            '\0' => escaped.push_str(r"\0"),
+            c if (c as u32) < 0x20 || c == '\u{007F}' => {
+                use std::fmt::Write as _;
+                let _ = write!(escaped, "\\x{:02x}", c as u32);
+            }
+            c => escaped.push(c),
+        }
+    }
+    format!("{kind}:\"{escaped}\"")
+}
+
+/// TOML v1.0 の基本文字列 (`"..."`) として安全にシリアライズする。
+fn toml_basic_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str(r"\\"),
+            '"' => out.push_str(r#"\""#),
+            '\u{0008}' => out.push_str(r"\b"),
+            '\t' => out.push_str(r"\t"),
+            '\n' => out.push_str(r"\n"),
+            '\u{000C}' => out.push_str(r"\f"),
+            '\r' => out.push_str(r"\r"),
+            c if (c as u32) < 0x20 || c == '\u{007F}' => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04X}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// 選択パス列を完全一致 (`root-file:`) の和集合 fileset 式に組み立てる。
+fn fileset_union_expr(paths: &[String]) -> String {
+    paths
+        .iter()
+        .map(|path| literal_fileset(path, "root-file"))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn fileset_alias_toml(alias: &str, expr: &str) -> String {
+    format!("[fileset-aliases]\n{alias} = {}\n", toml_basic_string(expr))
+}
+
+/// 引数全体ではなくサブコマンド名だけを抜き出す。status bar にパス列や
+/// テンプレートが溢れて OS エラー原因が隠れるのを防ぐ。
+fn summarize_command(args: &[&str]) -> String {
+    let mut parts = args.iter().copied().filter(|arg| !arg.starts_with('-'));
+    match parts.next() {
+        Some(first) if NESTED_SUBCOMMANDS.contains(&first) => match parts.next() {
+            Some(second) => format!("{first} {second}"),
+            None => first.to_string(),
+        },
+        Some(first) => first.to_string(),
+        None => String::new(),
+    }
+}
+
+static TEMP_CONFIG_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 作業コピー外に置く一時 `--config-file`。ドロップ時に必ず削除する。
+struct TempConfigFile {
+    path: PathBuf,
+}
+
+impl TempConfigFile {
+    fn write(contents: &str) -> Result<Self> {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        for _ in 0..64 {
+            let seq = TEMP_CONFIG_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("shikigami-untrack-{pid}-{seq}.toml"));
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&path) {
+                Ok(mut file) => {
+                    use std::io::Write as _;
+                    if let Err(err) = file.write_all(contents.as_bytes()) {
+                        drop(file);
+                        let _ = std::fs::remove_file(&path);
+                        return Err(err).context("cannot write temporary fileset config");
+                    }
+                    return Ok(Self { path });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(err).context("cannot create temporary fileset config");
+                }
+            }
+        }
+        bail!("cannot allocate a unique temporary fileset config path")
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempConfigFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// `jj file untrack` 失敗後の `@` 追跡一覧との照合結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UntrackProgress {
+    /// エイリアス非依存の `jj file list -r @` で確認できた件数。
+    Verified { untracked: usize, remaining: usize },
+    /// 追跡一覧の照合に失敗したため、件数を推測せず不明とする。
+    Unknown,
+}
+
+/// `jj file untrack` の失敗分類。起動前か起動後かを呼び出し側へ伝える。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UntrackFailure {
+    /// `jj file untrack` の起動前に失敗 (0 件解除が確定)。
+    NotStarted { detail: String },
+    /// `jj file untrack` が起動後に非 0 終了。実状態は `progress` で照合する。
+    AfterLaunch {
+        detail: String,
+        progress: UntrackProgress,
+    },
+}
+
+impl UntrackFailure {
+    pub fn detail(&self) -> &str {
+        match self {
+            UntrackFailure::NotStarted { detail } | UntrackFailure::AfterLaunch { detail, .. } => {
+                detail
+            }
+        }
+    }
+}
+
+impl fmt::Display for UntrackFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.detail())
+    }
+}
+
+/// 事前照合済みの `jj file untrack` バッチ。作業コピー外の一時設定ファイルを
+/// 保持し、実行完了または中止時のドロップで片付ける。
+pub struct UntrackBatch<'a> {
+    jj: &'a Jj,
+    config: TempConfigFile,
+    expected: BTreeSet<String>,
+}
+
+impl UntrackBatch<'_> {
+    /// 確定済みの fileset エイリアスを 1 回の `jj file untrack` で実行する。
+    pub fn execute(self) -> std::result::Result<String, UntrackFailure> {
+        let UntrackBatch {
+            jj,
+            config,
+            expected,
+        } = self;
+        let result = jj.exec_raw(
+            WRITE_GLOBALS,
+            Some(config.path()),
+            &["file", "untrack", UNTRACK_ALIAS],
+            OutputCapture::Full,
+            false,
+        );
+        // 一時設定ファイルは `jj file untrack` 終了直後に片付け、失敗時の
+        // 照合がエイリアスに一切依存しないことも明確にする。
+        drop(config);
+        match result {
+            Ok(out) => Ok(out),
+            Err(ExecError::Spawn { cmd_label, source }) => Err(UntrackFailure::NotStarted {
+                detail: format!("failed to run `{cmd_label}`: {source:#}"),
+            }),
+            Err(ExecError::Failed {
+                cmd_label,
+                status,
+                stderr,
+            }) => {
+                let detail = if stderr.is_empty() {
+                    format!("`{cmd_label}` failed with {status}")
+                } else {
+                    stderr
+                };
+                let progress = jj.reconcile_untrack_progress(&expected);
+                Err(UntrackFailure::AfterLaunch { detail, progress })
+            }
+        }
+    }
 }
 
 /// log に出てくる 1 change。
@@ -186,6 +409,39 @@ enum OutputCapture {
     DiffPane,
 }
 
+enum ExecError {
+    Spawn {
+        cmd_label: String,
+        source: anyhow::Error,
+    },
+    Failed {
+        cmd_label: String,
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
+}
+
+impl ExecError {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            ExecError::Spawn { cmd_label, source } => {
+                source.context(format!("failed to run `{cmd_label}`"))
+            }
+            ExecError::Failed {
+                cmd_label,
+                status,
+                stderr,
+            } => {
+                if stderr.is_empty() {
+                    anyhow::anyhow!("`{cmd_label}` failed with {status}")
+                } else {
+                    anyhow::anyhow!("{stderr}")
+                }
+            }
+        }
+    }
+}
+
 /// 1 つの jj repo に対する操作の入口。
 #[derive(Debug, Clone)]
 pub struct Jj {
@@ -254,9 +510,40 @@ impl Jj {
         capture: OutputCapture,
         include_stderr: bool,
     ) -> Result<String> {
+        self.exec_raw(globals, None, args, capture, include_stderr)
+            .map_err(ExecError::into_anyhow)
+    }
+
+    fn exec_with_config(
+        &self,
+        globals: &[&str],
+        config_file: Option<&Path>,
+        args: &[&str],
+    ) -> Result<String> {
+        self.exec_raw(globals, config_file, args, OutputCapture::Full, false)
+            .map_err(ExecError::into_anyhow)
+    }
+
+    fn exec_raw(
+        &self,
+        globals: &[&str],
+        config_file: Option<&Path>,
+        args: &[&str],
+        capture: OutputCapture,
+        include_stderr: bool,
+    ) -> std::result::Result<String, ExecError> {
+        let summary = summarize_command(args);
+        let cmd_label = if summary.is_empty() {
+            "jj".to_string()
+        } else {
+            format!("jj {summary}")
+        };
         let mut cmd = Command::new("jj");
         cmd.current_dir(&self.root);
         cmd.args(globals);
+        if let Some(path) = config_file {
+            cmd.arg("--config-file").arg(path);
+        }
         cmd.args(args);
         // 認証プロンプトが TUI の入力を奪わないよう、標準入力を閉じる。
         let out = match capture {
@@ -266,16 +553,19 @@ impl Jj {
                 .output()
                 .map_err(Into::into),
         }
-        .with_context(|| format!("failed to run `jj {}`", args.join(" ")))?;
+        .map_err(|source| ExecError::Spawn {
+            cmd_label: cmd_label.clone(),
+            source,
+        })?;
         if !out.status.success() {
             // jj のエラーは stderr に人間向けの Error/Hint で出る。
             // それをそのまま status bar に載せたいので、整形せず返す。
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let msg = stderr.trim();
-            if msg.is_empty() {
-                bail!("`jj {}` failed with {}", args.join(" "), out.status);
-            }
-            bail!("{msg}");
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(ExecError::Failed {
+                cmd_label,
+                status: out.status,
+                stderr,
+            });
         }
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         if include_stderr && !out.stderr.is_empty() {
@@ -533,14 +823,82 @@ impl Jj {
         self.write(&args)
     }
 
+    /// 選択パスを完全一致 fileset エイリアスとして作業コピー外の一時設定に
+    /// 書き出し、読み取り専用の `jj file list -r @` で `@` の追跡集合と完全一致
+    /// することを検証する。書き込み前に不一致を検出して中止できる。
+    pub fn prepare_file_untrack(&self, paths: &[String]) -> Result<UntrackBatch<'_>> {
+        let mut ordered = Vec::new();
+        let mut expected = BTreeSet::new();
+        for raw in paths {
+            let norm = normalize_repo_path(raw);
+            if expected.insert(norm.clone()) {
+                ordered.push(norm);
+            }
+        }
+        if ordered.is_empty() {
+            bail!("no paths selected to untrack");
+        }
+        let expr = fileset_union_expr(&ordered);
+        let toml = fileset_alias_toml(UNTRACK_ALIAS, &expr);
+        let config = TempConfigFile::write(&toml)?;
+
+        let out = self.exec_with_config(
+            READ_GLOBALS,
+            Some(config.path()),
+            &[
+                "file",
+                "list",
+                "-r",
+                "@",
+                "--template",
+                FILE_LIST_JSON_TEMPLATE,
+                UNTRACK_ALIAS,
+            ],
+        )?;
+        let matched = parse_file_list(&out)?;
+        if matched != expected {
+            let missing = expected.difference(&matched).count();
+            let unexpected = matched.difference(&expected).count();
+            bail!(
+                "selected paths did not match tracked files in @ ({missing} missing, {unexpected} unexpected)"
+            );
+        }
+        Ok(UntrackBatch {
+            jj: self,
+            config,
+            expected,
+        })
+    }
+
+    /// エイリアスを使わずに `@` の追跡一覧を読み、失敗後の実状態を照合する。
+    fn reconcile_untrack_progress(&self, expected: &BTreeSet<String>) -> UntrackProgress {
+        let Ok(out) = self.read(&[
+            "file",
+            "list",
+            "-r",
+            "@",
+            "--template",
+            FILE_LIST_JSON_TEMPLATE,
+        ]) else {
+            return UntrackProgress::Unknown;
+        };
+        let Ok(tracked) = parse_file_list(&out) else {
+            return UntrackProgress::Unknown;
+        };
+        let remaining = expected.iter().filter(|p| tracked.contains(*p)).count();
+        let untracked = expected.len().saturating_sub(remaining);
+        UntrackProgress::Verified {
+            untracked,
+            remaining,
+        }
+    }
+
     /// 作業コピーでの追跡を外す (`jj file untrack`)。`i` は先に
     /// `.gitignore` へ追記し、`I` は変更しない。ignore 済みでも auto-track
     /// 対象外でもなく、直ちに再追跡されるパスがあると jj はバッチ全体を拒否する。
     pub fn file_untrack(&self, paths: &[String]) -> Result<String> {
-        let filesets = root_filesets(paths);
-        let mut args = vec!["file", "untrack"];
-        args.extend(filesets.iter().map(String::as_str));
-        self.write(&args)
+        let batch = self.prepare_file_untrack(paths)?;
+        batch.execute().map_err(|err| anyhow::anyhow!("{err}"))
     }
 
     pub fn bookmark_set(&self, name: &str, rev: &str) -> Result<String> {
@@ -632,6 +990,19 @@ pub fn parse_diff_summary(out: &str) -> Result<Vec<DiffFile>> {
     out.lines()
         .map(|line| serde_json::from_str(line).context("cannot parse jj diff file entry"))
         .collect()
+}
+
+/// 1 行 1 JSON 文字列の `jj file list --template 'json(path) ++ "\n"'` を読む。
+fn parse_file_list(out: &str) -> Result<BTreeSet<String>> {
+    let mut paths = BTreeSet::new();
+    for line in out.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let path: String = serde_json::from_str(line).context("cannot parse jj file list entry")?;
+        paths.insert(path);
+    }
+    Ok(paths)
 }
 
 fn parse_change(data: &str) -> Option<Change> {
@@ -1102,6 +1473,10 @@ mod tests {
                 assert_eq!(literal_fileset(path, kind), format!("{kind}:\"{path}\""));
             }
             assert_eq!(literal_fileset("a\"b", kind), format!(r#"{kind}:"a\"b""#));
+            assert_eq!(
+                literal_fileset("a\tb\nc\r", kind),
+                format!(r#"{kind}:"a\tb\nc\r""#)
+            );
             if cfg!(windows) {
                 assert_eq!(
                     literal_fileset(r"dir\file", kind),
@@ -1114,6 +1489,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn summarize_command_omits_paths_and_flags() {
+        assert_eq!(
+            summarize_command(&["file", "untrack", "root:\"a\"", "root:\"b\""]),
+            "file untrack"
+        );
+        assert_eq!(
+            summarize_command(&["file", "list", "-r", "@", "--template", "json(path)"]),
+            "file list"
+        );
+        assert_eq!(
+            summarize_command(&["restore", "--changes-in", "@", "root:\"a\""]),
+            "restore"
+        );
+        assert_eq!(
+            summarize_command(&["bookmark", "move", "main", "--to", "@-"]),
+            "bookmark move"
+        );
+        assert_eq!(summarize_command(&["--quiet", "git", "fetch"]), "git fetch");
+        assert_eq!(summarize_command(&[]), "");
+    }
+
+    #[test]
+    fn toml_alias_serialization_escapes_special_characters_and_unicode() {
+        let paths = vec![
+            "a b/(c)&~d.txt".to_string(),
+            "日本語/file\"quote.txt".to_string(),
+            "tab\there.txt".to_string(),
+        ];
+        let expr = fileset_union_expr(&paths);
+        assert_eq!(
+            expr,
+            r#"root-file:"a b/(c)&~d.txt" | root-file:"日本語/file\"quote.txt" | root-file:"tab\there.txt""#
+        );
+        let toml = fileset_alias_toml(UNTRACK_ALIAS, &expr);
+        assert!(toml.starts_with("[fileset-aliases]\n__shikigami_untrack_targets = \""));
+        assert!(toml.contains(r#"\\\"quote.txt"#));
+        assert!(toml.contains(r#"\\there.txt"#));
+        assert!(toml.contains("日本語"));
+    }
+
+    #[test]
+    fn parse_file_list_reads_json_lines_and_rejects_malformed_input() {
+        let parsed = parse_file_list(concat!(
+            "\"a b.txt\"\n",
+            "\"nested/日本語 [1].txt\"\n",
+            "\n",
+            "\"quote\\\"slash\\\\.txt\"\n",
+        ))
+        .unwrap();
+        let expected: BTreeSet<String> = ["a b.txt", "nested/日本語 [1].txt", "quote\"slash\\.txt"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(parsed, expected);
+        assert!(parse_file_list("not-json\n").is_err());
+    }
+
+    #[test]
+    fn temp_config_file_lives_outside_repo_and_cleans_up_on_drop() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = {
+            let cfg = TempConfigFile::write("[fileset-aliases]\nfoo = \"none()\"\n").unwrap();
+            let path = cfg.path().to_path_buf();
+            assert!(path.exists());
+            assert!(!path.starts_with(repo.path()));
+            path
+        };
+        assert!(!path.exists(), "temp config should be removed on drop");
     }
 
     #[test]

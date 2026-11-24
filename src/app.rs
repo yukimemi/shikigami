@@ -23,7 +23,7 @@ use crate::diff_worker::{
     BodyOutcome, BodyRequest, BodyStrategy, DiffBackend, DiffWorkers, MetaOutcome, MetaRequest,
     RealDiffBackend, SingleBodyPayload,
 };
-use crate::jj::{Change, DiffFile, Jj, RebaseMode, Row};
+use crate::jj::{Change, DiffFile, Jj, RebaseMode, Row, UntrackFailure, UntrackProgress};
 use crate::selection::{FileSelection, plan_absorb, plan_open, plan_restore, plan_untrack};
 
 /// 一度に動かす行数 (Ctrl-d / Ctrl-u)。
@@ -77,6 +77,66 @@ fn status_detail(raw: &str) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitignoreOutcome {
+    Unchanged,
+    Updated(usize),
+    WriteFailed,
+}
+
+fn format_untrack_failure(
+    total: usize,
+    skipped: usize,
+    gitignore: GitignoreOutcome,
+    untrack_only: bool,
+    failure: &UntrackFailure,
+) -> String {
+    let mut parts = Vec::new();
+    match gitignore {
+        GitignoreOutcome::Updated(added) => parts.push(format!(".gitignore updated (+{added})")),
+        GitignoreOutcome::Unchanged => {
+            if untrack_only && matches!(failure, UntrackFailure::AfterLaunch { .. }) {
+                parts.push(".gitignore unchanged; use i to ignore + untrack".to_string());
+            } else {
+                parts.push(".gitignore unchanged".to_string());
+            }
+        }
+        GitignoreOutcome::WriteFailed => parts.push(".gitignore write failed".to_string()),
+    }
+    match failure {
+        UntrackFailure::NotStarted { .. } => {
+            parts.push(format!("0/{total} untracked, {total} remaining"));
+        }
+        UntrackFailure::AfterLaunch {
+            progress:
+                UntrackProgress::Verified {
+                    untracked,
+                    remaining,
+                },
+            ..
+        } => {
+            parts.push(format!(
+                "{untracked}/{total} untracked, {remaining} remaining"
+            ));
+        }
+        UntrackFailure::AfterLaunch {
+            progress: UntrackProgress::Unknown,
+            ..
+        } => {
+            parts.push("untrack outcome unknown".to_string());
+        }
+    }
+    if skipped > 0 {
+        parts.push(format!("{skipped} skipped"));
+    }
+    let detail = status_detail(failure.detail());
+    if detail.is_empty() {
+        format!("untrack failed ({})", parts.join("; "))
+    } else {
+        format!("untrack failed ({}): {detail}", parts.join("; "))
+    }
 }
 
 /// diff pane の本文状態。共有 [`Text`] で保持し、描画時は可視行だけを切り出す。
@@ -1302,8 +1362,8 @@ impl App {
             }
             Err(err) => {
                 // jj のエラーは複数行 (Error/Caused by/Hint)。status bar は
-                // 1 行なので、改行を ` | ` に畳んで全文を残す。
-                let text = status_detail(&err.to_string());
+                // 1 行なので、改行を ` | ` に畳んで根本原因まで残す。
+                let text = status_detail(&format!("{err:#}"));
                 self.status = Status::error(format!("{label} failed: {text}"));
             }
         }
@@ -1321,6 +1381,24 @@ impl App {
         if skipped > 0 {
             self.status.text.push_str(&format!(" ({skipped} skipped)"));
         }
+    }
+
+    /// `i` / `I` の失敗時に、`.gitignore` の更新有無・確認できた解除/残件数・
+    /// 短い根本原因を status bar へ出し、エラー表示を保ったまま一覧を再読込する。
+    fn report_untrack_failure(
+        &mut self,
+        total: usize,
+        skipped: usize,
+        gitignore: GitignoreOutcome,
+        untrack_only: bool,
+        failure: UntrackFailure,
+    ) {
+        let mut msg = format_untrack_failure(total, skipped, gitignore, untrack_only, &failure);
+        if let Err(reload_err) = self.reload() {
+            let reload_detail = status_detail(&format!("{reload_err:#}"));
+            msg.push_str(&format!(" (reload failed: {reload_detail})"));
+        }
+        self.status = Status::error(msg);
     }
 
     /// 確定した入力を実行する。
@@ -1398,15 +1476,34 @@ impl App {
                 skipped,
             } => {
                 self.file_selection.clear();
-                // `I`: `.gitignore` には一切触らず、ignore 済みでないパスは
-                // jj の拒否をそのまま報告する (全部か無しか)。
-                let result = self.jj.file_untrack(&paths);
-                let refused = result.is_err();
-                self.report_batch("untrack", count, skipped, result);
-                if refused {
-                    self.status
-                        .text
-                        .push_str(" (.gitignore unchanged; use i to ignore + untrack)");
+                // `I`: `.gitignore` には一切触らず、事前照合のうえで単一の
+                // `jj file untrack` を実行する (混在拒否は jj に任せる)。
+                let batch = match self.jj.prepare_file_untrack(&paths) {
+                    Ok(batch) => batch,
+                    Err(err) => {
+                        self.report_untrack_failure(
+                            count,
+                            skipped,
+                            GitignoreOutcome::Unchanged,
+                            true,
+                            UntrackFailure::NotStarted {
+                                detail: format!("{err:#}"),
+                            },
+                        );
+                        return;
+                    }
+                };
+                match batch.execute() {
+                    Ok(out) => self.report_batch("untrack", count, skipped, Ok(out)),
+                    Err(failure) => {
+                        self.report_untrack_failure(
+                            count,
+                            skipped,
+                            GitignoreOutcome::Unchanged,
+                            true,
+                            failure,
+                        );
+                    }
                 }
             }
             ConfirmAction::UntrackFile {
@@ -1416,23 +1513,53 @@ impl App {
                 skipped,
             } => {
                 self.file_selection.clear();
-                // `i`: jj は ignore 済みでないパスの untrack を拒否するので
-                // `.gitignore` が先。書き込みに失敗したら jj は呼ばない。
-                if let Err(err) = crate::gitignore::ignore_paths(self.jj.root(), &paths) {
-                    self.status = Status::error(format!("untrack failed: .gitignore: {err}"));
-                    return;
-                }
-                let result = self.jj.file_untrack(&paths);
-                if result.is_err() {
-                    // 追記は巻き戻さない (再実行は dedupe で冪等)。
-                    self.report_batch(
-                        "untrack (.gitignore updated, untrack failed)",
-                        count,
-                        skipped,
-                        result,
-                    );
-                } else {
-                    self.report_batch("untrack", count, skipped, result);
+                // `i`: 先に読み取り専用で対象集合を照合し、一致を確認してから
+                // `.gitignore` を重複排除付きで一度更新し、単一の `jj file untrack`
+                // を実行する。
+                let batch = match self.jj.prepare_file_untrack(&paths) {
+                    Ok(batch) => batch,
+                    Err(err) => {
+                        self.report_untrack_failure(
+                            count,
+                            skipped,
+                            GitignoreOutcome::Unchanged,
+                            false,
+                            UntrackFailure::NotStarted {
+                                detail: format!("{err:#}"),
+                            },
+                        );
+                        return;
+                    }
+                };
+                let gitignore_outcome = match crate::gitignore::ignore_paths(self.jj.root(), &paths)
+                {
+                    Ok(added) if added > 0 => GitignoreOutcome::Updated(added),
+                    Ok(_) => GitignoreOutcome::Unchanged,
+                    Err(err) => {
+                        self.report_untrack_failure(
+                            count,
+                            skipped,
+                            GitignoreOutcome::WriteFailed,
+                            false,
+                            UntrackFailure::NotStarted {
+                                detail: format!(".gitignore: {err:#}"),
+                            },
+                        );
+                        return;
+                    }
+                };
+                match batch.execute() {
+                    Ok(out) => self.report_batch("untrack", count, skipped, Ok(out)),
+                    Err(failure) => {
+                        // 追記は巻き戻さない (再実行は dedupe で冪等)。
+                        self.report_untrack_failure(
+                            count,
+                            skipped,
+                            gitignore_outcome,
+                            false,
+                            failure,
+                        );
+                    }
                 }
             }
             ConfirmAction::Undo => {
@@ -3293,6 +3420,534 @@ mod tests {
         let listed = String::from_utf8_lossy(&out.stdout);
         assert!(!listed.contains("c.txt"), "{listed}");
         assert!(dir.join("c.txt").exists());
+    }
+
+    #[test]
+    fn untrack_failure_formatting_reports_progress_gitignore_and_concise_cause() {
+        let spawn_msg = format_untrack_failure(
+            539,
+            0,
+            GitignoreOutcome::Updated(539),
+            false,
+            &UntrackFailure::NotStarted {
+                detail: "failed to run `jj file untrack`: filename too long (os error 206)"
+                    .to_string(),
+            },
+        );
+        assert!(
+            spawn_msg.contains(".gitignore updated (+539)"),
+            "{spawn_msg}"
+        );
+        assert!(
+            spawn_msg.contains("0/539 untracked, 539 remaining"),
+            "{spawn_msg}"
+        );
+        assert!(spawn_msg.contains("os error 206"), "{spawn_msg}");
+        assert!(!spawn_msg.contains("root:"), "{spawn_msg}");
+
+        let partial_msg = format_untrack_failure(
+            5,
+            1,
+            GitignoreOutcome::Updated(5),
+            false,
+            &UntrackFailure::AfterLaunch {
+                detail: "Error: interrupted\nHint: retry".to_string(),
+                progress: UntrackProgress::Verified {
+                    untracked: 2,
+                    remaining: 3,
+                },
+            },
+        );
+        assert!(
+            partial_msg.contains(".gitignore updated (+5)"),
+            "{partial_msg}"
+        );
+        assert!(
+            partial_msg.contains("2/5 untracked, 3 remaining"),
+            "{partial_msg}"
+        );
+        assert!(partial_msg.contains("1 skipped"), "{partial_msg}");
+        assert!(
+            partial_msg.contains("Error: interrupted | Hint: retry"),
+            "{partial_msg}"
+        );
+
+        let unknown_msg = format_untrack_failure(
+            5,
+            0,
+            GitignoreOutcome::Updated(5),
+            false,
+            &UntrackFailure::AfterLaunch {
+                detail: "Error: backend failed".to_string(),
+                progress: UntrackProgress::Unknown,
+            },
+        );
+        assert!(
+            unknown_msg.contains("untrack outcome unknown"),
+            "{unknown_msg}"
+        );
+        assert!(!unknown_msg.contains("remaining"), "{unknown_msg}");
+
+        let untrack_only_msg = format_untrack_failure(
+            2,
+            0,
+            GitignoreOutcome::Unchanged,
+            true,
+            &UntrackFailure::AfterLaunch {
+                detail: "Error: 'y.txt' is not ignored.".to_string(),
+                progress: UntrackProgress::Verified {
+                    untracked: 0,
+                    remaining: 2,
+                },
+            },
+        );
+        assert!(
+            untrack_only_msg.contains(".gitignore unchanged; use i to ignore + untrack"),
+            "{untrack_only_msg}"
+        );
+        assert!(
+            untrack_only_msg.contains("0/2 untracked, 2 remaining"),
+            "{untrack_only_msg}"
+        );
+
+        let write_failed_msg = format_untrack_failure(
+            2,
+            0,
+            GitignoreOutcome::WriteFailed,
+            false,
+            &UntrackFailure::NotStarted {
+                detail: ".gitignore: permission denied".to_string(),
+            },
+        );
+        assert!(
+            write_failed_msg.contains(".gitignore write failed"),
+            "{write_failed_msg}"
+        );
+        assert!(
+            write_failed_msg.contains("0/2 untracked, 2 remaining"),
+            "{write_failed_msg}"
+        );
+    }
+
+    fn windows_quote_arg(arg: &str) -> String {
+        let needs_quotes = arg.is_empty()
+            || arg
+                .chars()
+                .any(|c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '"'));
+        if !needs_quotes {
+            return arg.to_string();
+        }
+        let mut out = String::with_capacity(arg.len() + 2);
+        out.push('"');
+        let mut backslashes = 0usize;
+        for ch in arg.chars() {
+            match ch {
+                '\\' => backslashes += 1,
+                '"' => {
+                    for _ in 0..(backslashes * 2 + 1) {
+                        out.push('\\');
+                    }
+                    out.push('"');
+                    backslashes = 0;
+                }
+                _ => {
+                    for _ in 0..backslashes {
+                        out.push('\\');
+                    }
+                    backslashes = 0;
+                    out.push(ch);
+                }
+            }
+        }
+        for _ in 0..(backslashes * 2) {
+            out.push('\\');
+        }
+        out.push('"');
+        out
+    }
+
+    fn windows_quoted_cmdline_utf16_len(program: &str, args: &[String]) -> usize {
+        let mut cmdline = windows_quote_arg(program);
+        for arg in args {
+            cmdline.push(' ');
+            cmdline.push_str(&windows_quote_arg(arg));
+        }
+        cmdline.encode_utf16().count() + 1
+    }
+
+    fn oversized_bulk_fixtures() -> (Vec<String>, Vec<String>) {
+        let mut targets = Vec::with_capacity(540);
+        for i in 0..540 {
+            let dir = format!(
+                "bulk/seg_{:02}/deep_directory_padding_to_exceed_windows_createprocess_limit",
+                i % 12
+            );
+            let name = match i % 6 {
+                0 => format!("short_{i}.txt"),
+                1 => format!("spaces ({i}) [a]&~c.txt"),
+                2 => format!("日本語_ファイル_データ_{i:04}.txt"),
+                3 => format!("meta_%3A_a@b_{{x=y}}_{i:04}.txt"),
+                4 => format!("#hash_!bang_'quote_+plus_{i:04}.txt"),
+                _ => format!("long_padding_segment_0123456789_abcdef_{i:04}.txt"),
+            };
+            targets.push(format!("{dir}/{name}"));
+        }
+        let controls = vec![
+            "keep_root.txt".to_string(),
+            "bulk/keep with spaces (1).txt".to_string(),
+            "bulk/残すファイル_日本語.txt".to_string(),
+        ];
+        (targets, controls)
+    }
+
+    fn legacy_untrack_args(targets: &[String]) -> Vec<String> {
+        let mut args = vec![
+            "--no-pager".to_string(),
+            "--color".to_string(),
+            "never".to_string(),
+            "--config".to_string(),
+            "ui.editor=shikigami-refuses-to-open-an-editor".to_string(),
+            "file".to_string(),
+            "untrack".to_string(),
+        ];
+        for path in targets {
+            args.push(format!(
+                "root:\"{}\"",
+                path.replace('\\', "\\\\").replace('"', "\\\"")
+            ));
+        }
+        args
+    }
+
+    fn tracked_files_json(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+        let out = jj_stdout(
+            dir,
+            &[
+                "file",
+                "list",
+                "-r",
+                "@",
+                "--template",
+                r#"json(path) ++ "\n""#,
+            ],
+        );
+        out.lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str::<String>(line).unwrap())
+            .collect()
+    }
+
+    fn setup_oversized_bulk_repo(
+        targets: &[String],
+        controls: &[String],
+    ) -> Option<(tempfile::TempDir, App)> {
+        let (tmp, mut app) = crate::testutil::try_repo()?;
+        let dir = tmp.path();
+        for path in targets.iter().chain(controls.iter()) {
+            let full = dir.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&full, format!("payload:{path}\n")).unwrap();
+        }
+        app.reload().unwrap();
+        assert!(app.selected_change().unwrap().is_working_copy);
+        app.sync_diff_blocking(80);
+        app.focus = Focus::Files;
+        Some((tmp, app))
+    }
+
+    fn select_matching_files(app: &mut App, targets: &[String]) {
+        let target_set: HashSet<&str> = targets.iter().map(String::as_str).collect();
+        app.file_selection.clear();
+        let mut selected = 0usize;
+        for (i, file) in app.files.iter().enumerate() {
+            if target_set.contains(file.target_path().as_str()) {
+                app.file_selection.toggle(i);
+                selected += 1;
+            }
+        }
+        assert_eq!(
+            selected,
+            targets.len(),
+            "every target path must be present in app.files"
+        );
+    }
+
+    #[test]
+    fn bulk_untrack_oversized_ignore_and_untrack_only_work_above_windows_cmdline_limit() {
+        let (targets, controls) = oversized_bulk_fixtures();
+        let legacy_args = legacy_untrack_args(&targets);
+        let utf16_len = windows_quoted_cmdline_utf16_len("jj", &legacy_args);
+        assert!(
+            utf16_len > 32_767,
+            "legacy argv must exceed Windows CreateProcessW 32767 UTF-16 limit, got {utf16_len}"
+        );
+
+        // 1) Lowercase `i`: ignore + untrack above the Windows command-line limit.
+        let Some((tmp, mut app)) = setup_oversized_bulk_repo(&targets, &controls) else {
+            report_skip();
+            return;
+        };
+        let dir = tmp.path();
+
+        // Reproduce the pre-fix spawn failure directly on Windows against the same checkout.
+        #[cfg(windows)]
+        {
+            let err = crate::testutil::jj_cmd(dir)
+                .args(&legacy_args)
+                .output()
+                .expect_err("legacy argv must fail before launch on Windows");
+            assert_eq!(
+                err.raw_os_error(),
+                Some(206),
+                "expected ERROR_FILENAME_EXCED_RANGE (206), got {err:?}"
+            );
+        }
+
+        select_matching_files(&mut app, &targets);
+        app.handle_key(key(KeyCode::Char('i')));
+        let Mode::Confirm(confirm) = &app.mode else {
+            panic!("expected confirm prompt for bulk i: {:?}", app.mode);
+        };
+        assert!(confirm.prompt.contains("540 files"), "{}", confirm.prompt);
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+        assert!(!app.file_selection.is_active());
+
+        let tracked = tracked_files_json(dir);
+        for path in &targets {
+            assert!(!tracked.contains(path), "target still tracked: {path}");
+            assert_eq!(
+                std::fs::read_to_string(dir.join(path)).unwrap(),
+                format!("payload:{path}\n"),
+                "on-disk target must be preserved: {path}"
+            );
+        }
+        for path in &controls {
+            assert!(tracked.contains(path), "control file was untracked: {path}");
+            assert_eq!(
+                std::fs::read_to_string(dir.join(path)).unwrap(),
+                format!("payload:{path}\n")
+            );
+        }
+        let gitignore_before = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(gitignore_before.lines().count(), targets.len());
+        assert_eq!(
+            crate::gitignore::ignore_paths(dir, &targets).unwrap(),
+            0,
+            "deduplication must prevent duplicate .gitignore entries on retry"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".gitignore")).unwrap(),
+            gitignore_before
+        );
+
+        // 2) Uppercase `I`: untrack-only above the Windows command-line limit keeps .gitignore byte-for-byte.
+        let Some((tmp2, mut app2)) = setup_oversized_bulk_repo(&targets, &controls) else {
+            report_skip();
+            return;
+        };
+        let dir2 = tmp2.path();
+        let mut pre_ignored = String::from("# handwritten header\r\n");
+        let planned = crate::gitignore::plan_append(None, &targets)
+            .unwrap()
+            .unwrap();
+        for line in planned.lines() {
+            pre_ignored.push_str(line);
+            pre_ignored.push_str("\r\n");
+        }
+        let expected_bytes = pre_ignored.into_bytes();
+        std::fs::write(dir2.join(".gitignore"), &expected_bytes).unwrap();
+
+        select_matching_files(&mut app2, &targets);
+        app2.handle_key(key(KeyCode::Char('I')));
+        assert!(matches!(app2.mode, Mode::Confirm(_)), "{:?}", app2.mode);
+        app2.handle_key(key(KeyCode::Char('y')));
+
+        assert_eq!(app2.status.kind, StatusKind::Info, "{:?}", app2.status);
+        assert_eq!(
+            std::fs::read(dir2.join(".gitignore")).unwrap(),
+            expected_bytes,
+            "uppercase I must never modify .gitignore"
+        );
+        let tracked2 = tracked_files_json(dir2);
+        for path in &targets {
+            assert!(!tracked2.contains(path), "target still tracked: {path}");
+            assert!(dir2.join(path).exists(), "missing on disk: {path}");
+        }
+        for path in &controls {
+            assert!(
+                tracked2.contains(path),
+                "control file was untracked: {path}"
+            );
+            assert!(dir2.join(path).exists(), "missing on disk: {path}");
+        }
+    }
+
+    #[test]
+    fn bulk_untrack_only_oversized_mixed_refusal_keeps_entire_selection_and_gitignore() {
+        let (targets, controls) = oversized_bulk_fixtures();
+        let Some((tmp, mut app)) = setup_oversized_bulk_repo(&targets, &controls) else {
+            report_skip();
+            return;
+        };
+        let dir = tmp.path();
+        run(
+            dir,
+            &["config", "set", "--repo", "snapshot.auto-track", "all()"],
+        );
+        // Ignore all selected files except the first and last so chunking would
+        // have partially untracked the middle if untrack were split across calls.
+        let ignored_subset = &targets[1..targets.len() - 1];
+        let mut rules = String::from("# partial ignore rules\r\n");
+        let planned = crate::gitignore::plan_append(None, ignored_subset)
+            .unwrap()
+            .unwrap();
+        for line in planned.lines() {
+            rules.push_str(line);
+            rules.push_str("\r\n");
+        }
+        let expected_bytes = rules.into_bytes();
+        std::fs::write(dir.join(".gitignore"), &expected_bytes).unwrap();
+
+        select_matching_files(&mut app, &targets);
+        app.handle_key(key(KeyCode::Char('I')));
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert_eq!(app.status.kind, StatusKind::Error, "{:?}", app.status);
+        assert!(
+            app.status.text.contains(".gitignore unchanged"),
+            "{}",
+            app.status.text
+        );
+        assert!(app.status.text.contains("use i"), "{}", app.status.text);
+        assert!(
+            app.status.text.contains("0/540 untracked, 540 remaining"),
+            "{}",
+            app.status.text
+        );
+        assert!(
+            !app.status.text.contains("root:") && !app.status.text.contains("root-file:"),
+            "status bar must not dump literal fileset args: {}",
+            app.status.text
+        );
+        assert_eq!(
+            std::fs::read(dir.join(".gitignore")).unwrap(),
+            expected_bytes
+        );
+
+        let tracked = tracked_files_json(dir);
+        for path in targets.iter().chain(controls.iter()) {
+            assert!(
+                tracked.contains(path),
+                "mixed refusal must leave every path tracked: {path}"
+            );
+            assert!(dir.join(path).exists(), "missing on disk: {path}");
+        }
+    }
+
+    #[test]
+    fn untrack_ignore_failure_reloads_and_allows_idempotent_retry() {
+        let (tmp, mut app) = repo_or_skip!();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("ok.txt"), "ok\n").unwrap();
+        std::fs::write(dir.join("sub/blocked.txt"), "blocked\n").unwrap();
+        // A nested negation rule overrides root `.gitignore`, forcing `jj file untrack`
+        // to refuse after `i` updates the root `.gitignore`.
+        std::fs::write(dir.join("sub/.gitignore"), "!blocked.txt\n").unwrap();
+        run(
+            dir,
+            &["config", "set", "--repo", "snapshot.auto-track", "all()"],
+        );
+        app.reload().unwrap();
+        app.sync_diff_blocking(80);
+        app.focus = Focus::Files;
+
+        let targets = vec!["ok.txt".to_string(), "sub/blocked.txt".to_string()];
+        select_matching_files(&mut app, &targets);
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert_eq!(app.status.kind, StatusKind::Error, "{:?}", app.status);
+        let error_text = app.status.text.clone();
+        assert!(
+            error_text.contains(".gitignore updated (+2)"),
+            "{error_text}"
+        );
+        assert!(
+            error_text.contains("0/2 untracked, 2 remaining"),
+            "{error_text}"
+        );
+        assert!(!error_text.contains("root-file:"), "{error_text}");
+        let gitignore_after_first = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(gitignore_after_first, "/ok.txt\n/sub/blocked.txt\n");
+
+        // Reload ran while preserving the error status, so syncing shows `.gitignore`.
+        app.sync_diff_blocking(80);
+        assert_eq!(app.status.text, error_text);
+        assert!(app.files.iter().any(|f| f.target_path() == ".gitignore"));
+        let tracked = tracked_files_json(dir);
+        assert!(tracked.contains("ok.txt"));
+        assert!(tracked.contains("sub/blocked.txt"));
+
+        // Clear the nested negation and retry `i` on the remaining targets.
+        std::fs::remove_file(dir.join("sub/.gitignore")).unwrap();
+        app.reload().unwrap();
+        app.sync_diff_blocking(80);
+        select_matching_files(&mut app, &targets);
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert_eq!(app.status.kind, StatusKind::Info, "{:?}", app.status);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".gitignore")).unwrap(),
+            gitignore_after_first,
+            "retry must not duplicate .gitignore entries"
+        );
+        let tracked_after = tracked_files_json(dir);
+        assert!(!tracked_after.contains("ok.txt"));
+        assert!(!tracked_after.contains("sub/blocked.txt"));
+        assert!(dir.join("ok.txt").exists());
+        assert!(dir.join("sub/blocked.txt").exists());
+    }
+
+    #[test]
+    fn untrack_ignore_preflight_mismatch_aborts_before_writing_gitignore() {
+        let Some((tmp, mut app)) = app_with_wc_files() else {
+            report_skip();
+            return;
+        };
+        let dir = tmp.path();
+        app.file_selection.toggle(0);
+        app.file_selection.toggle(1);
+        app.handle_key(key(KeyCode::Char('i')));
+        assert!(matches!(app.mode, Mode::Confirm(_)), "{:?}", app.mode);
+
+        // Delete one selected file externally before confirming `y`.
+        std::fs::remove_file(dir.join("y.txt")).unwrap();
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert_eq!(app.status.kind, StatusKind::Error, "{:?}", app.status);
+        assert!(
+            app.status.text.contains(".gitignore unchanged"),
+            "{}",
+            app.status.text
+        );
+        assert!(
+            app.status.text.contains("0/2 untracked, 2 remaining"),
+            "{}",
+            app.status.text
+        );
+        assert!(app.status.text.contains("1 missing"), "{}", app.status.text);
+        assert!(
+            !dir.join(".gitignore").exists(),
+            "preflight failure must abort before modifying .gitignore"
+        );
+        let tracked = tracked_files_json(dir);
+        assert!(tracked.contains("x.txt"));
     }
 
     #[test]
