@@ -181,6 +181,11 @@ impl RebaseMode {
     }
 }
 
+enum OutputCapture {
+    Full,
+    DiffPane,
+}
+
 /// 1 つの jj repo に対する操作の入口。
 #[derive(Debug, Clone)]
 pub struct Jj {
@@ -218,7 +223,11 @@ impl Jj {
 
     /// 読み取り系コマンド。`--color never` で機械可読な出力にする。
     fn read(&self, args: &[&str]) -> Result<String> {
-        self.exec(&["--no-pager", "--color", "never"], args)
+        self.exec(READ_GLOBALS, args, OutputCapture::Full)
+    }
+
+    fn read_diff_pane(&self, args: &[&str]) -> Result<String> {
+        self.exec(READ_GLOBALS, args, OutputCapture::DiffPane)
     }
 
     /// 書き換え系コマンド。
@@ -231,27 +240,31 @@ impl Jj {
     /// shikigami は description を要する操作では必ず `-m` / `-u` を渡す
     /// ので、この guard が発火するのは想定外のケースだけ。
     fn write(&self, args: &[&str]) -> Result<String> {
-        self.exec_output(WRITE_GLOBALS, args, false)
+        self.exec_output(WRITE_GLOBALS, args, OutputCapture::Full, false)
     }
 
-    fn exec(&self, globals: &[&str], args: &[&str]) -> Result<String> {
-        self.exec_output(globals, args, false)
+    fn exec(&self, globals: &[&str], args: &[&str], capture: OutputCapture) -> Result<String> {
+        self.exec_output(globals, args, capture, false)
     }
 
-    fn exec_output(&self, globals: &[&str], args: &[&str], include_stderr: bool) -> Result<String> {
+    fn exec_output(
+        &self,
+        globals: &[&str],
+        args: &[&str],
+        capture: OutputCapture,
+        include_stderr: bool,
+    ) -> Result<String> {
         let mut cmd = Command::new("jj");
         cmd.current_dir(&self.root);
         cmd.args(globals);
         cmd.args(args);
         // 認証プロンプトが TUI の入力を奪わないよう、標準入力を閉じる。
-        let out = if matches!(args.first(), Some(&"diff" | &"show"))
-            || args == ["config", "get", "ui.diff-formatter"]
-        {
-            crate::diff_filter::capture(&mut cmd, None)
-        } else {
-            cmd.stdin(std::process::Stdio::null())
+        let out = match capture {
+            OutputCapture::DiffPane => crate::diff_filter::capture(&mut cmd, None),
+            OutputCapture::Full => cmd
+                .stdin(std::process::Stdio::null())
                 .output()
-                .map_err(Into::into)
+                .map_err(Into::into),
         }
         .with_context(|| format!("failed to run `jj {}`", args.join(" ")))?;
         if !out.status.success() {
@@ -276,12 +289,12 @@ impl Jj {
 
     /// Remote summaries and warnings are written to stderr even on success.
     pub fn git_fetch(&self) -> Result<String> {
-        self.exec_output(&["--no-pager", "--color", "never"], &["git", "fetch"], true)
+        self.exec_output(READ_GLOBALS, &["git", "fetch"], OutputCapture::Full, true)
     }
 
     /// Deliberately leave bookmark selection and creation policy to jj.
     pub fn git_push(&self) -> Result<String> {
-        self.exec_output(&["--no-pager", "--color", "never"], &["git", "push"], true)
+        self.exec_output(READ_GLOBALS, &["git", "push"], OutputCapture::Full, true)
     }
 
     /// trunk bookmark 名。`trunk()` の指す change に付いたローカルと
@@ -321,6 +334,7 @@ impl Jj {
             .exec_output(
                 WRITE_GLOBALS,
                 &["bookmark", "move", &name, "--to", "@-"],
+                OutputCapture::Full,
                 true,
             )
             .map_err(|err| anyhow::anyhow!("jj bookmark move {name} --to @-: {err}"))?;
@@ -369,30 +383,34 @@ impl Jj {
             .collect();
         let mut args = vec!["diff", "-r", rev, "--"];
         args.extend(filesets.iter().map(String::as_str));
-        self.exec(&["--no-pager", "--color", "always"], &args)
+        self.exec(
+            &["--no-pager", "--color", "always"],
+            &args,
+            OutputCapture::DiffPane,
+        )
     }
 
-    /// [`Jj::diff`] の色なし版。AI コマンドなど、ANSI を混ぜたくない
-    /// 消費者へ渡す用途に使う。常に change 全体 (path 絞り込みなし)。
+    /// AI コマンドに渡す change 全体の Git パッチ (ANSI なし)。
+    /// diff pane の出力上限は適用しない。
     pub fn diff_plain(&self, rev: &str) -> Result<String> {
         self.read(&["diff", "-r", rev, "--git"])
     }
 
     /// バッチ整形用の不変コミット全体 Git パッチ (`--color never --git`)。
     pub fn diff_git_full(&self, full_commit_id: &str) -> Result<String> {
-        self.read(&["diff", "-r", full_commit_id, "--git"])
+        self.read_diff_pane(&["diff", "-r", full_commit_id, "--git"])
     }
 
     /// 現在のリポジトリで有効な `ui.diff-formatter` 設定値を取得する。
     pub fn diff_formatter(&self) -> Result<String> {
-        let out = self.read(&["config", "get", "ui.diff-formatter"])?;
+        let out = self.read_diff_pane(&["config", "get", "ui.diff-formatter"])?;
         Ok(out.trim().to_string())
     }
 
     /// 選択中 change で変更されたファイルの表示名と実パスの一覧。
     /// lazygit のようにファイル単位で diff を選べるようにするための入口。
     pub fn diff_summary(&self, rev: &str) -> Result<Vec<DiffFile>> {
-        let out = self.read(&["diff", "-r", rev, "--template", DIFF_SUMMARY_TEMPLATE])?;
+        let out = self.read_diff_pane(&["diff", "-r", rev, "--template", DIFF_SUMMARY_TEMPLATE])?;
         parse_diff_summary(&out)
     }
 
@@ -401,6 +419,7 @@ impl Jj {
         self.exec(
             &["--no-pager", "--color", "always"],
             &["show", "-r", rev, "--no-patch"],
+            OutputCapture::DiffPane,
         )
     }
 
@@ -542,6 +561,8 @@ impl Jj {
         Ok(names.into_iter().collect())
     }
 }
+
+const READ_GLOBALS: &[&str] = &["--no-pager", "--color", "never"];
 
 const WRITE_GLOBALS: &[&str] = &[
     "--no-pager",
@@ -722,6 +743,50 @@ mod tests {
     #[test]
     fn trailing_blank_lines_are_dropped() {
         assert!(parse_log("\n\n").is_empty());
+    }
+
+    #[test]
+    fn ai_patch_outlives_diff_pane_output_limit() {
+        use std::io::Write;
+
+        let (repo, _) = crate::testutil::repo_or_skip!();
+        let dir = repo.path();
+        crate::testutil::run(
+            dir,
+            &[
+                "config",
+                "set",
+                "--repo",
+                "snapshot.max-new-file-size",
+                "40MiB",
+            ],
+        );
+        let mut file = std::fs::File::create(dir.join("large.txt")).unwrap();
+        let mut line = [b'x'; 1024];
+        line[1023] = b'\n';
+        let block = line.repeat(1024);
+        for _ in 0..32 {
+            file.write_all(&block).unwrap();
+        }
+        file.write_all(b"end of large patch\n").unwrap();
+        drop(file);
+        crate::testutil::run(dir, &["new"]);
+
+        let jj = Jj::discover(dir).unwrap();
+        let rows = jj.log(Some("@-")).unwrap();
+        let Row::Change { change, .. } = &rows[0] else {
+            panic!("expected the change with the large patch");
+        };
+        let rev = &change.full_commit_id;
+        let patch = jj.diff_plain(rev).unwrap();
+        assert!(patch.ends_with("+end of large patch\n"));
+        drop(patch);
+
+        let err = jj.diff_git_full(rev).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("diff output exceeds 32 MiB"),
+            "{err:#}"
+        );
     }
 
     #[test]
