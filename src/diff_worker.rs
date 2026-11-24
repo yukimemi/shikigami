@@ -6,6 +6,7 @@
 //! - **本文ワーカー**: `SHIKIGAMI_DIFF_BATCH=delta-v1` のバッチ整形または
 //!   ファイル単位フォールバック / `SHIKIGAMI_DIFF_FILTER` を実行し、ANSI 変換
 //!   済みの `Arc<Text<'static>>` を返す。
+//! - **起動時の先読み**: 表示用レーンが空いたら 1 件だけ別スレッドで取得する。
 //!
 //! 各ワーカーの未着手要求スロットは最新 1 件のみ (上書き集約) とし、実行中と
 //! 同一の要求は重複投入しない。特にバッチ整形では同じ `(commit_id, width,
@@ -33,6 +34,10 @@ use crate::jj::{DiffFile, Jj};
 pub trait DiffBackend: Send + Sync + 'static {
     fn diff_summary(&self, commit_id: &str) -> Result<Vec<DiffFile>>;
     fn show(&self, commit_id: &str) -> Result<String>;
+    /// 先読み用。作業コピーを持つバックエンドはスナップショットを省略する。
+    fn warm_metadata(&self, commit_id: &str) -> (Result<Vec<DiffFile>>, Result<String>) {
+        (self.diff_summary(commit_id), self.show(commit_id))
+    }
     fn diff_formatter(&self) -> Result<String>;
     fn diff_git_full(&self, commit_id: &str) -> Result<String>;
     fn diff_file(&self, commit_id: &str, paths: &[String]) -> Result<String>;
@@ -63,6 +68,10 @@ impl DiffBackend for RealDiffBackend {
 
     fn show(&self, commit_id: &str) -> Result<String> {
         self.jj.show(commit_id)
+    }
+
+    fn warm_metadata(&self, commit_id: &str) -> (Result<Vec<DiffFile>>, Result<String>) {
+        self.jj.warm_metadata(commit_id)
     }
 
     fn diff_formatter(&self) -> Result<String> {
@@ -125,6 +134,7 @@ pub enum MetaOutcome {
 pub struct MetaResponse {
     pub commit_id: String,
     pub generation: u64,
+    pub(crate) warmed: bool,
     pub outcome: MetaOutcome,
 }
 
@@ -242,6 +252,9 @@ struct MetaSlot {
 struct MetaSlotState {
     pending: Option<MetaRequest>,
     in_flight: Option<(String, u64)>,
+    warming: Option<(String, u64)>,
+    completed_warm: Option<(String, u64)>,
+    unread_replies: usize,
     shutdown: bool,
 }
 
@@ -261,6 +274,8 @@ struct BodySlotState {
 pub struct DiffWorkers {
     meta_slot: Arc<MetaSlot>,
     meta_rx: mpsc::Receiver<MetaResponse>,
+    meta_tx: mpsc::Sender<MetaResponse>,
+    backend: Arc<dyn DiffBackend>,
     body_slot: Arc<BodySlot>,
     body_rx: mpsc::Receiver<BodyResponse>,
 }
@@ -271,6 +286,9 @@ impl DiffWorkers {
             state: Mutex::new(MetaSlotState {
                 pending: None,
                 in_flight: None,
+                warming: None,
+                completed_warm: None,
+                unread_replies: 0,
                 shutdown: false,
             }),
             cv: Condvar::new(),
@@ -279,6 +297,7 @@ impl DiffWorkers {
         {
             let slot = Arc::clone(&meta_slot);
             let backend = Arc::clone(&backend);
+            let meta_tx = meta_tx.clone();
             thread::spawn(move || meta_worker_loop(slot, backend, meta_tx));
         }
 
@@ -295,12 +314,15 @@ impl DiffWorkers {
         let (body_tx, body_rx) = mpsc::channel();
         {
             let slot = Arc::clone(&body_slot);
+            let backend = Arc::clone(&backend);
             thread::spawn(move || body_worker_loop(slot, backend, body_tx));
         }
 
         Self {
             meta_slot,
             meta_rx,
+            meta_tx,
+            backend,
             body_slot,
             body_rx,
         }
@@ -308,16 +330,40 @@ impl DiffWorkers {
 
     pub fn submit_meta(&self, req: MetaRequest) {
         let mut guard = self.meta_slot.state.lock().unwrap();
-        if guard
-            .in_flight
-            .as_ref()
-            .is_some_and(|(cid, req_gen)| cid == &req.commit_id && *req_gen == req.generation)
+        let matches =
+            |(cid, req_gen): &(String, u64)| cid == &req.commit_id && *req_gen == req.generation;
+        if guard.in_flight.as_ref().is_some_and(matches)
+            || guard.warming.as_ref().is_some_and(matches)
+            || guard.completed_warm.as_ref().is_some_and(matches)
         {
             guard.pending = None;
             return;
         }
         guard.pending = Some(req);
         self.meta_slot.cv.notify_one();
+    }
+
+    /// 両レーンが空であることを確認した UI だけが先読みを起動する。
+    pub(crate) fn submit_warm_meta(&self, req: MetaRequest) {
+        let slot = Arc::clone(&self.meta_slot);
+        let backend = Arc::clone(&self.backend);
+        let tx = self.meta_tx.clone();
+        let mut guard = self.meta_slot.state.lock().unwrap();
+        guard.warming = Some((req.commit_id.clone(), req.generation));
+        if thread::Builder::new()
+            .spawn(move || {
+                let response = fetch_meta(&*backend, req, true);
+                let mut guard = slot.state.lock().unwrap();
+                let key = guard.warming.take();
+                if !guard.shutdown && tx.send(response).is_ok() {
+                    guard.unread_replies += 1;
+                    guard.completed_warm = key;
+                }
+            })
+            .is_err()
+        {
+            guard.warming = None;
+        }
     }
 
     pub fn submit_body(&self, req: BodyRequest) {
@@ -347,7 +393,13 @@ impl DiffWorkers {
     }
 
     pub fn try_recv_meta(&self) -> Option<MetaResponse> {
-        self.meta_rx.try_recv().ok()
+        let mut guard = self.meta_slot.state.lock().unwrap();
+        let response = self.meta_rx.try_recv().ok()?;
+        guard.unread_replies -= 1;
+        if response.warmed {
+            guard.completed_warm = None;
+        }
+        Some(response)
     }
 
     pub fn try_recv_body(&self) -> Option<BodyResponse> {
@@ -362,12 +414,27 @@ impl DiffWorkers {
 
     pub fn is_busy(&self) -> bool {
         let meta = self.meta_slot.state.lock().unwrap();
-        if meta.pending.is_some() || meta.in_flight.is_some() {
+        if meta.pending.is_some() || meta.in_flight.is_some() || meta.warming.is_some() {
             return true;
         }
         drop(meta);
         let body = self.body_slot.state.lock().unwrap();
         body.pending.is_some() || body.in_flight.is_some()
+    }
+
+    /// `is_busy` と異なり、まだ UI が読んでいない完了応答も数える。
+    pub(crate) fn is_idle(&self) -> bool {
+        let meta = self.meta_slot.state.lock().unwrap();
+        if meta.pending.is_some()
+            || meta.in_flight.is_some()
+            || meta.warming.is_some()
+            || meta.unread_replies != 0
+        {
+            return false;
+        }
+        drop(meta);
+        let body = self.body_slot.state.lock().unwrap();
+        body.pending.is_none() && body.in_flight.is_none() && body.unread_replies == 0
     }
 }
 
@@ -409,47 +476,54 @@ fn meta_worker_loop(
             }
         };
 
-        let outcome = if let Some((files, header_raw)) = req.cached {
-            MetaOutcome::Ready {
-                files,
-                header_text: parse_ansi(&header_raw),
-                header_raw: None,
-            }
-        } else {
-            match (
-                backend.diff_summary(&req.commit_id),
-                backend.show(&req.commit_id),
-            ) {
-                (Ok(files), Ok(header_raw)) => {
-                    let header_text = parse_ansi(&header_raw);
-                    MetaOutcome::Ready {
-                        files: Arc::new(files),
-                        header_raw: Some(Arc::new(header_raw)),
-                        header_text,
-                    }
-                }
-                (files_res, header_res) => {
-                    let files = Arc::new(files_res.unwrap_or_default());
-                    let header_raw = header_res.unwrap_or_else(|err| format!("{err:#}"));
-                    let header_text = parse_ansi(&header_raw);
-                    MetaOutcome::Error { files, header_text }
-                }
-            }
-        };
-
-        let send_err = tx
-            .send(MetaResponse {
-                commit_id: req.commit_id,
-                generation: req.generation,
-                outcome,
-            })
-            .is_err();
-
+        let response = fetch_meta(&*backend, req, false);
         let mut guard = slot.state.lock().unwrap();
-        guard.in_flight = None;
-        if send_err || guard.shutdown {
+        if guard.shutdown || tx.send(response).is_err() {
             return;
         }
+        guard.unread_replies += 1;
+        guard.in_flight = None;
+    }
+}
+
+fn fetch_meta(backend: &dyn DiffBackend, req: MetaRequest, warmed: bool) -> MetaResponse {
+    let outcome = if let Some((files, header_raw)) = req.cached {
+        MetaOutcome::Ready {
+            files,
+            header_text: parse_ansi(&header_raw),
+            header_raw: None,
+        }
+    } else {
+        let metadata = if warmed {
+            backend.warm_metadata(&req.commit_id)
+        } else {
+            (
+                backend.diff_summary(&req.commit_id),
+                backend.show(&req.commit_id),
+            )
+        };
+        match metadata {
+            (Ok(files), Ok(header_raw)) => {
+                let header_text = parse_ansi(&header_raw);
+                MetaOutcome::Ready {
+                    files: Arc::new(files),
+                    header_raw: Some(Arc::new(header_raw)),
+                    header_text,
+                }
+            }
+            (files_res, header_res) => {
+                let files = Arc::new(files_res.unwrap_or_default());
+                let header_raw = header_res.unwrap_or_else(|err| format!("{err:#}"));
+                let header_text = parse_ansi(&header_raw);
+                MetaOutcome::Error { files, header_text }
+            }
+        }
+    };
+    MetaResponse {
+        commit_id: req.commit_id,
+        generation: req.generation,
+        warmed,
+        outcome,
     }
 }
 

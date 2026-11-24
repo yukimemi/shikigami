@@ -340,6 +340,8 @@ pub struct App {
     /// 起動時にバックグラウンドで走らせた `jj log`/`jj status` の
     /// 結果を受け取るチャネル。終わるまでは `Some` で残る。
     startup_rx: Option<mpsc::Receiver<ReloadResult>>,
+    /// 初期表示が落ち着いてから先読みする次のコミットのメタデータ要求。
+    startup_warm_meta: Option<MetaRequest>,
     /// 起動時の `jj log`/`jj status` が失敗したときのエラー。
     startup_error: Option<anyhow::Error>,
     /// 実行中の AI メッセージ生成 (Ctrl-g)。
@@ -411,6 +413,7 @@ impl App {
             batch_fallback_widths: HashMap::new(),
             pending_filter_error: None,
             startup_rx: None,
+            startup_warm_meta: None,
             startup_error: None,
             ai_job: None,
             remote_job: None,
@@ -462,6 +465,18 @@ impl App {
             Ok(Ok((rows, working_copy))) => {
                 self.apply_rows(rows, working_copy);
                 self.startup_rx = None;
+                self.startup_warm_meta =
+                    self.rows
+                        .iter()
+                        .skip(self.selected + 1)
+                        .find_map(|row| match row {
+                            Row::Change { change, .. } => Some(MetaRequest {
+                                commit_id: change.full_commit_id.clone(),
+                                generation: self.generation,
+                                cached: None,
+                            }),
+                            Row::Connector(_) => None,
+                        });
                 if self.status.text == "loading…" {
                     self.status = Status::info("? for help");
                 }
@@ -515,7 +530,7 @@ impl App {
         let preserve_fresh = self.status_fresh;
         self.sync_diff(diff_width);
         let deadline = Instant::now() + TEST_WORKER_TIMEOUT;
-        while self.is_diff_loading() {
+        while self.is_diff_loading() || !self.diff_workers.is_idle() {
             assert!(
                 Instant::now() < deadline,
                 "timed out waiting for diff worker"
@@ -623,6 +638,7 @@ impl App {
     fn begin_remote(&mut self, action: RemoteAction) {
         // A startup snapshot must never overwrite the post-operation log.
         self.startup_rx = None;
+        self.startup_warm_meta = None;
         self.diff_workers.cancel_all_pending();
         let jj = self.jj.clone();
         let revset = self.revset.clone();
@@ -721,6 +737,7 @@ impl App {
         // startup 結果に上書きされないよう、その受信を捨てておく
         // (`poll_startup` は `startup_rx` が `None` なら何もしない)。
         self.startup_rx = None;
+        self.startup_warm_meta = None;
         let rows = self.jj.log(self.revset.as_deref())?;
         let working_copy = self.jj.status_line().unwrap_or_default();
         self.apply_rows(rows, working_copy);
@@ -760,6 +777,7 @@ impl App {
         }
         // 世代を進めて再読込前の未着手要求を破棄し、遅着結果を拒否する。
         self.generation = self.generation.wrapping_add(1);
+        self.startup_warm_meta = None;
         self.diff_workers.cancel_all_pending();
         self.pending_filter_error = None;
         self.loading_meta_commit = None;
@@ -813,12 +831,12 @@ impl App {
             .position(|&i| i == self.selected)
             .unwrap_or(0);
         let next = (cur as isize + delta).clamp(0, changes.len() as isize - 1) as usize;
-        self.selected = changes[next];
+        self.select_row(changes[next]);
     }
 
     pub fn select_first(&mut self) {
         if let Some(i) = self.first_change_index() {
-            self.selected = i;
+            self.select_row(i);
         }
     }
 
@@ -828,7 +846,14 @@ impl App {
             .iter()
             .rposition(|row| matches!(row, Row::Change { .. }))
         {
-            self.selected = i;
+            self.select_row(i);
+        }
+    }
+
+    fn select_row(&mut self, index: usize) {
+        if self.selected != index {
+            self.startup_warm_meta = None;
+            self.selected = index;
         }
     }
 
@@ -906,8 +931,18 @@ impl App {
                     }
                 }
                 MetaOutcome::Error { files, header_text } => {
-                    // 失敗はキャッシュしない。現在選択中の commit だけ表示に反映する。
-                    if is_current {
+                    if resp.warmed {
+                        // 先読みの失敗は表示せず、選択済みなら通常の取得をやり直す。
+                        if self
+                            .loading_meta_commit
+                            .as_ref()
+                            .is_some_and(|(id, generation)| {
+                                id == &resp.commit_id && *generation == resp.generation
+                            })
+                        {
+                            self.loading_meta_commit = None;
+                        }
+                    } else if is_current {
                         self.show_diff_meta(resp.commit_id, files, header_text);
                     }
                 }
@@ -977,6 +1012,22 @@ impl App {
                 }
             }
         }
+    }
+
+    fn warm_startup_meta(&mut self) {
+        if self.startup_warm_meta.is_none() || !self.diff_workers.is_idle() {
+            return;
+        }
+        let Some(mut req) = self.startup_warm_meta.take() else {
+            return;
+        };
+        if let Some(entry) = self.diff_cache.get(&req.commit_id) {
+            if self.header_cache.get(&req.commit_id).is_some() {
+                return;
+            }
+            req.cached = Some((Arc::clone(&entry.files), Arc::clone(&entry.header_raw)));
+        }
+        self.diff_workers.submit_warm_meta(req);
     }
 
     fn show_diff_meta(
@@ -1150,6 +1201,7 @@ impl App {
             {
                 self.status = Status::error(err_msg);
             }
+            self.warm_startup_meta();
             return;
         }
 
@@ -1176,6 +1228,7 @@ impl App {
             self.loading_diff_key = None;
             self.pending_filter_error = None;
             self.diff_workers.cancel_pending_body();
+            self.warm_startup_meta();
             return;
         }
 
@@ -4391,6 +4444,8 @@ mod tests {
         fail_delta_width: Option<u16>,
         delta_gate: Option<Arc<Gate>>,
         filter_gate: Option<Arc<Gate>>,
+        summary_gate: Option<(&'static str, Arc<Gate>)>,
+        summary_calls: std::sync::Mutex<Vec<String>>,
         fail_filter_width: Option<u16>,
         diff_git_calls: std::sync::atomic::AtomicUsize,
         delta_batch_calls: std::sync::atomic::AtomicUsize,
@@ -4411,6 +4466,8 @@ mod tests {
                 fail_delta_width: None,
                 delta_gate: None,
                 filter_gate: None,
+                summary_gate: None,
+                summary_calls: std::sync::Mutex::new(Vec::new()),
                 fail_filter_width: None,
                 diff_git_calls: std::sync::atomic::AtomicUsize::new(0),
                 delta_batch_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -4449,6 +4506,12 @@ mod tests {
 
     impl DiffBackend for FakeBackend {
         fn diff_summary(&self, commit_id: &str) -> Result<Vec<DiffFile>> {
+            self.summary_calls.lock().unwrap().push(commit_id.into());
+            if let Some((id, gate)) = &self.summary_gate
+                && *id == commit_id
+            {
+                gate.arrive_and_wait();
+            }
             self.files
                 .lock()
                 .unwrap()
@@ -4572,6 +4635,205 @@ mod tests {
         app.apply_rows(rows, "chg0".to_string());
         app.status = Status::info("? for help");
         (tmp, app)
+    }
+
+    const STARTUP_FIRST: &str = "1111111100000000000000000000000000000000";
+    const STARTUP_NEXT: &str = "1111111111111111111111111111111111111111";
+    const STARTUP_LAST: &str = "3333333333333333333333333333333333333333";
+
+    fn fake_startup(backend: Arc<FakeBackend>) -> (tempfile::TempDir, App) {
+        let (files, patch, per_file) = sample_multi_file_commit();
+        backend.add_commit(
+            STARTUP_FIRST,
+            vec![],
+            "first header",
+            "",
+            vec![(vec![], "first diff".into())],
+        );
+        backend.add_commit(STARTUP_NEXT, files, "next header", &patch, per_file);
+        backend.add_commit(STARTUP_LAST, vec![], "last header", "", vec![]);
+        let (tmp, mut app) = fake_app(
+            backend,
+            &[
+                (STARTUP_FIRST, "first commit"),
+                (STARTUP_NEXT, "next commit"),
+                (STARTUP_LAST, "last commit"),
+            ],
+        );
+        let mut rows = std::mem::take(&mut app.rows);
+        rows.insert(1, Row::Connector("│".into()));
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok((rows, "chg0".into()))).unwrap();
+        app.startup_rx = Some(rx);
+        app.poll_startup();
+        (tmp, app)
+    }
+
+    #[test]
+    fn startup_warm_waits_for_visible_body_then_caches_only_next_metadata() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let gate = Gate::new();
+        let mut backend = Arc::try_unwrap(FakeBackend::new(":git")).ok().unwrap();
+        backend.filter_gate = Some(Arc::clone(&gate));
+        let backend = Arc::new(backend);
+        let (_tmp, mut app) = fake_startup(Arc::clone(&backend));
+        app.diff_filter_cmd = Some("fake-filter".into());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(app.diff_body, DiffBody::LoadingDiff) {
+            assert!(Instant::now() < deadline, "initial metadata did not arrive");
+            app.sync_diff(80);
+            thread::yield_now();
+        }
+        gate.wait_entered(1);
+        app.sync_diff(80);
+        let calls_during_initial_body = backend.summary_calls.lock().unwrap().clone();
+        gate.release_all();
+        app.sync_diff_blocking(80);
+
+        assert_eq!(calls_during_initial_body, [STARTUP_FIRST]);
+        assert_eq!(
+            *backend.summary_calls.lock().unwrap(),
+            [STARTUP_FIRST, STARTUP_NEXT]
+        );
+        assert_eq!(backend.diff_file_calls.load(SeqCst), 1);
+        assert!(app.diff_plain_text().contains("first header"));
+        app.move_selection(1);
+        app.sync_diff(80);
+        assert_eq!(app.files[0].path, "alpha.rs");
+        assert!(app.diff_plain_text().contains("next header"));
+        app.sync_diff_blocking(80);
+        assert_eq!(
+            *backend.summary_calls.lock().unwrap(),
+            [STARTUP_FIRST, STARTUP_NEXT]
+        );
+        assert_eq!(backend.diff_file_calls.load(SeqCst), 2);
+    }
+
+    #[test]
+    fn startup_warm_reuses_in_flight_metadata_when_next_commit_is_selected() {
+        select_during_startup_warm(false);
+    }
+
+    #[test]
+    fn startup_warm_failure_is_hidden_and_retried_on_selection() {
+        select_during_startup_warm(true);
+    }
+
+    #[test]
+    fn startup_warm_does_not_block_unrelated_visible_metadata() {
+        let gate = Gate::new();
+        let mut backend = Arc::try_unwrap(FakeBackend::new(":git")).ok().unwrap();
+        backend.summary_gate = Some((STARTUP_NEXT, Arc::clone(&gate)));
+        let (_tmp, mut app) = fake_startup(Arc::new(backend));
+
+        wait_for_startup_warm(&mut app, &gate);
+        app.select_last();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let displayed = loop {
+            app.sync_diff(80);
+            if app.diff_plain_text().contains("last header") {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        gate.release_all();
+        app.sync_diff_blocking(80);
+        assert!(displayed, "the last commit waited for startup warming");
+    }
+
+    #[test]
+    fn startup_warm_does_not_snapshot_the_working_copy() {
+        let (tmp, mut app) = repo_or_skip!();
+        let working_copy = app.selected_change().unwrap().full_commit_id.clone();
+        app.move_selection(1);
+        let next = app.selected_change().unwrap().full_commit_id.clone();
+        std::fs::write(tmp.path().join("a.txt"), "unsnapshotted edit\n").unwrap();
+
+        app.diff_workers.submit_warm_meta(MetaRequest {
+            commit_id: next,
+            generation: app.generation,
+            cached: None,
+        });
+        let deadline = Instant::now() + TEST_WORKER_TIMEOUT;
+        let response = loop {
+            if let Some(response) = app.diff_workers.try_recv_meta() {
+                break response;
+            }
+            assert!(Instant::now() < deadline, "warm request did not settle");
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(matches!(response.outcome, MetaOutcome::Ready { .. }));
+
+        let output = crate::testutil::jj_cmd(tmp.path())
+            .args([
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                "@",
+                "-T",
+                "commit_id",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, working_copy.as_bytes());
+    }
+
+    fn select_during_startup_warm(fail_warm: bool) {
+        let gate = Gate::new();
+        let mut backend = Arc::try_unwrap(FakeBackend::new(":git")).ok().unwrap();
+        backend.summary_gate = Some((STARTUP_NEXT, Arc::clone(&gate)));
+        let backend = Arc::new(backend);
+        let (_tmp, mut app) = fake_startup(Arc::clone(&backend));
+
+        wait_for_startup_warm(&mut app, &gate);
+        app.move_selection(1);
+        app.sync_diff(80);
+        assert!(matches!(app.diff_body, DiffBody::LoadingMeta));
+        let missing_files = if fail_warm {
+            backend.files.lock().unwrap().remove(STARTUP_NEXT)
+        } else {
+            None
+        };
+        gate.release_all();
+        if let Some(files) = missing_files {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.diff_workers.is_busy() {
+                assert!(Instant::now() < deadline, "warm request did not settle");
+                thread::yield_now();
+            }
+            app.poll_diff();
+            assert!(matches!(app.diff_body, DiffBody::LoadingMeta));
+            backend
+                .files
+                .lock()
+                .unwrap()
+                .insert(STARTUP_NEXT.into(), files);
+        }
+        app.sync_diff_blocking(80);
+        assert_eq!(app.files[0].path, "alpha.rs");
+        assert!(app.diff_plain_text().contains("next header"));
+        let mut expected = vec![STARTUP_FIRST, STARTUP_NEXT];
+        if fail_warm {
+            expected.push(STARTUP_NEXT);
+        }
+        assert_eq!(*backend.summary_calls.lock().unwrap(), expected);
+    }
+
+    fn wait_for_startup_warm(app: &mut App, gate: &Gate) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(app.diff_body, DiffBody::Ready(_)) {
+            assert!(Instant::now() < deadline, "initial diff did not arrive");
+            app.sync_diff(80);
+            thread::yield_now();
+        }
+        gate.wait_entered(1);
     }
 
     type SampleCommit = (Vec<DiffFile>, String, Vec<(Vec<String>, String)>);

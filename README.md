@@ -287,6 +287,10 @@ Startup and diff preparation never block the UI event loop: the alternate screen
 and `jj log`, diff metadata, diff formatting (`delta` / `SHIKIGAMI_DIFF_FILTER`), and ANSI parsing
 all run on background workers with latest-selection coalescing so cursor movement, visual range
 selection, and quit remain responsive even on slow formatters or Windows.
+Once the first diff is ready and both workers are idle, startup warms only the next commit's
+file list and header in a separate background job, so other commits can load while it runs.
+The next commit's diff body is still fetched and formatted on demand.
+The warmup uses a full commit ID and skips the working-copy snapshot.
 
 ## Development
 
