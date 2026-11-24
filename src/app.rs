@@ -4746,6 +4746,45 @@ mod tests {
         assert!(displayed, "the last commit waited for startup warming");
     }
 
+    #[test]
+    fn startup_warm_does_not_snapshot_the_working_copy() {
+        let (tmp, mut app) = repo_or_skip!();
+        let working_copy = app.selected_change().unwrap().full_commit_id.clone();
+        app.move_selection(1);
+        let next = app.selected_change().unwrap().full_commit_id.clone();
+        std::fs::write(tmp.path().join("a.txt"), "unsnapshotted edit\n").unwrap();
+
+        app.diff_workers.submit_warm_meta(MetaRequest {
+            commit_id: next,
+            generation: app.generation,
+            cached: None,
+        });
+        let deadline = Instant::now() + TEST_WORKER_TIMEOUT;
+        let response = loop {
+            if let Some(response) = app.diff_workers.try_recv_meta() {
+                break response;
+            }
+            assert!(Instant::now() < deadline, "warm request did not settle");
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(matches!(response.outcome, MetaOutcome::Ready { .. }));
+
+        let output = crate::testutil::jj_cmd(tmp.path())
+            .args([
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                "@",
+                "-T",
+                "commit_id",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, working_copy.as_bytes());
+    }
+
     fn select_during_startup_warm(fail_warm: bool) {
         let gate = Gate::new();
         let mut backend = Arc::try_unwrap(FakeBackend::new(":git")).ok().unwrap();

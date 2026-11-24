@@ -290,6 +290,7 @@ selection, and quit remain responsive even on slow formatters or Windows.
 Once the first diff is ready and both workers are idle, startup warms only the next commit's
 file list and header in a separate background job, so other commits can load while it runs.
 The next commit's diff body is still fetched and formatted on demand.
+The warmup uses a full commit ID and skips the working-copy snapshot.
 
 ## Development
 

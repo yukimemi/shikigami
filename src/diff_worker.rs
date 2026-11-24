@@ -34,6 +34,10 @@ use crate::jj::{DiffFile, Jj};
 pub trait DiffBackend: Send + Sync + 'static {
     fn diff_summary(&self, commit_id: &str) -> Result<Vec<DiffFile>>;
     fn show(&self, commit_id: &str) -> Result<String>;
+    /// 先読み用。作業コピーを持つバックエンドはスナップショットを省略する。
+    fn warm_metadata(&self, commit_id: &str) -> (Result<Vec<DiffFile>>, Result<String>) {
+        (self.diff_summary(commit_id), self.show(commit_id))
+    }
     fn diff_formatter(&self) -> Result<String>;
     fn diff_git_full(&self, commit_id: &str) -> Result<String>;
     fn diff_file(&self, commit_id: &str, paths: &[String]) -> Result<String>;
@@ -64,6 +68,10 @@ impl DiffBackend for RealDiffBackend {
 
     fn show(&self, commit_id: &str) -> Result<String> {
         self.jj.show(commit_id)
+    }
+
+    fn warm_metadata(&self, commit_id: &str) -> (Result<Vec<DiffFile>>, Result<String>) {
+        self.jj.warm_metadata(commit_id)
     }
 
     fn diff_formatter(&self) -> Result<String> {
@@ -486,10 +494,15 @@ fn fetch_meta(backend: &dyn DiffBackend, req: MetaRequest, warmed: bool) -> Meta
             header_raw: None,
         }
     } else {
-        match (
-            backend.diff_summary(&req.commit_id),
-            backend.show(&req.commit_id),
-        ) {
+        let metadata = if warmed {
+            backend.warm_metadata(&req.commit_id)
+        } else {
+            (
+                backend.diff_summary(&req.commit_id),
+                backend.show(&req.commit_id),
+            )
+        };
+        match metadata {
             (Ok(files), Ok(header_raw)) => {
                 let header_text = parse_ansi(&header_raw);
                 MetaOutcome::Ready {

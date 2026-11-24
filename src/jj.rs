@@ -410,16 +410,42 @@ impl Jj {
     /// 選択中 change で変更されたファイルの表示名と実パスの一覧。
     /// lazygit のようにファイル単位で diff を選べるようにするための入口。
     pub fn diff_summary(&self, rev: &str) -> Result<Vec<DiffFile>> {
-        let out = self.read_diff_pane(&["diff", "-r", rev, "--template", DIFF_SUMMARY_TEMPLATE])?;
+        self.diff_summary_with_globals(rev, READ_GLOBALS)
+    }
+
+    fn diff_summary_with_globals(&self, rev: &str, globals: &[&str]) -> Result<Vec<DiffFile>> {
+        let out = self.exec(
+            globals,
+            &["diff", "-r", rev, "--template", DIFF_SUMMARY_TEMPLATE],
+            OutputCapture::DiffPane,
+        )?;
         parse_diff_summary(&out)
     }
 
     /// diff pane のヘッダに出す `jj show --no-patch` 相当。
     pub fn show(&self, rev: &str) -> Result<String> {
+        self.show_with_globals(rev, &["--no-pager", "--color", "always"])
+    }
+
+    fn show_with_globals(&self, rev: &str, globals: &[&str]) -> Result<String> {
         self.exec(
-            &["--no-pager", "--color", "always"],
+            globals,
             &["show", "-r", rev, "--no-patch"],
             OutputCapture::DiffPane,
+        )
+    }
+
+    /// 完全なコミット ID が既知なので、先読みでは作業コピーをスナップショットしない。
+    pub(crate) fn warm_metadata(&self, commit_id: &str) -> (Result<Vec<DiffFile>>, Result<String>) {
+        (
+            self.diff_summary_with_globals(
+                commit_id,
+                &["--ignore-working-copy", "--no-pager", "--color", "never"],
+            ),
+            self.show_with_globals(
+                commit_id,
+                &["--ignore-working-copy", "--no-pager", "--color", "always"],
+            ),
         )
     }
 
