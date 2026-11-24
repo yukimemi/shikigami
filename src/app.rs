@@ -4918,6 +4918,22 @@ mod tests {
             assert!(app.is_diff_loading());
         }
         gate.release_all();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.diff_workers.is_busy() {
+            assert!(Instant::now() < deadline, "diff worker did not settle");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Reproduce a worker finishing between the UI's poll and its same-key submit.
+        app.diff_workers.submit_body(BodyRequest {
+            commit_id: cid.into(),
+            width: 120,
+            generation: app.generation,
+            strategy: BodyStrategy::PerFile {
+                selected_file: app.selected_file().cloned(),
+                filter_cmd: app.diff_filter_cmd.clone(),
+                cached_raw_diff: None,
+            },
+        });
         app.sync_diff_blocking(120);
         assert!(app.diff_plain_text().contains("FILTER[w=120]"));
         assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 2);

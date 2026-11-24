@@ -253,6 +253,8 @@ struct BodySlot {
 struct BodySlotState {
     pending: Option<BodyRequest>,
     in_flight: Option<InFlightBody>,
+    completed_file: Option<InFlightBody>,
+    unread_replies: usize,
     shutdown: bool,
 }
 
@@ -284,6 +286,8 @@ impl DiffWorkers {
             state: Mutex::new(BodySlotState {
                 pending: None,
                 in_flight: None,
+                completed_file: None,
+                unread_replies: 0,
                 shutdown: false,
             }),
             cv: Condvar::new(),
@@ -319,7 +323,7 @@ impl DiffWorkers {
     pub fn submit_body(&self, req: BodyRequest) {
         let key = req.in_flight_key();
         let mut guard = self.body_slot.state.lock().unwrap();
-        if guard.in_flight.as_ref() == Some(&key) {
+        if guard.in_flight.as_ref() == Some(&key) || guard.completed_file.as_ref() == Some(&key) {
             guard.pending = None;
             return;
         }
@@ -347,7 +351,13 @@ impl DiffWorkers {
     }
 
     pub fn try_recv_body(&self) -> Option<BodyResponse> {
-        self.body_rx.try_recv().ok()
+        let mut guard = self.body_slot.state.lock().unwrap();
+        let response = self.body_rx.try_recv().ok()?;
+        guard.unread_replies -= 1;
+        if guard.unread_replies == 0 {
+            guard.completed_file = None;
+        }
+        Some(response)
     }
 
     pub fn is_busy(&self) -> bool {
@@ -568,20 +578,27 @@ fn body_worker_loop(
             }
         };
 
-        let send_err = tx
+        let mut guard = slot.state.lock().unwrap();
+        if guard.shutdown {
+            return;
+        }
+        if tx
             .send(BodyResponse {
                 commit_id: req.commit_id,
                 width: req.width,
                 generation: req.generation,
                 outcome,
             })
-            .is_err();
-
-        let mut guard = slot.state.lock().unwrap();
-        guard.in_flight = None;
-        if send_err || guard.shutdown {
+            .is_err()
+        {
             return;
         }
+        // UI のポーリングと再送の間に完了しても、未受信のファイル差分は再実行しない。
+        guard.unread_replies += 1;
+        guard.completed_file = guard
+            .in_flight
+            .take()
+            .filter(|key| matches!(key, InFlightBody::PerFile { .. }));
     }
 }
 
