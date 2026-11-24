@@ -125,6 +125,7 @@ pub enum MetaOutcome {
 pub struct MetaResponse {
     pub commit_id: String,
     pub generation: u64,
+    pub(crate) warmed: bool,
     pub outcome: MetaOutcome,
 }
 
@@ -240,8 +241,10 @@ struct MetaSlot {
 }
 
 struct MetaSlotState {
-    pending: Option<MetaRequest>,
+    pending: Option<(MetaRequest, bool)>,
     in_flight: Option<(String, u64)>,
+    completed_warm: Option<(String, u64)>,
+    unread_replies: usize,
     shutdown: bool,
 }
 
@@ -271,6 +274,8 @@ impl DiffWorkers {
             state: Mutex::new(MetaSlotState {
                 pending: None,
                 in_flight: None,
+                completed_warm: None,
+                unread_replies: 0,
                 shutdown: false,
             }),
             cv: Condvar::new(),
@@ -308,15 +313,22 @@ impl DiffWorkers {
 
     pub fn submit_meta(&self, req: MetaRequest) {
         let mut guard = self.meta_slot.state.lock().unwrap();
-        if guard
-            .in_flight
-            .as_ref()
-            .is_some_and(|(cid, req_gen)| cid == &req.commit_id && *req_gen == req.generation)
+        let matches =
+            |(cid, req_gen): &(String, u64)| cid == &req.commit_id && *req_gen == req.generation;
+        if guard.in_flight.as_ref().is_some_and(matches)
+            || guard.completed_warm.as_ref().is_some_and(matches)
         {
             guard.pending = None;
             return;
         }
-        guard.pending = Some(req);
+        guard.pending = Some((req, false));
+        self.meta_slot.cv.notify_one();
+    }
+
+    /// 両レーンが空であることを確認した UI だけが先読みを投入する。
+    pub(crate) fn submit_warm_meta(&self, req: MetaRequest) {
+        let mut guard = self.meta_slot.state.lock().unwrap();
+        guard.pending = Some((req, true));
         self.meta_slot.cv.notify_one();
     }
 
@@ -347,7 +359,13 @@ impl DiffWorkers {
     }
 
     pub fn try_recv_meta(&self) -> Option<MetaResponse> {
-        self.meta_rx.try_recv().ok()
+        let mut guard = self.meta_slot.state.lock().unwrap();
+        let response = self.meta_rx.try_recv().ok()?;
+        guard.unread_replies -= 1;
+        if response.warmed {
+            guard.completed_warm = None;
+        }
+        Some(response)
     }
 
     pub fn try_recv_body(&self) -> Option<BodyResponse> {
@@ -368,6 +386,17 @@ impl DiffWorkers {
         drop(meta);
         let body = self.body_slot.state.lock().unwrap();
         body.pending.is_some() || body.in_flight.is_some()
+    }
+
+    /// `is_busy` と異なり、まだ UI が読んでいない完了応答も数える。
+    pub(crate) fn is_idle(&self) -> bool {
+        let meta = self.meta_slot.state.lock().unwrap();
+        if meta.pending.is_some() || meta.in_flight.is_some() || meta.unread_replies != 0 {
+            return false;
+        }
+        drop(meta);
+        let body = self.body_slot.state.lock().unwrap();
+        body.pending.is_none() && body.in_flight.is_none() && body.unread_replies == 0
     }
 }
 
@@ -395,15 +424,15 @@ fn meta_worker_loop(
     tx: mpsc::Sender<MetaResponse>,
 ) {
     loop {
-        let req = {
+        let (req, warmed) = {
             let mut guard = slot.state.lock().unwrap();
             loop {
                 if guard.shutdown {
                     return;
                 }
-                if let Some(req) = guard.pending.take() {
+                if let Some((req, warmed)) = guard.pending.take() {
                     guard.in_flight = Some((req.commit_id.clone(), req.generation));
-                    break req;
+                    break (req, warmed);
                 }
                 guard = slot.cv.wait(guard).unwrap();
             }
@@ -437,18 +466,23 @@ fn meta_worker_loop(
             }
         };
 
-        let send_err = tx
-            .send(MetaResponse {
-                commit_id: req.commit_id,
-                generation: req.generation,
-                outcome,
-            })
-            .is_err();
-
         let mut guard = slot.state.lock().unwrap();
-        guard.in_flight = None;
-        if send_err || guard.shutdown {
+        if guard.shutdown
+            || tx
+                .send(MetaResponse {
+                    commit_id: req.commit_id,
+                    generation: req.generation,
+                    warmed,
+                    outcome,
+                })
+                .is_err()
+        {
             return;
+        }
+        guard.unread_replies += 1;
+        let finished = guard.in_flight.take();
+        if warmed {
+            guard.completed_warm = finished;
         }
     }
 }
