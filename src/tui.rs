@@ -82,8 +82,6 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         // ノンブロッキングで結果を拾う。
         app.poll_ai();
         app.poll_remote();
-        // バックグラウンド diff ワーカーの完了結果をノンブロッキングで拾う。
-        app.poll_diff();
         // 描画の直前に 1 回だけ diff 状態を同期する (非同期: キャッシュ未命中でも
         // サブプロセス待ちや ANSI 変換でイベントループを止めない)。SIGWINCH
         // 直後で size 取得自体が失敗することがあるので、その場合は 80 桁にフォールバックする。

@@ -523,7 +523,6 @@ impl App {
             if preserve_fresh {
                 self.status_fresh = true;
             }
-            self.poll_diff();
             self.sync_diff(diff_width);
             if self.is_diff_loading() {
                 thread::sleep(Duration::from_millis(1));
@@ -1068,11 +1067,12 @@ impl App {
     /// キャッシュ命中なら即座に共有 `Text` を差し替え、未命中なら表示を「待機中」へ
     /// 切り替えてバックグラウンドワーカーへ最新要求だけを送る。
     pub fn sync_diff(&mut self, diff_width: u16) {
+        // リサイズ前の応答は、現在の幅を記録してから判定する。
+        self.last_diff_width = Some(diff_width);
+        self.poll_diff();
         if self.remote_job.is_some() {
             return;
         }
-        self.last_diff_width = Some(diff_width);
-        self.poll_diff();
         let status_just_reported = std::mem::take(&mut self.status_fresh);
 
         let Some(change) = self.selected_change() else {
@@ -4391,6 +4391,7 @@ mod tests {
         fail_delta_width: Option<u16>,
         delta_gate: Option<Arc<Gate>>,
         filter_gate: Option<Arc<Gate>>,
+        fail_filter_width: Option<u16>,
         diff_git_calls: std::sync::atomic::AtomicUsize,
         delta_batch_calls: std::sync::atomic::AtomicUsize,
         diff_file_calls: std::sync::atomic::AtomicUsize,
@@ -4410,6 +4411,7 @@ mod tests {
                 fail_delta_width: None,
                 delta_gate: None,
                 filter_gate: None,
+                fail_filter_width: None,
                 diff_git_calls: std::sync::atomic::AtomicUsize::new(0),
                 delta_batch_calls: std::sync::atomic::AtomicUsize::new(0),
                 diff_file_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -4531,6 +4533,9 @@ mod tests {
                 .push((raw.to_string(), width));
             if let Some(gate) = &self.filter_gate {
                 gate.arrive_and_wait();
+            }
+            if self.fail_filter_width == Some(width) {
+                anyhow::bail!("filter failed at width {width}");
             }
             Ok(format!("\x1b[36mFILTER[w={width}]: {raw}\x1b[0m"))
         }
@@ -4938,6 +4943,45 @@ mod tests {
         assert!(app.diff_plain_text().contains("FILTER[w=120]"));
         assert_eq!(backend.diff_file_calls.load(Ordering::SeqCst), 2);
         assert_eq!(backend.filter_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn diff_filter_error_queued_before_resize_does_not_replace_status_or_body() {
+        let gate = Gate::new();
+        let mut backend = Arc::try_unwrap(FakeBackend::new(":git")).ok().unwrap();
+        backend.filter_gate = Some(Arc::clone(&gate));
+        backend.fail_filter_width = Some(40);
+        let backend = Arc::new(backend);
+        let (files, patch, per_file) = sample_multi_file_commit();
+        let cid = "9999999999999999999999999999999999999999";
+        backend.add_commit(cid, files, "", &patch, per_file);
+        let (_tmp, mut app) = fake_app(backend, &[(cid, "resize-before-filter-error")]);
+        app.diff_filter_cmd = Some("fake-filter".to_string());
+        app.status = Status::info("keep this status");
+
+        let deadline = Instant::now() + TEST_WORKER_TIMEOUT;
+        while app.files.is_empty() {
+            assert!(Instant::now() < deadline, "metadata never arrived");
+            app.sync_diff(40);
+            thread::sleep(Duration::from_millis(1));
+        }
+        gate.wait_entered(1);
+        gate.release_all();
+
+        // The resize has been read. Wait for the narrow reply to be queued before the next frame.
+        let deadline = Instant::now() + TEST_WORKER_TIMEOUT;
+        while app.diff_workers.is_busy() {
+            assert!(Instant::now() < deadline, "narrow filter never finished");
+            thread::sleep(Duration::from_millis(1));
+        }
+        app.sync_diff(120);
+        assert_eq!(app.status.text, "keep this status");
+        assert!(app.diff_plain_text().contains("loading diff…"));
+
+        app.sync_diff_blocking(120);
+        let text = app.diff_plain_text();
+        assert!(text.contains("FILTER[w=120]: RAW_ALPHA"), "{text}");
+        assert_eq!(app.status.text, "keep this status");
     }
 
     #[test]

@@ -207,8 +207,10 @@ setup carry straight through:
   right half. Press `L` to cycle through the layouts.
   If the command fails (missing binary, bad flags, non-zero exit), the diff pane
   falls back to jj's raw output and the error shows in the status bar — a broken filter never
-  blanks the diff. Both `jj diff` and `SHIKIGAMI_DIFF_FILTER` run asynchronously off the UI thread,
-  and successful formatted outputs are cached in memory per commit, file, and pane width.
+  blanks the diff. Failures are shown only if the pane still matches the failed request's
+  width when the result is processed. Both `jj diff` and `SHIKIGAMI_DIFF_FILTER` run
+  asynchronously off the UI thread, and successful formatted outputs are cached in memory per
+  commit, file, and pane width.
 - **`SHIKIGAMI_DIFF_BATCH=delta-v1`** (opt-in batched delta path). When set to `delta-v1`,
   `SHIKIGAMI_DIFF_FILTER` is unset, and jj's `ui.diff-formatter` is `:git`, shikigami fetches the
   commit's uncolored `jj diff --git` patch once per immutable commit ID, matches every Git diff
