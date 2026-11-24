@@ -140,18 +140,26 @@ impl CommitCache {
         }
     }
 
-    fn approx_bytes(&self) -> usize {
+    fn metadata_bytes(&self) -> usize {
         let files_bytes: usize = self
             .files
             .iter()
             .map(|f| f.path.len() + f.source_path.len() + f.destination_path.len() + 32)
             .sum();
+        files_bytes + self.header_raw.len() + 64
+    }
+
+    fn diff_entry_bytes(path: Option<&str>, raw: &str) -> usize {
+        path.map_or(0, str::len) + raw.len() + 32
+    }
+
+    fn approx_bytes(&self) -> usize {
         let diffs_bytes: usize = self
             .diffs_raw
             .iter()
-            .map(|(k, v)| k.as_ref().map_or(0, String::len) + v.len() + 32)
+            .map(|(k, v)| Self::diff_entry_bytes(k.as_deref(), v.as_str()))
             .sum();
-        files_bytes + self.header_raw.len() + diffs_bytes + 64
+        self.metadata_bytes() + diffs_bytes
     }
 }
 
@@ -211,11 +219,28 @@ impl DiffStore {
         let Some(entry) = self.map.get_mut(commit_id) else {
             return;
         };
-        let added_bytes = path.as_ref().map_or(0, String::len) + raw.len() + 32;
-        if added_bytes > self.max_bytes {
+        let added_bytes = CommitCache::diff_entry_bytes(path.as_deref(), raw.as_str());
+        if entry.metadata_bytes().saturating_add(added_bytes) > self.max_bytes {
             return;
         }
         let before = entry.approx_bytes();
+        let replaced_bytes = entry.diffs_raw.get(&path).map_or(0, |old| {
+            CommitCache::diff_entry_bytes(path.as_deref(), old.as_str())
+        });
+        let projected = before
+            .saturating_sub(replaced_bytes)
+            .saturating_add(added_bytes);
+        if projected > self.max_bytes {
+            let mut excess = projected - self.max_bytes;
+            entry.diffs_raw.retain(|k, v| {
+                if excess == 0 || k == &path {
+                    return true;
+                }
+                let entry_bytes = CommitCache::diff_entry_bytes(k.as_deref(), v.as_str());
+                excess = excess.saturating_sub(entry_bytes);
+                false
+            });
+        }
         entry.diffs_raw.insert(path, raw);
         let after = entry.approx_bytes();
         if after >= before {
@@ -737,5 +762,66 @@ mod tests {
         unsafe {
             std::env::remove_var("SHIKIGAMI_CACHE_DIR");
         }
+    }
+
+    #[test]
+    fn insert_file_diff_trims_same_commit_without_flushing_cache() {
+        let max_bytes = 500;
+        let mut store = DiffStore::with_max_bytes(max_bytes);
+
+        store.insert(
+            "commit-a".into(),
+            CommitCache::new(Vec::new(), String::new()),
+        );
+        store.insert_file_diff("commit-a", Some("a.rs".into()), Arc::new("diff-a".into()));
+
+        store.insert(
+            "commit-b".into(),
+            CommitCache::new(Vec::new(), "header-b".to_string()),
+        );
+        let first_raw = Arc::new("x".repeat(260));
+        let second_raw = Arc::new("y".repeat(260));
+        store.insert_file_diff("commit-b", Some("f1.rs".into()), Arc::clone(&first_raw));
+        store.insert_file_diff("commit-b", Some("f2.rs".into()), Arc::clone(&second_raw));
+
+        assert!(store.total_bytes <= max_bytes);
+        let entry_b = store
+            .get("commit-b")
+            .expect("target commit must remain cached");
+        assert_eq!(entry_b.header_raw.as_str(), "header-b");
+        assert_eq!(
+            entry_b
+                .diffs_raw
+                .get(&Some("f2.rs".into()))
+                .map(Arc::as_ref),
+            Some(second_raw.as_ref()),
+        );
+        assert!(!entry_b.diffs_raw.contains_key(&Some("f1.rs".into())));
+        let entry_a = store
+            .get("commit-a")
+            .expect("unrelated commit within budget must remain cached");
+        assert_eq!(
+            entry_a
+                .diffs_raw
+                .get(&Some("a.rs".into()))
+                .map(|raw| raw.as_str()),
+            Some("diff-a"),
+        );
+        let bytes_before_reject = store.total_bytes;
+
+        // Diff fits alone against `max_bytes`, but exceeds `max_bytes` once
+        // commit metadata is included; it must be ignored without evicting
+        // existing diffs.
+        store.insert_file_diff("commit-b", Some("big.rs".into()), Arc::new("z".repeat(420)));
+        let entry_b = store.get("commit-b").expect("target commit still cached");
+        assert!(!entry_b.diffs_raw.contains_key(&Some("big.rs".into())));
+        assert_eq!(
+            entry_b
+                .diffs_raw
+                .get(&Some("f2.rs".into()))
+                .map(Arc::as_ref),
+            Some(second_raw.as_ref()),
+        );
+        assert_eq!(store.total_bytes, bytes_before_reject);
     }
 }
