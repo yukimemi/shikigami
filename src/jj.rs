@@ -123,8 +123,16 @@ fn normalize_repo_path(path: &str) -> String {
 
 /// リポジトリ相対パスを fileset のリテラルとして渡す。
 fn literal_fileset(path: &str, kind: &str) -> String {
-    let path = normalize_repo_path(path);
-    let mut escaped = String::with_capacity(path.len());
+    if cfg!(windows) && path.contains('\\') {
+        return literal_normalized_fileset(&normalize_repo_path(path), kind);
+    }
+    literal_normalized_fileset(path, kind)
+}
+
+fn literal_normalized_fileset(path: &str, kind: &str) -> String {
+    let mut escaped = String::with_capacity(kind.len() + path.len() + 3);
+    escaped.push_str(kind);
+    escaped.push_str(":\"");
     for ch in path.chars() {
         match ch {
             '\\' => escaped.push_str(r"\\"),
@@ -140,7 +148,8 @@ fn literal_fileset(path: &str, kind: &str) -> String {
             c => escaped.push(c),
         }
     }
-    format!("{kind}:\"{escaped}\"")
+    escaped.push('"');
+    escaped
 }
 
 /// TOML v1.0 の基本文字列 (`"..."`) として安全にシリアライズする。
@@ -167,13 +176,19 @@ fn toml_basic_string(value: &str) -> String {
     out
 }
 
-/// 選択パス列を完全一致 (`root-file:`) の和集合 fileset 式に組み立てる。
-fn fileset_union_expr(paths: &[String]) -> String {
-    paths
+/// Windows の 32,767 UTF-16 コード単位制限に対し、実行ファイル名や固定引数の
+/// 余裕を残す。空白・外側の引用符と、Windows の引数エスケープを多めに見積もる。
+fn untrack_fits_in_argv(filesets: &[String]) -> bool {
+    filesets
         .iter()
-        .map(|path| literal_fileset(path, "root-file"))
-        .collect::<Vec<_>>()
-        .join(" | ")
+        .map(|arg| {
+            3 + arg
+                .encode_utf16()
+                .map(|unit| if matches!(unit, 34 | 92) { 2 } else { 1 })
+                .sum::<usize>()
+        })
+        .sum::<usize>()
+        <= 30_000
 }
 
 fn fileset_alias_toml(alias: &str, expr: &str) -> String {
@@ -219,8 +234,9 @@ fn write_untrack_config(
 /// `jj file untrack` 失敗後の `@` 追跡一覧との照合結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UntrackProgress {
-    /// エイリアス非依存の `jj file list -r @` で確認できた件数。
-    Verified { untracked: usize, remaining: usize },
+    /// `jj file list -r @` で確認できた、まだ追跡されている選択パスの件数。
+    /// 消えたパスが解除されたか、通常のスナップショットで削除されたかは区別できない。
+    StillTracked { remaining: usize },
     /// 追跡一覧の照合に失敗したため、件数を推測せず不明とする。
     Unknown,
 }
@@ -253,32 +269,54 @@ impl fmt::Display for UntrackFailure {
     }
 }
 
-/// 事前照合済みの `jj file untrack` バッチ。作業コピー外の一時設定ファイルを
-/// 保持し、実行完了または中止時のドロップで片付ける。
+enum UntrackTargets {
+    Argv(Vec<String>),
+    Config(tempfile::NamedTempFile),
+}
+
+impl UntrackTargets {
+    fn command_args<'a>(&'a self, prefix: &[&'a str]) -> (Option<&'a Path>, Vec<&'a str>) {
+        let target_count = match self {
+            Self::Argv(filesets) => filesets.len(),
+            Self::Config(_) => 1,
+        };
+        let mut args = Vec::with_capacity(prefix.len() + target_count);
+        args.extend_from_slice(prefix);
+        let config = match self {
+            Self::Argv(filesets) => {
+                args.extend(filesets.iter().map(String::as_str));
+                None
+            }
+            Self::Config(config) => {
+                args.push(UNTRACK_ALIAS);
+                Some(config.path())
+            }
+        };
+        (config, args)
+    }
+}
+
+/// 事前照合済みの `jj file untrack` バッチ。一時設定を使う場合は
+/// 実行完了または中止時のドロップで片付ける。
 pub struct UntrackBatch<'a> {
     jj: &'a Jj,
-    config: tempfile::NamedTempFile,
+    targets: UntrackTargets,
     expected: BTreeSet<String>,
 }
 
 impl UntrackBatch<'_> {
-    /// 確定済みの fileset エイリアスを 1 回の `jj file untrack` で実行する。
+    /// 確定済みの選択を 1 回の `jj file untrack` で実行する。
     pub fn execute(self) -> std::result::Result<String, UntrackFailure> {
         let UntrackBatch {
             jj,
-            config,
+            targets,
             expected,
         } = self;
-        let result = jj.exec_raw(
-            WRITE_GLOBALS,
-            Some(config.path()),
-            &["file", "untrack", UNTRACK_ALIAS],
-            OutputCapture::Full,
-            false,
-        );
+        let (config, args) = targets.command_args(&["file", "untrack"]);
+        let result = jj.exec_raw(WRITE_GLOBALS, config, &args, OutputCapture::Full, false);
         // 一時設定ファイルは `jj file untrack` 終了直後に片付け、失敗時の
         // 照合がエイリアスに一切依存しないことも明確にする。
-        drop(config);
+        drop(targets);
         match result {
             Ok(out) => Ok(out),
             Err(ExecError::Spawn { cmd_label, source }) => Err(UntrackFailure::NotStarted {
@@ -794,39 +832,46 @@ impl Jj {
         self.write(&args)
     }
 
-    /// 選択パスを完全一致 fileset エイリアスとして作業コピー外の一時設定に
-    /// 書き出し、読み取り専用の `jj file list -r @` で `@` の追跡集合と完全一致
-    /// することを検証する。書き込み前に不一致を検出して中止できる。
+    /// 読み取り専用の `jj file list -r @` で選択と記録済みの追跡パスが
+    /// 完全一致することを検証する。長い選択だけ作業コピー外の一時設定を使う。
     pub fn prepare_file_untrack(&self, paths: &[String]) -> Result<UntrackBatch<'_>> {
-        let mut ordered = Vec::new();
+        self.prepare_file_untrack_with_temp_dir(paths, std::env::temp_dir)
+    }
+
+    fn prepare_file_untrack_with_temp_dir(
+        &self,
+        paths: &[String],
+        temp_dir: impl FnOnce() -> PathBuf,
+    ) -> Result<UntrackBatch<'_>> {
+        let mut filesets = Vec::with_capacity(paths.len());
         let mut expected = BTreeSet::new();
         for raw in paths {
             let norm = normalize_repo_path(raw);
-            if expected.insert(norm.clone()) {
-                ordered.push(norm);
+            if !expected.contains(&norm) {
+                filesets.push(literal_normalized_fileset(&norm, "root-file"));
+                expected.insert(norm);
             }
         }
-        if ordered.is_empty() {
+        if filesets.is_empty() {
             bail!("no paths selected to untrack");
         }
-        let expr = fileset_union_expr(&ordered);
-        let toml = fileset_alias_toml(UNTRACK_ALIAS, &expr);
-        let config = write_untrack_config(self.root(), &std::env::temp_dir(), &toml)?;
+        let targets = if untrack_fits_in_argv(&filesets) {
+            UntrackTargets::Argv(filesets)
+        } else {
+            let toml = fileset_alias_toml(UNTRACK_ALIAS, &filesets.join(" | "));
+            UntrackTargets::Config(write_untrack_config(self.root(), &temp_dir(), &toml)?)
+        };
 
-        let out = self.exec_with_config(
-            READ_GLOBALS,
-            Some(config.path()),
-            &[
-                "--ignore-working-copy",
-                "file",
-                "list",
-                "-r",
-                "@",
-                "--template",
-                FILE_LIST_JSON_TEMPLATE,
-                UNTRACK_ALIAS,
-            ],
-        )?;
+        let (config, args) = targets.command_args(&[
+            "--ignore-working-copy",
+            "file",
+            "list",
+            "-r",
+            "@",
+            "--template",
+            FILE_LIST_JSON_TEMPLATE,
+        ]);
+        let out = self.exec_with_config(READ_GLOBALS, config, &args)?;
         let matched = parse_file_list(&out)?;
         if matched != expected {
             let missing = expected.difference(&matched).count();
@@ -837,7 +882,7 @@ impl Jj {
         }
         Ok(UntrackBatch {
             jj: self,
-            config,
+            targets,
             expected,
         })
     }
@@ -859,11 +904,7 @@ impl Jj {
             return UntrackProgress::Unknown;
         };
         let remaining = expected.iter().filter(|p| tracked.contains(*p)).count();
-        let untracked = expected.len().saturating_sub(remaining);
-        UntrackProgress::Verified {
-            untracked,
-            remaining,
-        }
+        UntrackProgress::StillTracked { remaining }
     }
 
     /// 作業コピーでの追跡を外す (`jj file untrack`)。`i` は先に
@@ -1488,12 +1529,9 @@ mod tests {
 
     #[test]
     fn toml_alias_serialization_escapes_special_characters_and_unicode() {
-        let paths = vec![
-            "a b/(c)&~d.txt".to_string(),
-            "日本語/file\"quote.txt".to_string(),
-            "tab\there.txt".to_string(),
-        ];
-        let expr = fileset_union_expr(&paths);
+        let expr = ["a b/(c)&~d.txt", "日本語/file\"quote.txt", "tab\there.txt"]
+            .map(|path| literal_fileset(path, "root-file"))
+            .join(" | ");
         assert_eq!(
             expr,
             r#"root-file:"a b/(c)&~d.txt" | root-file:"日本語/file\"quote.txt" | root-file:"tab\there.txt""#
@@ -1543,6 +1581,30 @@ mod tests {
     }
 
     #[test]
+    fn untrack_short_selection_works_with_temp_inside_working_copy() {
+        let (tmp, _) = crate::testutil::repo_or_skip!();
+        let dir = tmp.path();
+        let jj = Jj::discover(dir).unwrap();
+        let inside = dir.join("tmp");
+        std::fs::create_dir(&inside).unwrap();
+        let target = "日本語 [1] (a)&b.txt";
+        std::fs::write(dir.join(target), "keep").unwrap();
+        crate::testutil::run(dir, &["file", "track", "all()"]);
+        std::fs::write(dir.join(".gitignore"), "/日本語 \\[1\\] (a)&b.txt\n").unwrap();
+
+        jj.prepare_file_untrack_with_temp_dir(&[target.to_string()], || inside)
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let out = jj
+            .read(&["file", "list", "--template", FILE_LIST_JSON_TEMPLATE])
+            .unwrap();
+        assert!(!parse_file_list(&out).unwrap().contains(target));
+        assert_eq!(std::fs::read(dir.join(target)).unwrap(), b"keep");
+    }
+
+    #[test]
     fn untrack_checks_recorded_paths_without_snapshotting() {
         let (tmp, _) = crate::testutil::repo_or_skip!();
         let dir = tmp.path();
@@ -1559,10 +1621,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             jj.reconcile_untrack_progress(&BTreeSet::from([target])),
-            UntrackProgress::Verified {
-                untracked: 0,
-                remaining: 1,
-            }
+            UntrackProgress::StillTracked { remaining: 1 }
         );
         drop(batch);
     }

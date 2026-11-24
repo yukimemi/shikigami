@@ -150,14 +150,15 @@ that selection; mutating actions clear it when executed. These keys are inactive
 
 `i` and `I` only operate on the working-copy change (`@`) and keep files on disk.
 Both verify the exact selection against the recorded `@` without snapshotting it, then pass
-the literal paths to jj through a temporary configuration outside the working copy rather than
-through command-line arguments. Deleted files are skipped; renames use the new path.
+the literal paths to jj directly for short selections or through a temporary configuration
+outside the working copy for oversized selections. Deleted files are skipped; renames use the new path.
 
 `I` never changes `.gitignore`. If any selected path would immediately be tracked again,
 jj refuses the entire batch. Use `i` to add only missing rules to the root `.gitignore` before
-untracking. On failure, the TUI reloads the file list and reports the cause and, when known,
-how many targets were untracked and how many remain. Rules already written are kept; reselect
-the remaining files and retry without duplicating those rules.
+untracking. On failure, the TUI reloads the file list and reports the cause and how many targets
+are confirmed to remain tracked, when known. A missing path may have been deleted rather than
+untracked. Rules already written are kept; reselect the remaining files and retry without
+duplicating those rules.
 
 `[` and `]` navigate to the previous and next file directly from the diff pane.
 Navigation stops at the first or last file without wrapping.

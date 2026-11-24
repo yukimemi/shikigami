@@ -118,16 +118,16 @@ fn format_untrack_failure(
             parts.push(format!("0/{total} untracked, {total} remaining"));
         }
         UntrackFailure::AfterLaunch {
-            progress:
-                UntrackProgress::Verified {
-                    untracked,
-                    remaining,
-                },
+            progress: UntrackProgress::StillTracked { remaining },
             ..
         } => {
-            parts.push(format!(
-                "{untracked}/{total} untracked, {remaining} remaining"
-            ));
+            if *remaining == total {
+                parts.push(format!("0/{total} untracked, {total} remaining"));
+            } else {
+                parts.push(format!(
+                    "untrack outcome unknown; {remaining} still tracked"
+                ));
+            }
         }
         UntrackFailure::AfterLaunch {
             progress: UntrackProgress::Unknown,
@@ -1397,7 +1397,7 @@ impl App {
         }
     }
 
-    /// `i` / `I` の失敗時に、`.gitignore` の更新有無・確認できた解除/残件数・
+    /// `i` / `I` の失敗時に、`.gitignore` の更新有無・確認できた残件数・
     /// 短い根本原因を status bar へ出し、エラー表示を保ったまま一覧を再読込する。
     fn report_untrack_failure(
         &mut self,
@@ -3365,6 +3365,42 @@ mod tests {
     }
 
     #[test]
+    fn untrack_refusal_does_not_count_a_snapshot_deletion_as_success() {
+        let Some((tmp, mut app)) = app_with_wc_files() else {
+            report_skip();
+            return;
+        };
+        let dir = tmp.path();
+        run(
+            dir,
+            &["config", "set", "--repo", "snapshot.auto-track", "all()"],
+        );
+        let rules = b"/x.txt\n";
+        std::fs::write(dir.join(".gitignore"), rules).unwrap();
+        app.file_selection.toggle(0);
+        app.file_selection.toggle(1);
+        app.handle_key(key(KeyCode::Char('I')));
+        assert!(matches!(app.mode, Mode::Confirm(_)), "{:?}", app.mode);
+
+        // `jj file untrack` snapshots this deletion before rejecting y.txt.
+        std::fs::remove_file(dir.join("x.txt")).unwrap();
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert_eq!(app.status.kind, StatusKind::Error, "{:?}", app.status);
+        let status = &app.status.text;
+        assert!(
+            status.contains("untrack outcome unknown; 1 still tracked"),
+            "{status}"
+        );
+        assert!(!status.contains("1/2 untracked"), "{status}");
+        assert_eq!(std::fs::read(dir.join(".gitignore")).unwrap(), rules);
+        let tracked = tracked_files_json(dir);
+        assert!(!tracked.contains("x.txt"));
+        assert!(tracked.contains("y.txt"));
+        assert!(dir.join("y.txt").exists());
+    }
+
+    #[test]
     fn untrack_only_keeps_existing_ignore_rules_and_untracks_selected_files() {
         for visual in [false, true] {
             let Some((tmp, mut app)) = app_with_wc_files() else {
@@ -3465,33 +3501,6 @@ mod tests {
         );
         assert!(!spawn_msg.contains("root:"), "{spawn_msg}");
 
-        let partial_msg = format_untrack_failure(
-            5,
-            1,
-            GitignoreOutcome::Updated(5),
-            false,
-            &UntrackFailure::AfterLaunch {
-                detail: "Error: interrupted\nHint: retry".to_string(),
-                progress: UntrackProgress::Verified {
-                    untracked: 2,
-                    remaining: 3,
-                },
-            },
-        );
-        assert!(
-            partial_msg.contains(".gitignore updated (+5)"),
-            "{partial_msg}"
-        );
-        assert!(
-            partial_msg.contains("2/5 untracked, 3 remaining"),
-            "{partial_msg}"
-        );
-        assert!(partial_msg.contains("1 skipped"), "{partial_msg}");
-        assert!(
-            partial_msg.starts_with("untrack: Error: interrupted;"),
-            "{partial_msg}"
-        );
-
         let unknown_msg = format_untrack_failure(
             5,
             0,
@@ -3515,10 +3524,7 @@ mod tests {
             true,
             &UntrackFailure::AfterLaunch {
                 detail: "Error: 'y.txt' is not ignored.".to_string(),
-                progress: UntrackProgress::Verified {
-                    untracked: 0,
-                    remaining: 2,
-                },
+                progress: UntrackProgress::StillTracked { remaining: 2 },
             },
         );
         assert!(
