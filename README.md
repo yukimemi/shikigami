@@ -288,7 +288,8 @@ and `jj log`, diff metadata, diff formatting (`delta` / `SHIKIGAMI_DIFF_FILTER`)
 all run on background workers with latest-selection coalescing so cursor movement, visual range
 selection, and quit remain responsive even on slow formatters or Windows.
 Once the first diff is ready and both workers are idle, startup warms only the next commit's
-file list and header. The next commit's diff body is still fetched and formatted on demand.
+file list and header in a separate background job, so other commits can load while it runs.
+The next commit's diff body is still fetched and formatted on demand.
 
 ## Development
 

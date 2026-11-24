@@ -4639,6 +4639,7 @@ mod tests {
 
     const STARTUP_FIRST: &str = "1111111100000000000000000000000000000000";
     const STARTUP_NEXT: &str = "1111111111111111111111111111111111111111";
+    const STARTUP_LAST: &str = "3333333333333333333333333333333333333333";
 
     fn fake_startup(backend: Arc<FakeBackend>) -> (tempfile::TempDir, App) {
         let (files, patch, per_file) = sample_multi_file_commit();
@@ -4650,11 +4651,13 @@ mod tests {
             vec![(vec![], "first diff".into())],
         );
         backend.add_commit(STARTUP_NEXT, files, "next header", &patch, per_file);
+        backend.add_commit(STARTUP_LAST, vec![], "last header", "", vec![]);
         let (tmp, mut app) = fake_app(
             backend,
             &[
                 (STARTUP_FIRST, "first commit"),
                 (STARTUP_NEXT, "next commit"),
+                (STARTUP_LAST, "last commit"),
             ],
         );
         let mut rows = std::mem::take(&mut app.rows);
@@ -4718,6 +4721,31 @@ mod tests {
         select_during_startup_warm(true);
     }
 
+    #[test]
+    fn startup_warm_does_not_block_unrelated_visible_metadata() {
+        let gate = Gate::new();
+        let mut backend = Arc::try_unwrap(FakeBackend::new(":git")).ok().unwrap();
+        backend.summary_gate = Some((STARTUP_NEXT, Arc::clone(&gate)));
+        let (_tmp, mut app) = fake_startup(Arc::new(backend));
+
+        wait_for_startup_warm(&mut app, &gate);
+        app.select_last();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let displayed = loop {
+            app.sync_diff(80);
+            if app.diff_plain_text().contains("last header") {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        gate.release_all();
+        app.sync_diff_blocking(80);
+        assert!(displayed, "the last commit waited for startup warming");
+    }
+
     fn select_during_startup_warm(fail_warm: bool) {
         let gate = Gate::new();
         let mut backend = Arc::try_unwrap(FakeBackend::new(":git")).ok().unwrap();
@@ -4725,13 +4753,7 @@ mod tests {
         let backend = Arc::new(backend);
         let (_tmp, mut app) = fake_startup(Arc::clone(&backend));
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !matches!(app.diff_body, DiffBody::Ready(_)) {
-            assert!(Instant::now() < deadline, "initial diff did not arrive");
-            app.sync_diff(80);
-            thread::yield_now();
-        }
-        gate.wait_entered(1);
+        wait_for_startup_warm(&mut app, &gate);
         app.move_selection(1);
         app.sync_diff(80);
         assert!(matches!(app.diff_body, DiffBody::LoadingMeta));
@@ -4763,6 +4785,16 @@ mod tests {
             expected.push(STARTUP_NEXT);
         }
         assert_eq!(*backend.summary_calls.lock().unwrap(), expected);
+    }
+
+    fn wait_for_startup_warm(app: &mut App, gate: &Gate) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(app.diff_body, DiffBody::Ready(_)) {
+            assert!(Instant::now() < deadline, "initial diff did not arrive");
+            app.sync_diff(80);
+            thread::yield_now();
+        }
+        gate.wait_entered(1);
     }
 
     type SampleCommit = (Vec<DiffFile>, String, Vec<(Vec<String>, String)>);
