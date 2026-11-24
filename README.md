@@ -232,8 +232,9 @@ setup carry straight through:
   or exceeds the rendered cache limits, that commit and pane width use the per-file path
   without invalidating batches at other widths.
 
-  Diff subprocesses reject stdout over 32 MiB and retain at most 256 KiB of stderr. The
-  on-disk diff cache ignores files over 64 MiB.
+  Diff-pane subprocesses reject stdout over 32 MiB and retain at most 256 KiB of stderr.
+  These limits do not apply to the patch passed to `SHIKIGAMI_AI_CMD`. The on-disk diff
+  cache ignores files over 64 MiB.
   Cached change headers are also parsed off the UI thread. `Ctrl-r` clears file marks
   and visual selection but keeps the file cursor when the commit ID is unchanged.
 
