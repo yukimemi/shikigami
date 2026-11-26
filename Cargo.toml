@@ -14,7 +14,7 @@ categories = ["command-line-utilities", "development-tools"]
 # CLI
 clap = { version = "4.6.9", features = ["derive"] }
 clap_complete = "4.6.12"
-anyhow = "1.0.104"
+anyhow = "1.0.105"
 
 # TUI
 ratatui = "0.30.2"
